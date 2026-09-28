@@ -1032,7 +1032,7 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
       <button class="modal-close" id="settings-close" type="button" aria-label="Close">×</button>
     </div>
     <div class="settings-section">
-      <div class="settings-section-title">Jira account</div>
+      <div class="settings-section-title">Jira account login</div>
       <div class="settings-credential-row">
         <div class="settings-credential-info">Stored credential<br><span class="settings-credential-email" id="settings-email">Not configured</span></div>
         <button class="modal-secondary" id="settings-manage-credential" type="button">Manage credential</button>
