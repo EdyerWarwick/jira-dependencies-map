@@ -100,6 +100,15 @@ def _update_current_exe():
         if not latest_tag or _version_tuple(latest_tag) <= _version_tuple(APP_VERSION):
             return False
 
+        current_exe = os.path.abspath(sys.executable)
+        failed_version_file = current_exe + ".failed-update.txt"
+        try:
+            with open(failed_version_file, "r", encoding="utf-8-sig") as handle:
+                if handle.read().strip() == latest_tag:
+                    return False
+        except OSError:
+            pass
+
         asset = next(
             (
                 item
@@ -139,10 +148,11 @@ def _update_current_exe():
 
         import tempfile
 
-        current_exe = os.path.abspath(sys.executable)
         update_exe = current_exe + ".update.exe"
         download_file = current_exe + ".download"
-        backup_exe = current_exe + ".previous"
+        backup_exe = current_exe + ".previous.exe"
+        failed_exe = current_exe + ".failed.exe"
+        failed_version_file = current_exe + ".failed-update.txt"
         error_log = os.path.join(tempfile.gettempdir(), "jira_dep_map_update_error.log")
         script = os.path.join(
             tempfile.gettempdir(),
@@ -161,8 +171,57 @@ def _update_current_exe():
 $current = {_ps_single_quote(current_exe)}
 $update = {_ps_single_quote(update_exe)}
 $backup = {_ps_single_quote(backup_exe)}
+$failed = {_ps_single_quote(failed_exe)}
+$failedVersionFile = {_ps_single_quote(failed_version_file)}
 $errorLog = {_ps_single_quote(error_log)}
+$releaseTag = {_ps_single_quote(latest_tag)}
+$expectedVersion = {_ps_single_quote(latest_tag.lstrip("vV"))}
 $parentProcessId = {os.getpid()}
+$healthUrl = {_ps_single_quote(f"http://127.0.0.1:{PORT}/api/update-health?ts={int(time.time())}")}
+
+function Write-UpdateError([string]$message) {{
+    Add-Content -LiteralPath $errorLog `
+        -Value "$(Get-Date -Format o) $message" -Encoding UTF8
+}}
+
+function Restore-PreviousVersion([System.Diagnostics.Process]$updatedProcess) {{
+    if ($null -ne $updatedProcess) {{
+        try {{
+            $updatedProcess.Refresh()
+            if (-not $updatedProcess.HasExited) {{
+                Stop-Process -Id $updatedProcess.Id -Force -ErrorAction SilentlyContinue
+            }}
+        }} catch {{}}
+    }}
+
+    Start-Sleep -Milliseconds 750
+    Remove-Item -LiteralPath $failed -Force -ErrorAction SilentlyContinue
+
+    $lastRestoreFailure = "Unknown rollback error"
+    for ($attempt = 1; $attempt -le 120; $attempt++) {{
+        try {{
+            if (-not (Test-Path -LiteralPath $backup)) {{
+                throw "The previous executable backup is missing."
+            }}
+            if (Test-Path -LiteralPath $current) {{
+                Move-Item -LiteralPath $current -Destination $failed -Force
+            }}
+            Move-Item -LiteralPath $backup -Destination $current -Force
+            Set-Content -LiteralPath $failedVersionFile `
+                -Value $releaseTag -Encoding UTF8
+
+            $env:JIRA_DEP_MAP_SKIP_UPDATE = "1"
+            Start-Process -FilePath $current `
+                -WorkingDirectory (Split-Path -Parent $current) | Out-Null
+            return
+        }}
+        catch {{
+            $lastRestoreFailure = $_.Exception.Message
+            Start-Sleep -Milliseconds 500
+        }}
+    }}
+    throw "Rollback failed after 120 attempts: $lastRestoreFailure"
+}}
 
 try {{
     $deadline = (Get-Date).AddSeconds(90)
@@ -170,63 +229,80 @@ try {{
            ((Get-Date) -lt $deadline)) {{
         Start-Sleep -Milliseconds 250
     }}
-
     if (Get-Process -Id $parentProcessId -ErrorAction SilentlyContinue) {{
         throw "The old application process did not exit within 90 seconds."
     }}
+    if (-not (Test-Path -LiteralPath $update)) {{
+        throw "The staged update file is missing."
+    }}
 
-    $lastFailure = "Unknown update error"
-
+    $replaced = $false
+    $lastReplaceFailure = "Unknown replacement error"
     for ($attempt = 1; $attempt -le 120; $attempt++) {{
-        $replaced = $false
         try {{
-            if (-not (Test-Path -LiteralPath $update)) {{
-                throw "The staged update file is missing."
-            }}
-
             Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-
             if (Test-Path -LiteralPath $current) {{
                 [System.IO.File]::Replace($update, $current, $backup, $true)
             }} else {{
                 Move-Item -LiteralPath $update -Destination $current -Force
             }}
             $replaced = $true
-
-            $child = Start-Process `
-                -FilePath $current `
-                -WorkingDirectory (Split-Path -Parent $current) `
-                -PassThru
-
-            Start-Sleep -Milliseconds 1500
-            $child.Refresh()
-            if ($child.HasExited) {{
-                throw "The updated application exited immediately with code $($child.ExitCode)."
-            }}
-
-            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $errorLog -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-            exit 0
+            break
         }}
         catch {{
-            $lastFailure = $_.Exception.Message
-
-            if ($replaced -and (Test-Path -LiteralPath $backup)) {{
-                Copy-Item -LiteralPath $current -Destination $update -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
-                Move-Item -LiteralPath $backup -Destination $current -Force -ErrorAction SilentlyContinue
-            }}
-
+            $lastReplaceFailure = $_.Exception.Message
             Start-Sleep -Milliseconds 500
         }}
     }}
+    if (-not $replaced) {{
+        throw "Update replacement failed after 120 attempts: $lastReplaceFailure"
+    }}
 
-    throw "Update replacement failed after 120 attempts: $lastFailure"
+    # A PyInstaller DLL error can leave an error dialog alive. The process merely
+    # remaining open is therefore not success: Flask must report the new version.
+    $env:JIRA_DEP_MAP_SKIP_UPDATE = "1"
+    $child = Start-Process -FilePath $current `
+        -WorkingDirectory (Split-Path -Parent $current) -PassThru
+
+    $healthy = $false
+    $healthFailure = "The Flask health endpoint did not become available."
+    $healthDeadline = (Get-Date).AddSeconds(75)
+    while ((Get-Date) -lt $healthDeadline) {{
+        $child.Refresh()
+        if ($child.HasExited) {{
+            $healthFailure = "The updated application exited with code $($child.ExitCode)."
+            break
+        }}
+        try {{
+            $health = Invoke-RestMethod -Uri $healthUrl -Method Get `
+                -TimeoutSec 2 -Headers @{{"Cache-Control"="no-cache"}}
+            if ($health.ok -eq $true -and
+                [string]$health.version -eq $expectedVersion) {{
+                $healthy = $true
+                break
+            }}
+            if ($null -ne $health.version) {{
+                $healthFailure = "The application reported version $($health.version), expected $expectedVersion."
+            }}
+        }}
+        catch {{}}
+        Start-Sleep -Milliseconds 500
+    }}
+
+    if (-not $healthy) {{
+        Restore-PreviousVersion $child
+        throw "$healthFailure The previous version was restored. Rejected file: $failed"
+    }}
+
+    # Keep .previous.exe as a known-working manual fallback.
+    Remove-Item -LiteralPath $failedVersionFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $failed -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $errorLog -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+    exit 0
 }}
 catch {{
-    $line = "$(Get-Date -Format o) $($_.Exception.Message)"
-    Add-Content -LiteralPath $errorLog -Value $line -Encoding UTF8
+    Write-UpdateError $_.Exception.Message
     exit 1
 }}
 """
@@ -258,6 +334,7 @@ catch {{
             except OSError:
                 pass
         return False
+
 
 app=Flask(__name__)
 
@@ -647,6 +724,11 @@ def api_credentials_remove():
     except Exception as e:
         return jsonify({"error":f"Could not remove credential: {e}"}),500
 
+@app.route("/api/update-health")
+def api_update_health():
+    return jsonify({"ok":True,"version":APP_VERSION,"pid":os.getpid()})
+
+
 @app.route("/api/config")
 def api_config(): return jsonify({"jiraBaseUrl":JIRA_BASE_URL,"port":PORT,"jql":JQL_QUERY})
 
@@ -949,7 +1031,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:7px}
 .card-top-left{display:flex;align-items:center;gap:6px;min-width:0}
 .assignee-select{font:inherit;border:0;background:transparent;color:var(--muted);cursor:pointer;min-width:0;padding:0;outline:none}
-.assignee-select{font-size:12px;width:100%;max-width:100%;margin-top:7px}
+.assignee-select{font-size:11px;max-width:100%;margin-top:7px}
 .priority-picker{position:relative;display:inline-flex;align-items:center;flex-shrink:0}
 .priority-trigger{display:flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:0;background:transparent;border-radius:4px;cursor:pointer}
 .priority-trigger:hover,.priority-picker.open .priority-trigger{background:#f1f5f9}
@@ -3324,7 +3406,8 @@ def run_flask():
     app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    if _update_current_exe():
+    skip_update=os.environ.pop("JIRA_DEP_MAP_SKIP_UPDATE","")=="1"
+    if not skip_update and _update_current_exe():
         sys.exit(0)
     clear_port_windows(PORT)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
