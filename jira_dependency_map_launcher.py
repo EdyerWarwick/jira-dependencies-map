@@ -281,17 +281,24 @@ def install_release(release, version):
             archive.unlink()
         except OSError:
             pass
-
-
-def cleanup_versions(current_version, previous_version=None):
-    candidates = []
+def cleanup_versions(current_version):
+   """Remove every installed application version except the active one."""
+    current_dir = VERSIONS_DIR / current_version
+    if not installed_exe(current_version).is_file():
+        return
+        
     try:
         for child in VERSIONS_DIR.iterdir():
-            parsed = version_tuple(child.name)
-            if parsed and installed_exe(child.name).is_file():
-                candidates.append((parsed, child))
+            
+           if child == current_dir or not child.is_dir():
+                continue
+            # Remove old semantic-version directories and abandoned staging
+            # directories, but leave unrelated folders untouched.
+            if version_tuple(child.name) or child.name.startswith("."):
+                shutil.rmtree(child, ignore_errors=True)
+            
     except OSError:
-        return
+        pass
 
     candidates.sort(reverse=True)
     keep = {VERSIONS_DIR / current_version}
@@ -332,7 +339,7 @@ def run():
             process = launch_app(latest)
             if wait_for_health(process, latest):
                 write_current(latest)
-                cleanup_versions(latest, previous_version=current)
+                cleanup_versions(latest)
                 log(f"Activated version {latest}.")
                 return 0
             try:
@@ -352,6 +359,8 @@ def run():
 
     if current:
         try:
+            # Also remove versions retained by earlier launcher releases.
+            cleanup_versions(current)
             launch_app(current)
             return 0
         except Exception as exc:
