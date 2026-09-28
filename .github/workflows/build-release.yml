@@ -1,0 +1,66 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Set application version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          if ($version -notmatch '^v\d+\.\d+\.\d+$') {
+            $version = "v1.0.0"
+          }
+
+          $versionNumber = $version.Substring(1)
+
+          $path = "jira_dependency_map_v33.py"
+          $content = Get-Content $path -Raw
+          $content = [regex]::Replace(
+            $content,
+            'APP_VERSION="[^"]*"',
+            ('APP_VERSION="' + $versionNumber + '"'),
+            1
+          )
+          Set-Content -Path $path -Value $content -Encoding UTF8
+
+      - name: Build EXE
+        run: python -m PyInstaller --clean --noconfirm jira_dependency_map.spec
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jira-Dependency-Map
+          path: dist/Jira-Dependency-Map.exe
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/Jira-Dependency-Map.exe" `
+            --title "Jira Dependency Map ${{ github.ref_name }}" `
+            --generate-notes
