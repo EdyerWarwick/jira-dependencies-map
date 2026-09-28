@@ -1051,7 +1051,7 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
     <div class="settings-section">
       <div class="settings-section-title">Feedback and Features</div>
       <div class="settings-feedback-row">
-        <div class="settings-feedback-info">Request a feature or improvement under &ldquo;Ways of Working&rdquo;.</div>
+        <div class="settings-feedback-info">Request a feature or improvement:</div>
         <a class="modal-secondary settings-feedback-button" href="https://warwick.ac.uk/services/marketing/teams/cds/opd/" target="_blank" rel="noopener noreferrer">Suggest a change</a>
       </div>      
     </div>
