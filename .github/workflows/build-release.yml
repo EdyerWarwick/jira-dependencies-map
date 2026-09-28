@@ -54,13 +54,12 @@ jobs:
           name: Jira-Dependency-Map
           path: dist/Jira-Dependency-Map.exe
 
-      - name: Create GitHub release
+      - name: Upload EXE to GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          gh release create "${{ github.ref_name }}" `
+          gh release upload "${{ github.ref_name }}" `
             "dist/Jira-Dependency-Map.exe" `
-            --title "Jira Dependency Map ${{ github.ref_name }}" `
-            --generate-notes
+            --clobber
