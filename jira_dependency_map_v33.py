@@ -33,38 +33,98 @@ def _version_tuple(value):
     except Exception:
         return (0,0,0)
 
+def _get_latest_stable_release():
+    """Return the highest published, non-draft, non-prerelease GitHub release."""
+    api=f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=100&t={int(time.time())}"
+    resp=req.get(
+        api,
+        headers={
+            "Accept":"application/vnd.github+json",
+            "Cache-Control":"no-cache",
+            "Pragma":"no-cache",
+            "X-GitHub-Api-Version":"2022-11-28",
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    releases=resp.json()
+    if not isinstance(releases,list):
+        return None
+
+    candidates=[]
+    for release in releases:
+        if not isinstance(release,dict):
+            continue
+        # Ignore drafts and prereleases. Only published stable releases
+        # should be candidates for automatic application updates.
+        if release.get("draft") or release.get("prerelease"):
+            continue
+        tag=str(release.get("tag_name") or "").strip()
+        version=_version_tuple(tag)
+        if not tag or version <= (0,0,0):
+            continue
+        candidates.append((version,release))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item:item[0],reverse=True)
+    return candidates[0][1]
+
+
 def _update_current_exe():
-    # Download and launch a newer GitHub release, if one exists.
+    # Download and launch a newer published stable GitHub release, if one exists.
     if not getattr(sys,"frozen",False):
         return False
     try:
-        api=f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest?t={int(time.time())}"
-        resp=req.get(api,headers={"Accept":"application/vnd.github+json","Cache-Control":"no-cache"},timeout=10)
-        resp.raise_for_status()
-        release=resp.json()
+        release=_get_latest_stable_release()
+        if not release:
+            return False
+
         latest_tag=str(release.get("tag_name") or "").strip()
         if not latest_tag or _version_tuple(latest_tag) <= _version_tuple(APP_VERSION):
             return False
-        asset=next((a for a in (release.get("assets") or []) if a.get("name")==GITHUB_RELEASE_ASSET),None)
+
+        asset=next(
+            (a for a in (release.get("assets") or [])
+             if a.get("name")==GITHUB_RELEASE_ASSET),
+            None
+        )
         if not asset or not asset.get("browser_download_url"):
             return False
-        download=req.get(asset["browser_download_url"],headers={"Accept":"application/octet-stream"},timeout=120)
+
+        download=req.get(
+            asset["browser_download_url"],
+            headers={
+                "Accept":"application/octet-stream",
+                "Cache-Control":"no-cache",
+            },
+            timeout=120,
+        )
         download.raise_for_status()
         data=download.content
         if not data or len(data)<1024:
             return False
+
         digest=str(asset.get("digest") or "")
         if digest.lower().startswith("sha256:"):
             import hashlib
-            if hashlib.sha256(data).hexdigest().lower()!=digest.split(":",1)[1].strip().lower():
+            expected=digest.split(":",1)[1].strip().lower()
+            actual=hashlib.sha256(data).hexdigest().lower()
+            if actual!=expected:
                 return False
+
         current_exe=os.path.abspath(sys.executable)
         update_exe=current_exe+".update"
         with open(update_exe,"wb") as f:
             f.write(data)
+
         import tempfile
-        script=os.path.join(tempfile.gettempdir(),f"jira_dep_map_update_{os.getpid()}.ps1")
-        script_text=f"""$ErrorActionPreference = \"Stop\"
+        script=os.path.join(
+            tempfile.gettempdir(),
+            f"jira_dep_map_update_{os.getpid()}.ps1"
+        )
+        script_text=f"""$ErrorActionPreference = "Stop"
 $current = '{current_exe.replace(chr(39),chr(39)+chr(39))}'
 $update = '{update_exe.replace(chr(39),chr(39)+chr(39))}'
 $pid = {os.getpid()}
@@ -77,7 +137,18 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 """
         with open(script,"w",encoding="utf-8") as f:
             f.write(script_text)
-        subprocess.Popen(["powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",script],close_fds=True,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy","Bypass",
+                "-File",script
+            ],
+            close_fds=True,
+            creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0)
+        )
         return True
     except Exception:
         return False
@@ -401,12 +472,15 @@ def api_credential_status():
 
 @app.route("/api/app-version")
 def api_app_version():
-    result={"current":APP_VERSION,"latest":APP_VERSION,"updateAvailable":False,"releaseUrl":f"https://github.com/{GITHUB_REPO}/releases/latest"}
+    result={
+        "current":APP_VERSION,
+        "latest":APP_VERSION,
+        "updateAvailable":False,
+        "releaseUrl":f"https://github.com/{GITHUB_REPO}/releases/latest"
+    }
     try:
-        api=f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest?t={int(time.time())}"
-        resp=req.get(api,headers={"Accept":"application/vnd.github+json","Cache-Control":"no-cache"},timeout=5)
-        if resp.ok:
-            release=resp.json()
+        release=_get_latest_stable_release()
+        if release:
             latest=str(release.get("tag_name") or "").strip()
             if latest:
                 result["latest"]=latest.lstrip("vV")
