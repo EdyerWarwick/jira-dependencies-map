@@ -1,75 +1,88 @@
-# Jira Dependency Map — Windows EXE
+# Jira Dependency Map — reliable side-by-side Windows updates
 
-This package is based on the supplied v33 application.
+This version uses a stable launcher and installs each application release into
+its own local version directory. The running EXE is never overwritten.
 
-## What is included
+## Release layout
 
-- `jira_dependency_map_v33.py` — the application source
-- `jira_dependency_map.spec` — PyInstaller build definition
-- `.github/workflows/build-release.yml` — Windows GitHub Actions build/release
-- `requirements.txt` — Python dependencies
+Each GitHub Release contains:
 
-## Security model
+- `Jira-Dependency-Map.exe` — the small stable launcher
+- `Jira-Dependency-Map-win64.zip` — the PyInstaller `--onedir` application
+- `Jira-Dependency-Map-win64.zip.sha256` — mandatory SHA-256 checksum
 
-The Jira email/API key is stored in the current Windows user's Windows Credential Manager.
+The launcher installs releases under:
 
-The credential is not embedded in the executable and is not sent to the browser. The Jira Basic Authentication value is generated in memory when a Jira request is made.
+```text
+%LOCALAPPDATA%\JiraDependencyMap\
+    Jira-Dependency-Map.exe
+    current.json
+    launcher.log
+    versions\
+        1.0.0\
+            Jira-Dependency-Map.exe
+            _internal\...
+        1.0.1\
+            Jira-Dependency-Map.exe
+            _internal\...
+```
 
-The executable update process downloads the latest GitHub Release executable and, when GitHub provides an asset SHA-256 digest, verifies the downloaded bytes before installing the update.
+## Update behaviour
 
-## One required configuration
+On each launch, the launcher:
 
-Before building the first release, change this line in `jira_dependency_map_v33.py`:
+1. Finds the highest stable GitHub Release.
+2. Downloads the application ZIP to a `.part` file.
+3. Checks the GitHub asset size and mandatory SHA-256 checksum.
+4. Safely extracts it into a staging directory.
+5. Atomically moves the staging directory to `versions\<version>`.
+6. Starts the new version and verifies `/api/update-health`, including its
+   version and process ID.
+7. Writes `current.json` only after the health check succeeds.
+8. Keeps the current and previous version for rollback.
 
-    GITHUB_REPO="YOUR-ORG/YOUR-REPO"
+If downloading, extraction, startup, or health checking fails, the launcher
+records the error in `launcher.log` and starts the previously selected version.
 
-to the actual GitHub repository, for example:
+## Compatibility with the old updater
 
-    GITHUB_REPO="your-org/jira-dependency-map"
+The launcher release asset keeps the name `Jira-Dependency-Map.exe`. An older
+installation can therefore download it using the previous updater. When the old
+updater starts that file, the launcher installs and starts the matching
+versioned application; the application's health endpoint then lets the old
+updater complete successfully.
 
-The executable then checks that repository's latest GitHub Release when it starts.
+## Configuration
 
-## Creating the first release
+The repository defaults to:
 
-1. Create a GitHub repository.
-2. Add the files from this package.
-3. Set `GITHUB_REPO` in `jira_dependency_map_v33.py`.
-4. Commit and push.
-5. Create and push a version tag, for example:
+```text
+EdyerWarwick/jira-dependencies-map
+```
 
-       git tag v1.0.0
-       git push origin v1.0.0
+Override it at runtime with `JIRA_DEP_MAP_GITHUB_REPO` if required.
 
-6. GitHub Actions builds the Windows executable on a Windows runner.
-7. The workflow attaches `Jira-Dependency-Map.exe` to the GitHub Release.
+## Creating a release
 
-GitHub Actions artifacts can also be retained separately from releases, which is useful for testing builds before publishing a release.
+Commit these files, then create and push a semantic version tag:
 
-## Updating the application
+```powershell
+git tag v1.0.1
+git push origin v1.0.1
+```
 
-For a new release:
+GitHub Actions builds both executables, creates the ZIP and checksum, and
+uploads all three release assets.
 
-    git tag v1.0.1
-    git push origin v1.0.1
-
-A new Windows executable is built and attached to the release.
-
-Existing users do not need to reinstall it. On their next launch, the application checks the latest release, downloads a newer executable when the version is newer, verifies the digest when available, exits the old process, replaces it, and starts the new executable.
-
-Windows Credential Manager is independent of the executable, so saved Jira credentials remain available after an update.
+For a manual `workflow_dispatch` build, files are available as a workflow
+artifact but are not attached to a GitHub Release.
 
 ## Local development
 
-Install the dependencies:
+```powershell
+python -m pip install -r requirements.txt
+python jira_dependency_map_v33.py
+```
 
-    python -m pip install -r requirements.txt
-
-Run:
-
-    python jira_dependency_map_v33.py
-
-The app starts on:
-
-    http://localhost:5001
-
-The source file deliberately remains usable as a normal Python application; the GitHub updater is only active when running from a frozen PyInstaller executable.
+The application starts at `http://localhost:5001`. The launcher only manages
+frozen release builds.
