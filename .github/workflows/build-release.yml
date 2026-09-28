@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows release
 
 on:
   push:
@@ -33,28 +33,44 @@ jobs:
             $version = "v1.0.0"
           }
 
-          $versionNumber = $version.Substring(1)
-
           $path = "jira_dependency_map_v33.py"
           $content = Get-Content $path -Raw
           $content = [regex]::Replace(
             $content,
             'APP_VERSION="[^"]*"',
-            ('APP_VERSION="' + $versionNumber + '"'),
+            ('APP_VERSION="' + $version.Substring(1) + '"'),
             1
           )
           Set-Content -Path $path -Value $content -Encoding UTF8
 
-      - name: Build EXE
-        run: python -m PyInstaller --clean --noconfirm jira_dependency_map.spec
+      - name: Build application and launcher
+        run: |
+          python -m PyInstaller --clean --noconfirm jira_dependency_map.spec
+          python -m PyInstaller --clean --noconfirm jira_dependency_map_launcher.spec
 
-      - name: Upload build artifact
+      - name: Package versioned application
+        shell: pwsh
+        run: |
+          $zip = "dist/Jira-Dependency-Map-win64.zip"
+          Compress-Archive `
+            -Path "dist/Jira-Dependency-Map/*" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
+
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          "$hash  Jira-Dependency-Map-win64.zip" |
+            Set-Content -Path "$zip.sha256" -Encoding ascii
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Jira-Dependency-Map
-          path: dist/Jira-Dependency-Map.exe
+          name: Jira-Dependency-Map-release
+          path: |
+            dist/Jira-Dependency-Map.exe
+            dist/Jira-Dependency-Map-win64.zip
+            dist/Jira-Dependency-Map-win64.zip.sha256
 
-      - name: Upload EXE to GitHub release
+      - name: Upload assets to GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -62,4 +78,6 @@ jobs:
         run: |
           gh release upload "${{ github.ref_name }}" `
             "dist/Jira-Dependency-Map.exe" `
+            "dist/Jira-Dependency-Map-win64.zip" `
+            "dist/Jira-Dependency-Map-win64.zip.sha256" `
             --clobber
