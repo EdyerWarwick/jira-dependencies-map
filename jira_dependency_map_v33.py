@@ -1434,7 +1434,7 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 <header id="app-header">
   <div class="brand">
     <span class="brand-icon">&#x2197;</span>
-    <div>Jira Dependency Map<small>WT unresolved dependencies</small></div>
+    <div>Jira Dependency Map<small>Web Evolution dependencies</small></div>
   </div>
 
   <div class="header-center">
