@@ -1187,7 +1187,7 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
     <button class="btn btn-save" id="save" disabled>SAVE (0)</button>
     <span class="header-divider" aria-hidden="true"></span>
     <button class="btn btn-toggle-completed" id="toggle-completed" title="Toggle visibility of Done / Completed tickets">
-      <span class="toggle-track"></span>Show Completed
+      <span class="toggle-track"></span>Completed
     </button>
     <button class="btn btn-toggle-milestones" id="toggle-milestones" title="View milestone overview">
       View Milestones
