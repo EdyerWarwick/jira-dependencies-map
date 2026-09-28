@@ -117,77 +117,19 @@ def expected_checksum(release, zip_asset):
     if github_digest.lower().startswith("sha256:"):
         api_digest = github_digest.split(":", 1)[1].strip().lower()
         if api_digest != expected:
-            raise RuntimeError("GitHub's digest does not match the checksum asset.")
+            raise RuntimeError("GitHub's asset digest does not match the checksum file.")
     return expected
-
-
-def download_zip(asset, destination, expected_sha256):
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    part = destination.with_suffix(destination.suffix + ".part")
-    digest = hashlib.sha256()
-    size = 0
-    try:
-        with requests.get(
-            asset["browser_download_url"],
-            headers={"Accept": "application/octet-stream", "Cache-Control": "no-cache"},
-            stream=True,
-            timeout=(15, 180),
-        ) as response:
-            response.raise_for_status()
-            with part.open("wb") as handle:
-                for chunk in response.iter_content(1024 * 1024):
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    digest.update(chunk)
-                    size += len(chunk)
-                handle.flush()
-                os.fsync(handle.fileno())
-
-        advertised_size = int(asset.get("size") or 0)
-        if advertised_size and size != advertised_size:
-            raise RuntimeError(
-                f"Download size was {size} bytes; expected {advertised_size}."
-            )
-        if digest.hexdigest().lower() != expected_sha256:
-            raise RuntimeError("The downloaded ZIP failed its SHA-256 check.")
-        os.replace(part, destination)
-    except Exception:
-        try:
-            part.unlink()
-        except OSError:
-            pass
-        raise
-
-
-def safe_extract(zip_path, destination):
-    destination_root = destination.resolve()
-    with zipfile.ZipFile(zip_path) as archive:
-        for info in archive.infolist():
-            target = (destination / info.filename).resolve()
-            if os.path.commonpath([str(destination_root), str(target)]) != str(
-                destination_root
-            ):
-                raise RuntimeError("The release ZIP contains an unsafe path.")
-        archive.extractall(destination)
-
-
-def installed_exe(version):
-    return VERSIONS_DIR / version / APP_EXE
 
 
 def read_current_version():
     try:
-        data = json.loads(CURRENT_FILE.read_text(encoding="utf-8"))
+        data = json.loads(CURRENT_FILE.read_text(encoding="utf-8-sig"))
         version = version_text(data.get("version"))
         if version and installed_exe(version).is_file():
             return version
     except (OSError, ValueError, TypeError):
         pass
-    return discover_latest_installed()
 
-
-def discover_latest_installed():
     candidates = []
     try:
         for child in VERSIONS_DIR.iterdir():
@@ -196,26 +138,79 @@ def discover_latest_installed():
                 candidates.append((parsed, child.name))
     except OSError:
         pass
-    return max(candidates, default=(None, None), key=lambda item: item[0])[1]
+    return max(candidates, default=(None, None))[1]
 
 
 def write_current(version):
     LOCAL_APP_DIR.mkdir(parents=True, exist_ok=True)
-    temporary = CURRENT_FILE.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps({"version": version}, indent=2) + "\n", encoding="utf-8"
+    temp = CURRENT_FILE.with_suffix(".json.tmp")
+    temp.write_text(
+        json.dumps({"version": version}, indent=2) + "\n",
+        encoding="utf-8",
     )
-    os.replace(temporary, CURRENT_FILE)
+    os.replace(temp, CURRENT_FILE)
 
 
-def launch_app(version, restart=False):
+def installed_exe(version):
+    return VERSIONS_DIR / version / APP_EXE
+
+
+def download_zip(asset, destination, expected_sha256):
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_suffix(destination.suffix + ".part")
+    digest = hashlib.sha256()
+    try:
+        with requests.get(
+            asset["browser_download_url"],
+            headers={"Accept": "application/octet-stream", "Cache-Control": "no-cache"},
+            stream=True,
+            timeout=(15, 180),
+        ) as response:
+            response.raise_for_status()
+            with partial.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+                        digest.update(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+        if digest.hexdigest().lower() != expected_sha256.lower():
+            raise RuntimeError("The application ZIP failed its SHA-256 check.")
+        os.replace(partial, destination)
+    except Exception:
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def safe_extract(archive, destination):
+    destination = destination.resolve()
+    with zipfile.ZipFile(archive) as package:
+        for member in package.infolist():
+            member_path = (destination / member.filename).resolve()
+            try:
+                member_path.relative_to(destination)
+            except ValueError as exc:
+                raise RuntimeError("The release ZIP contains an unsafe path.") from exc
+        package.extractall(destination)
+
+    entries = list(destination.iterdir())
+    if len(entries) == 1 and entries[0].is_dir():
+        nested = entries[0]
+        for child in list(nested.iterdir()):
+            shutil.move(str(child), destination / child.name)
+        nested.rmdir()
+
+
+def launch_app(version):
     executable = installed_exe(version)
     if not executable.is_file():
-        raise RuntimeError(f"Installed application {version} is missing.")
+        raise RuntimeError(f"Application version {version} is not installed correctly.")
     env = os.environ.copy()
     env["JIRA_DEP_MAP_MANAGED_VERSION"] = version
-    if restart:
-        env["JIRA_DEP_MAP_RESTART"] = "1"
+    env["JIRA_DEP_MAP_LAUNCHER"] = str(Path(sys.executable).resolve())
     return subprocess.Popen(
         [str(executable)],
         cwd=str(executable.parent),
@@ -225,14 +220,17 @@ def launch_app(version, restart=False):
     )
 
 
-def wait_for_health(process, expected_version, timeout=90):
-    deadline = time.monotonic() + timeout
+def wait_for_health(process, expected_version, timeout=75):
+    import requests as health_requests
+
+    expected_pid = process.pid
+    deadline = time.time() + timeout
     url = f"http://127.0.0.1:{PORT}/api/update-health"
-    while time.monotonic() < deadline:
+    while time.time() < deadline:
         if process.poll() is not None:
             return False
         try:
-            response = requests.get(
+            response = health_requests.get(
                 url,
                 params={"ts": time.time_ns()},
                 headers={"Cache-Control": "no-cache"},
@@ -243,7 +241,7 @@ def wait_for_health(process, expected_version, timeout=90):
                 response.ok
                 and data.get("ok") is True
                 and version_text(data.get("version")) == expected_version
-                and int(data.get("pid") or 0) == process.pid
+                and int(data.get("pid", -1)) == expected_pid
             ):
                 return True
         except (requests.RequestException, ValueError, TypeError):
@@ -281,38 +279,24 @@ def install_release(release, version):
             archive.unlink()
         except OSError:
             pass
+
+
 def cleanup_versions(current_version):
-   """Remove every installed application version except the active one."""
+    """Remove every installed application version except the active one."""
     current_dir = VERSIONS_DIR / current_version
     if not installed_exe(current_version).is_file():
         return
-        
+
     try:
         for child in VERSIONS_DIR.iterdir():
-            
-           if child == current_dir or not child.is_dir():
+            if child == current_dir or not child.is_dir():
                 continue
             # Remove old semantic-version directories and abandoned staging
             # directories, but leave unrelated folders untouched.
             if version_tuple(child.name) or child.name.startswith("."):
                 shutil.rmtree(child, ignore_errors=True)
-            
     except OSError:
         pass
-
-    candidates.sort(reverse=True)
-    keep = {VERSIONS_DIR / current_version}
-    if previous_version and previous_version != current_version:
-        keep.add(VERSIONS_DIR / previous_version)
-    else:
-        for _, path in candidates:
-            if path not in keep:
-                keep.add(path)
-                break
-
-    for _, path in candidates:
-        if path not in keep:
-            shutil.rmtree(path, ignore_errors=True)
 
 
 def run():
