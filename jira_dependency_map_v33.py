@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Jira Dependency Map — standalone Flask application."""
-import subprocess,sys,time,threading,webbrowser,os,base64,json,ctypes,re
+import subprocess,sys,time,threading,webbrowser,os,base64,json,ctypes
 from collections import defaultdict,deque
 import requests as req
 from flask import Flask,Response,jsonify,request
@@ -8,6 +8,8 @@ from flask import Flask,Response,jsonify,request
 JIRA_BASE_URL="https://uow-idg.atlassian.net"
 JQL_QUERY="project IN (OPD, WT) AND status NOT IN (Epics, Component) AND issuetype != Epic AND issuetype NOT IN subTaskIssueTypes()"
 PORT=5001
+
+# GitHub release/update settings. GitHub Actions patches APP_VERSION during the build.
 APP_VERSION="1.0.0"
 GITHUB_REPO=os.environ.get("JIRA_DEP_MAP_GITHUB_REPO","EdyerWarwick/jira-dependencies-map")
 GITHUB_RELEASE_ASSET="Jira-Dependency-Map.exe"
@@ -17,6 +19,69 @@ GITHUB_RELEASE_ASSET="Jira-Dependency-Map.exe"
 CREDENTIAL_TARGET="Jira Dependency Map"
 CRED_TYPE_GENERIC=1
 CRED_PERSIST_LOCAL_MACHINE=2
+
+def _version_tuple(value):
+    try:
+        parts=str(value or "").strip().lstrip("vV").split(".")
+        nums=[]
+        for part in parts[:3]:
+            digits="".join(ch for ch in part if ch.isdigit())
+            nums.append(int(digits or 0))
+        while len(nums)<3:
+            nums.append(0)
+        return tuple(nums[:3])
+    except Exception:
+        return (0,0,0)
+
+def _update_current_exe():
+    # Download and launch a newer GitHub release, if one exists.
+    if not getattr(sys,"frozen",False):
+        return False
+    try:
+        api=f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest?t={int(time.time())}"
+        resp=req.get(api,headers={"Accept":"application/vnd.github+json","Cache-Control":"no-cache"},timeout=10)
+        resp.raise_for_status()
+        release=resp.json()
+        latest_tag=str(release.get("tag_name") or "").strip()
+        if not latest_tag or _version_tuple(latest_tag) <= _version_tuple(APP_VERSION):
+            return False
+        asset=next((a for a in (release.get("assets") or []) if a.get("name")==GITHUB_RELEASE_ASSET),None)
+        if not asset or not asset.get("browser_download_url"):
+            return False
+        download=req.get(asset["browser_download_url"],headers={"Accept":"application/octet-stream"},timeout=120)
+        download.raise_for_status()
+        data=download.content
+        if not data or len(data)<1024:
+            return False
+        digest=str(asset.get("digest") or "")
+        if digest.lower().startswith("sha256:"):
+            import hashlib
+            if hashlib.sha256(data).hexdigest().lower()!=digest.split(":",1)[1].strip().lower():
+                return False
+        current_exe=os.path.abspath(sys.executable)
+        update_exe=current_exe+".update"
+        with open(update_exe,"wb") as f:
+            f.write(data)
+        import tempfile
+        script=os.path.join(tempfile.gettempdir(),f"jira_dep_map_update_{os.getpid()}.ps1")
+        script_text=f"""$ErrorActionPreference = \"Stop\"
+$current = '{current_exe.replace(chr(39),chr(39)+chr(39))}'
+$update = '{update_exe.replace(chr(39),chr(39)+chr(39))}'
+$pid = {os.getpid()}
+while (Get-Process -Id $pid -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 250 }}
+Start-Sleep -Milliseconds 250
+Move-Item -LiteralPath $update -Destination $current -Force
+Start-Process -FilePath $current
+Remove-Item -LiteralPath $update -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+"""
+        with open(script,"w",encoding="utf-8") as f:
+            f.write(script_text)
+        subprocess.Popen(["powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",script],close_fds=True,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+        return True
+    except Exception:
+        return False
+
 app=Flask(__name__)
 
 if os.name == "nt":
@@ -123,120 +188,6 @@ def get_jira_headers():
     basic=base64.b64encode(f"{credential['email']}:{credential['apiKey']}".encode("utf-8")).decode("ascii")
     return {"Authorization":f"Basic {basic}","Content-Type":"application/json","Accept":"application/json"}
 
-
-
-# ---------------------------------------------------------------------------
-# GitHub release updater
-# ---------------------------------------------------------------------------
-
-def _version_tuple(value):
-    value=str(value or "").strip().lstrip("vV")
-    parts=re.findall(r"\d+", value)
-    return tuple(int(x) for x in parts[:4]) if parts else (0,)
-
-def _update_current_exe():
-    """Check GitHub for a newer Windows release and replace this EXE safely."""
-    if not getattr(sys, "frozen", False):
-        return False
-    if not GITHUB_REPO or GITHUB_REPO.startswith("YOUR-ORG/"):
-        return False
-
-    try:
-        api=f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-        resp=req.get(api,headers={"Accept":"application/vnd.github+json"},
-                     timeout=5)
-        if not resp.ok:
-            return False
-        release=resp.json()
-        latest=str(release.get("tag_name") or "").strip()
-        if not latest or _version_tuple(latest) <= _version_tuple(APP_VERSION):
-            return False
-
-        asset=next((a for a in (release.get("assets") or [])
-                    if a.get("name")==GITHUB_RELEASE_ASSET),None)
-        if not asset:
-            return False
-        download_url=asset.get("browser_download_url")
-        if not download_url:
-            return False
-
-        current_exe=os.path.abspath(sys.executable)
-        temp_exe=current_exe + ".update"
-        download=req.get(download_url,timeout=60)
-        if not download.ok or len(download.content)<100000:
-            return False
-
-        expected=str(asset.get("digest") or "")
-        if expected.startswith("sha256:"):
-            import hashlib
-            actual=hashlib.sha256(download.content).hexdigest()
-            if actual.lower()!=expected.split(":",1)[1].lower():
-                print("Update skipped: GitHub asset digest did not match.")
-                return False
-
-        with open(temp_exe,"wb") as fh:
-            fh.write(download.content)
-
-        # Give the user visible confirmation that the new EXE has downloaded
-        # successfully and that the application is about to restart.
-        if sys.platform == "win32":
-            try:
-                import ctypes
-                ctypes.windll.user32.MessageBoxW(
-                    0,
-                    f"Jira Dependency Map {latest} has been downloaded.\n\nThe application will now restart and install the update.",
-                    "Jira Dependency Map – Updating",
-                    0x40 | 0x1000
-                )
-            except Exception:
-                pass
-
-        script_path=os.path.join(
-            os.environ.get("TEMP",os.path.dirname(current_exe)),
-            f"jira_dep_map_update_{os.getpid()}.ps1"
-        )
-        script=r"""
-param(
-    [int]$ProcessId,
-    [string]$CurrentExe,
-    [string]$NewExe,
-    [string]$ScriptPath
-)
-try {
-    Wait-Process -Id $ProcessId -Timeout 120 -ErrorAction Stop
-} catch {}
-Start-Sleep -Milliseconds 500
-for($i=0; $i -lt 20; $i++) {
-    try {
-        Move-Item -LiteralPath $NewExe -Destination $CurrentExe -Force -ErrorAction Stop
-        Start-Process -FilePath $CurrentExe
-        break
-    } catch {
-        Start-Sleep -Milliseconds 500
-    }
-}
-Remove-Item -LiteralPath $NewExe -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $ScriptPath -Force -ErrorAction SilentlyContinue
-"""
-        with open(script_path,"w",encoding="utf-8") as fh:
-            fh.write(script)
-
-        creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0)
-        subprocess.Popen(
-            ["powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass",
-             "-File",script_path,
-             "-ProcessId",str(os.getpid()),
-             "-CurrentExe",current_exe,
-             "-NewExe",temp_exe,
-             "-ScriptPath",script_path],
-            creationflags=creationflags,
-            close_fds=True
-        )
-        print(f"Updating Jira Dependency Map {APP_VERSION} -> {latest}...")
-        return True
-    except Exception as exc:
-        print(f"Update check skipped: {exc}")
-        return False
 
 # ---------------------------------------------------------------------------
 # Jira helpers
@@ -450,11 +401,10 @@ def api_credential_status():
 
 @app.route("/api/app-version")
 def api_app_version():
-    """Return the running version and the latest published GitHub release."""
     result={"current":APP_VERSION,"latest":APP_VERSION,"updateAvailable":False,"releaseUrl":f"https://github.com/{GITHUB_REPO}/releases/latest"}
     try:
-        api=f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-        resp=req.get(api,headers={"Accept":"application/vnd.github+json"},timeout=5)
+        api=f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest?t={int(time.time())}"
+        resp=req.get(api,headers={"Accept":"application/vnd.github+json","Cache-Control":"no-cache"},timeout=5)
         if resp.ok:
             release=resp.json()
             latest=str(release.get("tag_name") or "").strip()
@@ -1085,17 +1035,17 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
       <button class="modal-close" id="settings-close" type="button" aria-label="Close">×</button>
     </div>
     <div class="settings-section">
-      <div class="settings-section-title">Application</div>
-      <div class="settings-version-row">
-        <div class="settings-version-info">Current version <span class="settings-version-value" id="settings-current-version">Checking…</span><div class="settings-version-status" id="settings-latest-version">Checking latest release…</div></div>
-        <a class="settings-version-link" id="settings-release-link" href="https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest" target="_blank" rel="noopener">View release</a>
-      </div>
-    </div>
-    <div class="settings-section">
       <div class="settings-section-title">Jira account</div>
       <div class="settings-credential-row">
         <div class="settings-credential-info">Stored credential<br><span class="settings-credential-email" id="settings-email">Not configured</span></div>
         <button class="modal-secondary" id="settings-manage-credential" type="button">Manage credential</button>
+      </div>
+    </div>
+    <div class="settings-section">
+      <div class="settings-section-title">Application</div>
+      <div class="settings-version-row">
+        <div class="settings-version-info">Current version <span class="settings-version-value" id="settings-current-version">Checking…</span><div class="settings-version-status" id="settings-latest-version">Checking latest release…</div></div>
+        <a class="settings-version-link" id="settings-release-link" href="https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest" target="_blank" rel="noopener">View release</a>
       </div>
     </div>
     <div class="settings-actions">
@@ -1293,14 +1243,15 @@ async function openSettings(){
     settingsEmail.textContent = data.configured ? (data.email || 'Configured') : 'Not configured';
   }catch(e){ settingsEmail.textContent = 'Unable to check'; }
   try{
-    const r = await fetch('/api/app-version',{cache:'no-store'});
+    const r = await fetch('/api/app-version?ts=' + Date.now(),{cache:'no-store'});
     const data = await r.json().catch(()=>({}));
-    settingsCurrentVersion.textContent = data.current ? `v${data.current}` : 'Unknown';
-    settingsLatestVersion.textContent = data.latest ? (data.updateAvailable ? `Latest release: v${data.latest} available` : `Latest release: v${data.latest}`) : 'Unable to check latest release';
-    settingsReleaseLink.href = data.releaseUrl || 'https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest';
+    if(!r.ok) throw new Error('version check failed');
+    settingsCurrentVersion.textContent = data.current ? 'v' + data.current : 'Unknown';
+    settingsLatestVersion.textContent = data.updateAvailable ? 'Latest release: v' + data.latest + ' available' : 'Latest release: v' + (data.latest || data.current || 'Unknown');
+    if(data.releaseUrl) settingsReleaseLink.href = data.releaseUrl;
   }catch(e){
     settingsCurrentVersion.textContent = 'Unable to check';
-    settingsLatestVersion.textContent = 'Unable to check latest release';
+    settingsLatestVersion.textContent = 'Latest release could not be checked';
   }
 }
 
