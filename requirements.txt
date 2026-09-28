@@ -1,0 +1,5 @@
+Flask>=3.1,<4
+requests>=2.32,<3
+pystray>=0.19,<1
+Pillow>=11,<13
+pyinstaller>=6.22,<7
