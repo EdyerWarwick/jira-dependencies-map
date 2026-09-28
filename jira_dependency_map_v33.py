@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Jira Dependency Map — standalone Flask application."""
-import subprocess,sys,time,threading,webbrowser,os,base64,json,ctypes
+import subprocess,sys,time,threading,webbrowser,os,base64,json,ctypes,re
 from collections import defaultdict,deque
 import requests as req
 from flask import Flask,Response,jsonify,request
@@ -8,6 +8,9 @@ from flask import Flask,Response,jsonify,request
 JIRA_BASE_URL="https://uow-idg.atlassian.net"
 JQL_QUERY="project IN (OPD, WT) AND status NOT IN (Epics, Component) AND issuetype != Epic AND issuetype NOT IN subTaskIssueTypes()"
 PORT=5001
+APP_VERSION="1.0.0"
+GITHUB_REPO=os.environ.get("JIRA_DEP_MAP_GITHUB_REPO","EdyerWarwick/jira-dependencies-map")
+GITHUB_RELEASE_ASSET="Jira-Dependency-Map.exe"
 
 # Credentials are stored in the current Windows user's Credential Manager.
 # Nothing sensitive is embedded in this source file or sent to the browser.
@@ -120,6 +123,120 @@ def get_jira_headers():
     basic=base64.b64encode(f"{credential['email']}:{credential['apiKey']}".encode("utf-8")).decode("ascii")
     return {"Authorization":f"Basic {basic}","Content-Type":"application/json","Accept":"application/json"}
 
+
+
+# ---------------------------------------------------------------------------
+# GitHub release updater
+# ---------------------------------------------------------------------------
+
+def _version_tuple(value):
+    value=str(value or "").strip().lstrip("vV")
+    parts=re.findall(r"\d+", value)
+    return tuple(int(x) for x in parts[:4]) if parts else (0,)
+
+def _update_current_exe():
+    """Check GitHub for a newer Windows release and replace this EXE safely."""
+    if not getattr(sys, "frozen", False):
+        return False
+    if not GITHUB_REPO or GITHUB_REPO.startswith("YOUR-ORG/"):
+        return False
+
+    try:
+        api=f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        resp=req.get(api,headers={"Accept":"application/vnd.github+json"},
+                     timeout=5)
+        if not resp.ok:
+            return False
+        release=resp.json()
+        latest=str(release.get("tag_name") or "").strip()
+        if not latest or _version_tuple(latest) <= _version_tuple(APP_VERSION):
+            return False
+
+        asset=next((a for a in (release.get("assets") or [])
+                    if a.get("name")==GITHUB_RELEASE_ASSET),None)
+        if not asset:
+            return False
+        download_url=asset.get("browser_download_url")
+        if not download_url:
+            return False
+
+        current_exe=os.path.abspath(sys.executable)
+        temp_exe=current_exe + ".update"
+        download=req.get(download_url,timeout=60)
+        if not download.ok or len(download.content)<100000:
+            return False
+
+        expected=str(asset.get("digest") or "")
+        if expected.startswith("sha256:"):
+            import hashlib
+            actual=hashlib.sha256(download.content).hexdigest()
+            if actual.lower()!=expected.split(":",1)[1].lower():
+                print("Update skipped: GitHub asset digest did not match.")
+                return False
+
+        with open(temp_exe,"wb") as fh:
+            fh.write(download.content)
+
+        # Give the user visible confirmation that the new EXE has downloaded
+        # successfully and that the application is about to restart.
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    f"Jira Dependency Map {latest} has been downloaded.\n\nThe application will now restart and install the update.",
+                    "Jira Dependency Map – Updating",
+                    0x40 | 0x1000
+                )
+            except Exception:
+                pass
+
+        script_path=os.path.join(
+            os.environ.get("TEMP",os.path.dirname(current_exe)),
+            f"jira_dep_map_update_{os.getpid()}.ps1"
+        )
+        script=r"""
+param(
+    [int]$ProcessId,
+    [string]$CurrentExe,
+    [string]$NewExe,
+    [string]$ScriptPath
+)
+try {
+    Wait-Process -Id $ProcessId -Timeout 120 -ErrorAction Stop
+} catch {}
+Start-Sleep -Milliseconds 500
+for($i=0; $i -lt 20; $i++) {
+    try {
+        Move-Item -LiteralPath $NewExe -Destination $CurrentExe -Force -ErrorAction Stop
+        Start-Process -FilePath $CurrentExe
+        break
+    } catch {
+        Start-Sleep -Milliseconds 500
+    }
+}
+Remove-Item -LiteralPath $NewExe -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $ScriptPath -Force -ErrorAction SilentlyContinue
+"""
+        with open(script_path,"w",encoding="utf-8") as fh:
+            fh.write(script)
+
+        creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0)
+        subprocess.Popen(
+            ["powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass",
+             "-File",script_path,
+             "-ProcessId",str(os.getpid()),
+             "-CurrentExe",current_exe,
+             "-NewExe",temp_exe,
+             "-ScriptPath",script_path],
+            creationflags=creationflags,
+            close_fds=True
+        )
+        print(f"Updating Jira Dependency Map {APP_VERSION} -> {latest}...")
+        return True
+    except Exception as exc:
+        print(f"Update check skipped: {exc}")
+        return False
 
 # ---------------------------------------------------------------------------
 # Jira helpers
@@ -330,6 +447,24 @@ def api_credential_status():
         return jsonify({"configured":bool(credential),"email":credential["email"] if credential else ""})
     except Exception as e:
         return jsonify({"configured":False,"error":str(e)}),500
+
+@app.route("/api/app-version")
+def api_app_version():
+    """Return the running version and the latest published GitHub release."""
+    result={"current":APP_VERSION,"latest":APP_VERSION,"updateAvailable":False,"releaseUrl":f"https://github.com/{GITHUB_REPO}/releases/latest"}
+    try:
+        api=f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        resp=req.get(api,headers={"Accept":"application/vnd.github+json"},timeout=5)
+        if resp.ok:
+            release=resp.json()
+            latest=str(release.get("tag_name") or "").strip()
+            if latest:
+                result["latest"]=latest.lstrip("vV")
+                result["updateAvailable"]=_version_tuple(latest)>_version_tuple(APP_VERSION)
+                result["releaseUrl"]=release.get("html_url") or result["releaseUrl"]
+    except Exception:
+        pass
+    return jsonify(result)
 
 @app.route("/api/credentials",methods=["POST"])
 def api_credentials():
@@ -891,6 +1026,12 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 .settings-credential-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .settings-credential-info{font-size:12px;color:#334155}
 .settings-credential-email{font-weight:700;color:#172033}
+.settings-version-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.settings-version-info{font-size:12px;color:#334155;line-height:1.5}
+.settings-version-value{font-weight:700;color:#172033}
+.settings-version-status{font-size:11px;color:#64748b;margin-top:2px}
+.settings-version-link{color:#4f46e5;text-decoration:none;font-weight:700;white-space:nowrap}
+.settings-version-link:hover{text-decoration:underline}
 .settings-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
 /* ── Credential setup / management ───────────────────────────────────────── */
 #credential-modal{
@@ -942,6 +1083,13 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
     <div class="settings-head">
       <h2 id="settings-title">Settings</h2>
       <button class="modal-close" id="settings-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="settings-section">
+      <div class="settings-section-title">Application</div>
+      <div class="settings-version-row">
+        <div class="settings-version-info">Current version <span class="settings-version-value" id="settings-current-version">Checking…</span><div class="settings-version-status" id="settings-latest-version">Checking latest release…</div></div>
+        <a class="settings-version-link" id="settings-release-link" href="https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest" target="_blank" rel="noopener">View release</a>
+      </div>
     </div>
     <div class="settings-section">
       <div class="settings-section-title">Jira account</div>
@@ -1109,6 +1257,9 @@ const credentialCancel = document.getElementById('credential-cancel');
 const settingsBtn = document.getElementById('settings');
 const settingsModal = document.getElementById('settings-modal');
 const settingsEmail = document.getElementById('settings-email');
+const settingsCurrentVersion = document.getElementById('settings-current-version');
+const settingsLatestVersion = document.getElementById('settings-latest-version');
+const settingsReleaseLink = document.getElementById('settings-release-link');
 const settingsManageCredential = document.getElementById('settings-manage-credential');
 const settingsClose = document.getElementById('settings-close');
 const settingsCloseBottom = document.getElementById('settings-close-bottom');
@@ -1134,11 +1285,23 @@ function closeSettings(){ settingsModal.classList.remove('open'); }
 async function openSettings(){
   settingsModal.classList.add('open');
   settingsEmail.textContent = 'Checking…';
+  settingsCurrentVersion.textContent = 'Checking…';
+  settingsLatestVersion.textContent = 'Checking latest release…';
   try{
     const r = await fetch('/api/credential-status',{cache:'no-store'});
     const data = await r.json().catch(()=>({}));
     settingsEmail.textContent = data.configured ? (data.email || 'Configured') : 'Not configured';
   }catch(e){ settingsEmail.textContent = 'Unable to check'; }
+  try{
+    const r = await fetch('/api/app-version',{cache:'no-store'});
+    const data = await r.json().catch(()=>({}));
+    settingsCurrentVersion.textContent = data.current ? `v${data.current}` : 'Unknown';
+    settingsLatestVersion.textContent = data.latest ? (data.updateAvailable ? `Latest release: v${data.latest} available` : `Latest release: v${data.latest}`) : 'Unable to check latest release';
+    settingsReleaseLink.href = data.releaseUrl || 'https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest';
+  }catch(e){
+    settingsCurrentVersion.textContent = 'Unable to check';
+    settingsLatestVersion.textContent = 'Unable to check latest release';
+  }
 }
 
 // ── Windows credential setup ───────────────────────────────────────────────
@@ -3024,6 +3187,8 @@ def run_flask():
     app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
+    if _update_current_exe():
+        sys.exit(0)
     clear_port_windows(PORT)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
