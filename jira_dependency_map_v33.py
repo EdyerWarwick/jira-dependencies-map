@@ -127,8 +127,8 @@ def _update_current_exe():
         script_text=f"""$ErrorActionPreference = "Stop"
 $current = '{current_exe.replace(chr(39),chr(39)+chr(39))}'
 $update = '{update_exe.replace(chr(39),chr(39)+chr(39))}'
-$pid = {os.getpid()}
-while (Get-Process -Id $pid -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 250 }}
+$processId = {os.getpid()}
+while (Get-Process -Id $processId -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 250 }}
 Start-Sleep -Milliseconds 250
 Move-Item -LiteralPath $update -Destination $current -Force
 Start-Process -FilePath $current
