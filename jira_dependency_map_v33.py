@@ -72,85 +72,191 @@ def _get_latest_stable_release():
     return candidates[0][1]
 
 
-def _update_current_exe():
-    # Download and launch a newer published stable GitHub release, if one exists.
-    if not getattr(sys,"frozen",False):
-        return False
+def _ps_single_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _record_update_error(message):
     try:
-        release=_get_latest_stable_release()
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "jira_dep_map_update_error.log")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        pass
+
+
+def _update_current_exe():
+    """Download and atomically replace this executable with the newest stable release."""
+    if not getattr(sys, "frozen", False):
+        return False
+
+    try:
+        release = _get_latest_stable_release()
         if not release:
             return False
 
-        latest_tag=str(release.get("tag_name") or "").strip()
+        latest_tag = str(release.get("tag_name") or "").strip()
         if not latest_tag or _version_tuple(latest_tag) <= _version_tuple(APP_VERSION):
             return False
 
-        asset=next(
-            (a for a in (release.get("assets") or [])
-             if a.get("name")==GITHUB_RELEASE_ASSET),
-            None
+        asset = next(
+            (
+                item
+                for item in (release.get("assets") or [])
+                if item.get("name") == GITHUB_RELEASE_ASSET
+            ),
+            None,
         )
         if not asset or not asset.get("browser_download_url"):
-            return False
+            raise RuntimeError(
+                f"Release {latest_tag} does not contain {GITHUB_RELEASE_ASSET}."
+            )
 
-        download=req.get(
+        response = req.get(
             asset["browser_download_url"],
             headers={
-                "Accept":"application/octet-stream",
-                "Cache-Control":"no-cache",
+                "Accept": "application/octet-stream",
+                "Cache-Control": "no-cache",
             },
             timeout=120,
         )
-        download.raise_for_status()
-        data=download.content
-        if not data or len(data)<1024:
-            return False
+        response.raise_for_status()
+        data = response.content
 
-        digest=str(asset.get("digest") or "")
+        # Reject an HTML error page or an obviously incomplete executable.
+        if len(data) < 1024 or data[:2] != b"MZ":
+            raise RuntimeError("The downloaded release asset is not a valid Windows executable.")
+
+        digest = str(asset.get("digest") or "")
         if digest.lower().startswith("sha256:"):
             import hashlib
-            expected=digest.split(":",1)[1].strip().lower()
-            actual=hashlib.sha256(data).hexdigest().lower()
-            if actual!=expected:
-                return False
 
-        current_exe=os.path.abspath(sys.executable)
-        update_exe=current_exe+".update"
-        with open(update_exe,"wb") as f:
-            f.write(data)
+            expected = digest.split(":", 1)[1].strip().lower()
+            actual = hashlib.sha256(data).hexdigest().lower()
+            if actual != expected:
+                raise RuntimeError("The downloaded executable failed its SHA-256 check.")
 
         import tempfile
-        script=os.path.join(
+
+        current_exe = os.path.abspath(sys.executable)
+        update_exe = current_exe + ".update.exe"
+        download_file = current_exe + ".download"
+        backup_exe = current_exe + ".previous"
+        error_log = os.path.join(tempfile.gettempdir(), "jira_dep_map_update_error.log")
+        script = os.path.join(
             tempfile.gettempdir(),
-            f"jira_dep_map_update_{os.getpid()}.ps1"
+            f"jira_dep_map_update_{os.getpid()}.ps1",
         )
-        script_text=f"""$ErrorActionPreference = "Stop"
-$current = '{current_exe.replace(chr(39),chr(39)+chr(39))}'
-$update = '{update_exe.replace(chr(39),chr(39)+chr(39))}'
-$processId = {os.getpid()}
-while (Get-Process -Id $processId -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 250 }}
-Start-Sleep -Milliseconds 250
-Move-Item -LiteralPath $update -Destination $current -Force
-Start-Process -FilePath $current
-Remove-Item -LiteralPath $update -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+
+        # Write to a temporary file first, then rename it into place so the helper
+        # can never see a partially written update.
+        with open(download_file, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(download_file, update_exe)
+
+        script_text = f"""$ErrorActionPreference = "Stop"
+$current = {_ps_single_quote(current_exe)}
+$update = {_ps_single_quote(update_exe)}
+$backup = {_ps_single_quote(backup_exe)}
+$errorLog = {_ps_single_quote(error_log)}
+$parentProcessId = {os.getpid()}
+
+try {{
+    $deadline = (Get-Date).AddSeconds(90)
+    while ((Get-Process -Id $parentProcessId -ErrorAction SilentlyContinue) -and
+           ((Get-Date) -lt $deadline)) {{
+        Start-Sleep -Milliseconds 250
+    }}
+
+    if (Get-Process -Id $parentProcessId -ErrorAction SilentlyContinue) {{
+        throw "The old application process did not exit within 90 seconds."
+    }}
+
+    $lastFailure = "Unknown update error"
+
+    for ($attempt = 1; $attempt -le 120; $attempt++) {{
+        $replaced = $false
+        try {{
+            if (-not (Test-Path -LiteralPath $update)) {{
+                throw "The staged update file is missing."
+            }}
+
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+
+            if (Test-Path -LiteralPath $current) {{
+                [System.IO.File]::Replace($update, $current, $backup, $true)
+            }} else {{
+                Move-Item -LiteralPath $update -Destination $current -Force
+            }}
+            $replaced = $true
+
+            $child = Start-Process `
+                -FilePath $current `
+                -WorkingDirectory (Split-Path -Parent $current) `
+                -PassThru
+
+            Start-Sleep -Milliseconds 1500
+            $child.Refresh()
+            if ($child.HasExited) {{
+                throw "The updated application exited immediately with code $($child.ExitCode)."
+            }}
+
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $errorLog -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+            exit 0
+        }}
+        catch {{
+            $lastFailure = $_.Exception.Message
+
+            if ($replaced -and (Test-Path -LiteralPath $backup)) {{
+                Copy-Item -LiteralPath $current -Destination $update -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+                Move-Item -LiteralPath $backup -Destination $current -Force -ErrorAction SilentlyContinue
+            }}
+
+            Start-Sleep -Milliseconds 500
+        }}
+    }}
+
+    throw "Update replacement failed after 120 attempts: $lastFailure"
+}}
+catch {{
+    $line = "$(Get-Date -Format o) $($_.Exception.Message)"
+    Add-Content -LiteralPath $errorLog -Value $line -Encoding UTF8
+    exit 1
+}}
 """
-        with open(script,"w",encoding="utf-8") as f:
-            f.write(script_text)
+
+        # Windows PowerShell 5.1 reliably detects UTF-8 when a BOM is present.
+        with open(script, "w", encoding="utf-8-sig", newline="\r\n") as handle:
+            handle.write(script_text)
 
         subprocess.Popen(
             [
                 "powershell.exe",
                 "-NoProfile",
                 "-NonInteractive",
-                "-ExecutionPolicy","Bypass",
-                "-File",script
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script,
             ],
             close_fds=True,
-            creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0)
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return True
-    except Exception:
+
+    except Exception as exc:
+        _record_update_error(f"Could not stage application update: {exc}")
+        for suffix in (".download",):
+            try:
+                os.remove(os.path.abspath(sys.executable) + suffix)
+            except OSError:
+                pass
         return False
 
 app=Flask(__name__)
