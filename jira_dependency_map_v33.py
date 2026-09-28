@@ -14,6 +14,11 @@ APP_VERSION="1.0.0"
 GITHUB_REPO=os.environ.get("JIRA_DEP_MAP_GITHUB_REPO","EdyerWarwick/jira-dependencies-map")
 GITHUB_RELEASE_ASSET="Jira-Dependency-Map.exe"
 
+# Local installation directory — always a fast local path regardless of where
+# the user placed the shortcut/exe (e.g. a roaming network profile desktop).
+LOCAL_APP_DIR=os.path.join(os.environ.get("LOCALAPPDATA",os.path.expanduser("~")),"JiraDependencyMap")
+LOCAL_EXE=os.path.join(LOCAL_APP_DIR,GITHUB_RELEASE_ASSET)
+
 # Credentials are stored in the current Windows user's Credential Manager.
 # Nothing sensitive is embedded in this source file or sent to the browser.
 CREDENTIAL_TARGET="Jira Dependency Map"
@@ -86,9 +91,88 @@ def _record_update_error(message):
         pass
 
 
-def _update_current_exe():
-    """Download and atomically replace this executable with the newest stable release."""
+def _is_network_path(path: str) -> bool:
+    """Return True when *path* lives on a UNC share or a mapped network drive."""
+    p = os.path.abspath(path)
+    if p.startswith("\\\\"):
+        return True
+    drive = os.path.splitdrive(p)[0].upper()
+    if not drive:
+        return False
+    try:
+        result = subprocess.run(
+            ["net", "use", drive],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _bootstrap_local_exe() -> bool:
+    """Ensure the app always runs from a local path, not a network share.
+
+    If the current exe is on a network path, copy it to LOCAL_APP_DIR on the
+    first run and then launch the local copy.  Subsequent runs launch the
+    local copy directly.  Returns True when the caller should exit immediately
+    (i.e. delegation to the local copy happened).
+    """
     if not getattr(sys, "frozen", False):
+        return False
+
+    current_exe = os.path.abspath(sys.executable)
+
+    # Already running from the managed local copy — nothing to delegate.
+    if os.path.normcase(current_exe) == os.path.normcase(LOCAL_EXE):
+        return False
+
+    on_network = _is_network_path(current_exe)
+    local_exists = os.path.isfile(LOCAL_EXE)
+
+    # Running locally and no separate local copy exists — run in-place as normal.
+    if not on_network and not local_exists:
+        return False
+
+    if not local_exists:
+        # First run from a network path: seed the local copy from ourselves.
+        try:
+            import shutil
+            os.makedirs(LOCAL_APP_DIR, exist_ok=True)
+            shutil.copy2(current_exe, LOCAL_EXE)
+        except Exception as exc:
+            _record_update_error(f"Could not seed local exe: {exc}")
+            return False  # Fall back to running in-place
+
+    # Launch the local copy and let this (network-path) process exit.
+    env = os.environ.copy()
+    env.pop("JIRA_DEP_MAP_SKIP_UPDATE", None)
+    try:
+        subprocess.Popen(
+            [LOCAL_EXE],
+            cwd=LOCAL_APP_DIR,
+            env=env,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 8),
+        )
+    except Exception as exc:
+        _record_update_error(f"Could not launch local exe: {exc}")
+        return False
+    return True
+
+
+def _update_current_exe():
+    """Download the newest stable release into LOCAL_APP_DIR.
+
+    Updates always target the local-appdata copy regardless of where the
+    shortcut/exe lives, so file-replacement on network shares is avoided.
+    """
+    if not getattr(sys, "frozen", False):
+        return False
+
+    # Only the local managed copy should self-update; the network-path copy
+    # is just a bootstrapper and never needs to be replaced.
+    current_exe = LOCAL_EXE
+    if not os.path.isfile(current_exe):
         return False
 
     try:
@@ -100,7 +184,6 @@ def _update_current_exe():
         if not latest_tag or _version_tuple(latest_tag) <= _version_tuple(APP_VERSION):
             return False
 
-        current_exe = os.path.abspath(sys.executable)
         failed_version_file = current_exe + ".failed-update.txt"
         try:
             with open(failed_version_file, "r", encoding="utf-8-sig") as handle:
@@ -3407,6 +3490,10 @@ def run_flask():
 
 if __name__ == "__main__":
     skip_update=os.environ.pop("JIRA_DEP_MAP_SKIP_UPDATE","")=="1"
+    # If running from a network path, delegate to (or seed) the local copy and exit.
+    if not skip_update and _bootstrap_local_exe():
+        sys.exit(0)
+    # Now running from LOCAL_APP_DIR — safe to self-update over a reliable local path.
     if not skip_update and _update_current_exe():
         sys.exit(0)
     clear_port_windows(PORT)
