@@ -1519,6 +1519,12 @@ function applySearchFilter(){
     const count = col.querySelectorAll('.card:not([hidden])').length;
     const countEl = col.querySelector('.column-count');
     if(countEl) countEl.textContent = count;
+
+    // While searching, hide entire dependency levels that contain no matches.
+    // This keeps matching levels adjacent so users do not have to horizontally
+    // scroll through empty columns (e.g. matches in Level 3 and Level 5 only).
+    // When the search is cleared, restore all columns.
+    col.style.display = words.length && count === 0 ? 'none' : '';
   });
 
   searchClear.classList.toggle('visible', !!words.length && !state.lockedKey);
