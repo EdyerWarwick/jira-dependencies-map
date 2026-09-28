@@ -949,7 +949,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:7px}
 .card-top-left{display:flex;align-items:center;gap:6px;min-width:0}
 .assignee-select{font:inherit;border:0;background:transparent;color:var(--muted);cursor:pointer;min-width:0;padding:0;outline:none}
-.assignee-select{font-size:11px;max-width:100%;margin-top:7px}
+.assignee-select{font-size:12px;width:100%;max-width:100%;margin-top:7px}
 .priority-picker{position:relative;display:inline-flex;align-items:center;flex-shrink:0}
 .priority-trigger{display:flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:0;background:transparent;border-radius:4px;cursor:pointer}
 .priority-trigger:hover,.priority-picker.open .priority-trigger{background:#f1f5f9}
