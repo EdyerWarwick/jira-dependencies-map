@@ -434,6 +434,24 @@ def api_credential_status():
     except Exception as e:
         return jsonify({"configured":False,"error":str(e)}),500
 
+@app.route("/api/app-version")
+def api_app_version():
+    """Return the running version and the latest published GitHub release."""
+    result={"current":APP_VERSION,"latest":APP_VERSION,"updateAvailable":False,"releaseUrl":f"https://github.com/{GITHUB_REPO}/releases/latest"}
+    try:
+        api=f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        resp=req.get(api,headers={"Accept":"application/vnd.github+json"},timeout=5)
+        if resp.ok:
+            release=resp.json()
+            latest=str(release.get("tag_name") or "").strip()
+            if latest:
+                result["latest"]=latest.lstrip("vV")
+                result["updateAvailable"]=_version_tuple(latest)>_version_tuple(APP_VERSION)
+                result["releaseUrl"]=release.get("html_url") or result["releaseUrl"]
+    except Exception:
+        pass
+    return jsonify(result)
+
 @app.route("/api/credentials",methods=["POST"])
 def api_credentials():
     try:
@@ -994,6 +1012,12 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 .settings-credential-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .settings-credential-info{font-size:12px;color:#334155}
 .settings-credential-email{font-weight:700;color:#172033}
+.settings-version-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.settings-version-info{font-size:12px;color:#334155;line-height:1.5}
+.settings-version-value{font-weight:700;color:#172033}
+.settings-version-status{font-size:11px;color:#64748b;margin-top:2px}
+.settings-version-link{color:#4f46e5;text-decoration:none;font-weight:700;white-space:nowrap}
+.settings-version-link:hover{text-decoration:underline}
 .settings-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
 /* ── Credential setup / management ───────────────────────────────────────── */
 #credential-modal{
@@ -1045,6 +1069,13 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
     <div class="settings-head">
       <h2 id="settings-title">Settings</h2>
       <button class="modal-close" id="settings-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="settings-section">
+      <div class="settings-section-title">Application</div>
+      <div class="settings-version-row">
+        <div class="settings-version-info">Current version <span class="settings-version-value" id="settings-current-version">Checking…</span><div class="settings-version-status" id="settings-latest-version">Checking latest release…</div></div>
+        <a class="settings-version-link" id="settings-release-link" href="https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest" target="_blank" rel="noopener">View release</a>
+      </div>
     </div>
     <div class="settings-section">
       <div class="settings-section-title">Jira account</div>
@@ -1212,6 +1243,9 @@ const credentialCancel = document.getElementById('credential-cancel');
 const settingsBtn = document.getElementById('settings');
 const settingsModal = document.getElementById('settings-modal');
 const settingsEmail = document.getElementById('settings-email');
+const settingsCurrentVersion = document.getElementById('settings-current-version');
+const settingsLatestVersion = document.getElementById('settings-latest-version');
+const settingsReleaseLink = document.getElementById('settings-release-link');
 const settingsManageCredential = document.getElementById('settings-manage-credential');
 const settingsClose = document.getElementById('settings-close');
 const settingsCloseBottom = document.getElementById('settings-close-bottom');
@@ -1237,11 +1271,23 @@ function closeSettings(){ settingsModal.classList.remove('open'); }
 async function openSettings(){
   settingsModal.classList.add('open');
   settingsEmail.textContent = 'Checking…';
+  settingsCurrentVersion.textContent = 'Checking…';
+  settingsLatestVersion.textContent = 'Checking latest release…';
   try{
     const r = await fetch('/api/credential-status',{cache:'no-store'});
     const data = await r.json().catch(()=>({}));
     settingsEmail.textContent = data.configured ? (data.email || 'Configured') : 'Not configured';
   }catch(e){ settingsEmail.textContent = 'Unable to check'; }
+  try{
+    const r = await fetch('/api/app-version',{cache:'no-store'});
+    const data = await r.json().catch(()=>({}));
+    settingsCurrentVersion.textContent = data.current ? `v${data.current}` : 'Unknown';
+    settingsLatestVersion.textContent = data.latest ? (data.updateAvailable ? `Latest release: v${data.latest} available` : `Latest release: v${data.latest}`) : 'Unable to check latest release';
+    settingsReleaseLink.href = data.releaseUrl || 'https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest';
+  }catch(e){
+    settingsCurrentVersion.textContent = 'Unable to check';
+    settingsLatestVersion.textContent = 'Unable to check latest release';
+  }
 }
 
 // ── Windows credential setup ───────────────────────────────────────────────
