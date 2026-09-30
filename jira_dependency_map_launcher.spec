@@ -1,8 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+project_dir = Path(SPECPATH)
+icon_file = project_dir / "assets" / "jira-dependency-map.ico"
+
+if not icon_file.is_file():
+    raise FileNotFoundError(f"Launcher icon not found: {icon_file}")
+
+
 a = Analysis(
-    ["jira_dependency_map_launcher.py"],
-    pathex=[],
+    [str(project_dir / "jira_dependency_map_launcher.py")],
+    pathex=[str(project_dir)],
     binaries=[],
     datas=[],
     hiddenimports=[],
@@ -22,10 +31,10 @@ exe = EXE(
     a.datas,
     [],
     name="Jira-Dependency-Map",
-    icon="assets/jira-dependency-map.ico",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     console=False,
+    icon=str(icon_file),
 )
