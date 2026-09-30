@@ -988,6 +988,16 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 .settings-help a:hover{text-decoration:underline}
 .settings-feedback-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .settings-feedback-info{font-size:12px;line-height:1.45;color:#334155}
+.settings-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:14px}
+.settings-toggle-info{font-size:12px;line-height:1.45;color:#334155}
+.settings-toggle-title{font-weight:700;color:#172033}
+.settings-toggle-help{font-size:10px;color:#64748b;margin-top:2px}
+.settings-toggle{display:inline-flex;align-items:center;gap:7px;flex:0 0 auto;border:0;background:transparent;color:#475569;padding:0;cursor:pointer;font:inherit}
+.settings-toggle-track{display:inline-block;position:relative;width:34px;height:20px;border-radius:10px;background:#cbd5e1;transition:background .18s}
+.settings-toggle-track::after{content:"";position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:2px;left:2px;box-shadow:0 1px 2px rgba(15,23,42,.18);transition:transform .18s}
+.settings-toggle.active .settings-toggle-track{background:#6366f1}
+.settings-toggle.active .settings-toggle-track::after{transform:translateX(14px)}
+.settings-toggle-state{font-size:11px;font-weight:700;min-width:22px;text-align:right}
 .settings-feedback-button{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;text-decoration:none;font-weight:700;white-space:nowrap}
 .settings-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
 /* ── Credential setup / management ───────────────────────────────────────── */
@@ -1030,6 +1040,8 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 }
 .credential-error{display:none;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:7px;padding:9px 10px;font-size:11px;line-height:1.4;margin-bottom:12px}
 .credential-error.visible{display:block}
+.credential-help{font-size:11px;color:#64748b;margin:-2px 0 10px;line-height:1.4}
+.credential-help a{color:#0057b8;text-decoration:underline}
 .credential-status{font-size:10px;color:#64748b;margin-top:8px;min-height:14px}
 </style>
 </head>
@@ -1050,6 +1062,19 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
       <div class="settings-help">
         Need an API token?
         <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noopener noreferrer">Create one in Atlassian</a>
+      </div>
+    </div>
+    <div class="settings-section">
+      <div class="settings-section-title">Jira tickets</div>
+      <div class="settings-toggle-row">
+        <div class="settings-toggle-info">
+          <div class="settings-toggle-title">Use Jira modal</div>
+          <div class="settings-toggle-help">Open Jira tickets inside the app instead of a new browser tab.</div>
+        </div>
+        <button class="settings-toggle" id="settings-use-jira-modal" type="button" role="switch" aria-checked="false">
+          <span class="settings-toggle-track" aria-hidden="true"></span>
+          <span class="settings-toggle-state">Off</span>
+        </button>
       </div>
     </div>
     <div class="settings-section">
@@ -1084,6 +1109,10 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
     <div class="credential-field">
       <label for="credential-api-key">Jira API key</label>
       <input id="credential-api-key" type="password" autocomplete="current-password" spellcheck="false" placeholder="Paste your API key">
+    </div>
+    <div class="credential-help">
+      Need an API token?
+      <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noopener noreferrer">Create one in Atlassian</a>
     </div>
     <div class="credential-note">The API key is converted to Jira's base64 Basic Authentication value only in memory when a Jira request is made. It is never written into the Python source or sent to the browser.</div>
     <div class="credential-status" id="credential-status"></div>
@@ -1229,6 +1258,7 @@ const settingsCurrentVersion = document.getElementById('settings-current-version
 const settingsLatestVersion = document.getElementById('settings-latest-version');
 const settingsReleaseLink = document.getElementById('settings-release-link');
 const settingsManageCredential = document.getElementById('settings-manage-credential');
+const settingsUseJiraModal = document.getElementById('settings-use-jira-modal');
 const settingsClose = document.getElementById('settings-close');
 const settingsCloseBottom = document.getElementById('settings-close-bottom');
 
@@ -1249,8 +1279,26 @@ const loadingStages = [
 
 
 // ── Settings ───────────────────────────────────────────────────────────────
+const JIRA_MODAL_STORAGE_KEY = 'jiraDependencyMap.useJiraModal';
+function getUseJiraModal(){
+  try{ return localStorage.getItem(JIRA_MODAL_STORAGE_KEY) === 'true'; }
+  catch(e){ return false; }
+}
+function setUseJiraModal(enabled){
+  try{ localStorage.setItem(JIRA_MODAL_STORAGE_KEY, enabled ? 'true' : 'false'); }catch(e){}
+  updateJiraModalSetting();
+}
+function updateJiraModalSetting(){
+  if(!settingsUseJiraModal) return;
+  const enabled = getUseJiraModal();
+  settingsUseJiraModal.classList.toggle('active', enabled);
+  settingsUseJiraModal.setAttribute('aria-checked', enabled ? 'true' : 'false');
+  const stateLabel = settingsUseJiraModal.querySelector('.settings-toggle-state');
+  if(stateLabel) stateLabel.textContent = enabled ? 'On' : 'Off';
+}
 function closeSettings(){ settingsModal.classList.remove('open'); }
 async function openSettings(){
+  updateJiraModalSetting();
   settingsModal.classList.add('open');
   settingsEmail.textContent = 'Checking…';
   settingsCurrentVersion.textContent = 'Checking…';
@@ -2752,6 +2800,14 @@ function attachTicketKeyModalHandlers(root=document){
     link.dataset.ticketModalBound = '1';
     link.addEventListener('click', e => {
       if(e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+
+      // Default behaviour: let the existing target="_blank" link open Jira in a new tab.
+      // Only intercept the click when the user has explicitly enabled the Jira modal.
+      if(!getUseJiraModal()){
+        e.stopPropagation();
+        return;
+      }
+
       e.preventDefault();
       e.stopPropagation();
 
@@ -3071,6 +3127,9 @@ credentialSave.addEventListener('click', saveCredential);
 credentialRemove.addEventListener('click', removeCredential);
 credentialCancel.addEventListener('click', closeCredentialModal);
 settingsBtn.addEventListener('click', openSettings);
+settingsUseJiraModal.addEventListener('click', () => {
+  setUseJiraModal(!getUseJiraModal());
+});
 settingsClose.addEventListener('click', closeSettings);
 settingsCloseBottom.addEventListener('click', closeSettings);
 settingsModal.addEventListener('click', e => { if(e.target === settingsModal) closeSettings(); });
@@ -3108,6 +3167,7 @@ window.addEventListener('resize', () => requestAnimationFrame(drawLines));
 // view the board, cards and SVG move together, so rebuilding the paths on
 // every scroll frame only causes flicker.
 
+updateJiraModalSetting();
 initialiseApp();
 </script>
 </body>
@@ -3154,29 +3214,78 @@ def run_flask():
     app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    clear_port_windows(PORT)
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    try:
-        import pystray
-        from PIL import Image as _Img
-        def on_open(icon, item): webbrowser.open(f'http://localhost:{PORT}')
-        def on_quit(icon, item): icon.stop(); sys.exit(0)
-        menu = pystray.Menu(
-            pystray.MenuItem('Open Dependency Map', on_open, default=True),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem('Quit', on_quit),
-        )
-        tray = pystray.Icon('jira-dependency-map', make_tray_icon(), 'Jira Dependency Map', menu)
-        if os.environ.get('JIRA_DEP_MAP_RESTART') != '1':
-            threading.Timer(0.8, lambda: webbrowser.open(f'http://localhost:{PORT}')).start()
+    # Packaged EXE behaviour is unchanged:
+    # - reclaim the fixed port
+    # - run the tray application
+    #
+    # Local .py behaviour:
+    # - never kill another process using the port
+    # - do not require pystray/Pillow or the packaged tray asset
+    # - start Flask and open the browser directly
+    if getattr(sys, "frozen", False):
+        clear_port_windows(PORT)
+
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+
+        try:
+            import pystray
+            from PIL import Image as _Img
+
+            def on_open(icon, item):
+                webbrowser.open(f'http://localhost:{PORT}')
+
+            def on_quit(icon, item):
+                icon.stop()
+                sys.exit(0)
+
+            menu = pystray.Menu(
+                pystray.MenuItem('Open Dependency Map', on_open, default=True),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem('Quit', on_quit),
+            )
+
+            tray = pystray.Icon(
+                'jira-dependency-map',
+                make_tray_icon(),
+                'Jira Dependency Map',
+                menu
+            )
+
+            if os.environ.get('JIRA_DEP_MAP_RESTART') != '1':
+                threading.Timer(
+                    0.8,
+                    lambda: webbrowser.open(f'http://localhost:{PORT}')
+                ).start()
+
+            print(f'Jira Dependency Map -> http://localhost:{PORT}')
+            tray.run()
+
+        except ImportError:
+            print('  pystray / Pillow not found - running in terminal mode.')
+            print(f'  Starting -> http://localhost:{PORT}')
+            if os.environ.get('JIRA_DEP_MAP_RESTART') != '1':
+                webbrowser.open(f'http://localhost:{PORT}')
+            try:
+                flask_thread.join()
+            except KeyboardInterrupt:
+                print('\n  Stopped.')
+                sys.exit(0)
+
+    else:
+        # Local Python development mode.
+        # Keep this completely separate from the packaged tray application.
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+
         print(f'Jira Dependency Map -> http://localhost:{PORT}')
-        tray.run()
-    except ImportError:
-        print('  pystray / Pillow not found - running in terminal mode.')
-        print(f'  Starting -> http://localhost:{PORT}')
+
         if os.environ.get('JIRA_DEP_MAP_RESTART') != '1':
-            webbrowser.open(f'http://localhost:{PORT}')
+            threading.Timer(
+                0.8,
+                lambda: webbrowser.open(f'http://localhost:{PORT}')
+            ).start()
+
         try:
             flask_thread.join()
         except KeyboardInterrupt:
