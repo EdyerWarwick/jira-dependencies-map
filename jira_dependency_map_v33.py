@@ -8,6 +8,7 @@ from flask import Flask,Response,jsonify,request
 JIRA_BASE_URL="https://uow-idg.atlassian.net"
 JQL_QUERY="project IN (OPD, WT) AND status NOT IN (Epics, Component) AND issuetype != Epic AND issuetype NOT IN subTaskIssueTypes()"
 PORT=5001
+STARTUP_MESSAGES_URL="https://sitebuilder.warwick.ac.uk/sitebuilder2/api/dataentry/entries.json?page=/services/marketing/teams/cds/opd/startup/"
 
 # GitHub Actions patches APP_VERSION during the build. Updates are installed
 # by jira_dependency_map_launcher.py, never by the running application.
@@ -391,6 +392,34 @@ def api_credential_status():
         return jsonify({"configured":bool(credential),"email":credential["email"] if credential else ""})
     except Exception as e:
         return jsonify({"configured":False,"error":str(e)}),500
+
+@app.route("/api/startup-messages")
+def api_startup_messages():
+    print(f"[Startup Messages] Fetching Sitebuilder feed: {STARTUP_MESSAGES_URL}", flush=True)
+    try:
+        response=req.get(STARTUP_MESSAGES_URL,timeout=15,headers={"Accept":"application/json"})
+        print(f"[Startup Messages] Sitebuilder response: HTTP {response.status_code}, content-type={response.headers.get('Content-Type','')}, bytes={len(response.content)}", flush=True)
+        if not response.ok:
+            print(f"[Startup Messages] Sitebuilder request failed: {response.text[:500]}", flush=True)
+            return jsonify({"error":f"Sitebuilder returned HTTP {response.status_code}"}),502
+        data=response.json()
+        items=data.get("items",[]) if isinstance(data,dict) else []
+        print(f"[Startup Messages] JSON parsed successfully. Raw item count: {len(items) if isinstance(items,list) else 'not a list'}", flush=True)
+        messages=[]
+        for index,item in enumerate(items if isinstance(items,list) else []):
+            if not isinstance(item,dict):
+                print(f"[Startup Messages] Item {index}: skipped because it is not an object", flush=True)
+                continue
+            title=str(item.get("title") or "").strip()
+            body=str(item.get("parsedContentBody") or "").strip()
+            print(f"[Startup Messages] Item {index}: title={title!r}, parsedContentBody length={len(body)}", flush=True)
+            if title or body:
+                messages.append({"title":title,"parsedContentBody":body})
+        print(f"[Startup Messages] Returning {len(messages)} usable message(s) to browser", flush=True)
+        return jsonify({"items":messages})
+    except Exception as e:
+        print(f"[Startup Messages] ERROR: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"error":f"Could not load startup messages: {e}"}),502
 
 @app.route("/api/app-version")
 def api_app_version():
@@ -881,22 +910,46 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 .edit-dependency-btn:hover{background:#eef2ff;border-color:#a5b4fc;color:#4338ca}
 /* ── Loading overlay ─────────────────────────────────────────────────────── */
 #loading{
-  position:fixed;inset:58px 0 0;background:rgba(241,245,249,.9);
-  backdrop-filter:blur(4px);display:flex;flex-direction:column;
-  align-items:center;justify-content:center;gap:12px;
-  z-index:100;opacity:0;pointer-events:none;transition:opacity .15s;
+  position:fixed;inset:58px 0 0;
+  background:radial-gradient(circle at 50% 42%,rgba(255,255,255,.98) 0,rgba(241,245,249,.96) 48%,rgba(226,232,240,.94) 100%);
+  backdrop-filter:blur(7px);display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:15px;
+  z-index:100;opacity:0;pointer-events:none;transition:opacity .2s;
 }
 #loading.show{opacity:1;pointer-events:auto}
-.spinner{
-  width:34px;height:34px;border:3px solid #cbd5e1;
-  border-top-color:var(--accent);border-radius:50%;
-  animation:spin .7s linear infinite;
+/* dependency-status is earlier in the DOM than #loading, so it cannot be hidden with a following-sibling selector. */
+#dependency-status.loading-hidden{display:none !important}
+#loading::before{
+  content:"";position:absolute;width:520px;height:520px;border-radius:50%;
+  background:radial-gradient(circle,rgba(99,102,241,.08),transparent 68%);
+  animation:loadingPulse 2.4s ease-in-out infinite;pointer-events:none;
 }
-@keyframes spin{to{transform:rotate(360deg)}}
-#loading-label{font-size:13px;color:#475569}
-#loading-stage{font-size:11px;color:#94a3b8;min-width:48px;text-align:center}
-.loading-progress{width:220px;height:4px;background:#e2e8f0;border-radius:999px;overflow:hidden}
-#loading-progress-bar{height:100%;width:10%;background:var(--accent);border-radius:999px;transition:width .2s ease}
+.loading-favicon-wrap{
+  position:relative;width:72px;height:72px;display:flex;align-items:center;justify-content:center;
+  border-radius:50%;background:rgba(99,102,241,.08);box-shadow:0 8px 28px rgba(99,102,241,.16);
+  animation:loadingPulse 2.4s ease-in-out infinite;
+}
+.loading-favicon{width:48px;height:48px;object-fit:contain;animation:loadingFaviconSpin 2.2s linear infinite}
+@keyframes loadingFaviconSpin{to{transform:rotate(360deg)}}
+@keyframes loadingPulse{0%,100%{transform:scale(.94);opacity:.78}50%{transform:scale(1.06);opacity:1}}
+#loading-label{position:relative;font-size:18px;font-weight:850;color:#172033;letter-spacing:.1px;text-align:center}
+#loading-status{position:relative;font-size:12px;font-weight:650;color:#64748b;text-align:center;min-height:18px}
+.loading-progress{position:relative;width:min(420px,calc(100vw - 56px));height:8px;background:#dbe3ef;border-radius:999px;overflow:hidden;box-shadow:inset 0 1px 2px rgba(15,23,42,.08)}
+#loading-progress-bar{height:100%;width:42%;background:linear-gradient(90deg,var(--accent),#818cf8);border-radius:999px;box-shadow:0 0 14px rgba(99,102,241,.32);animation:loadingProgress 1.35s ease-in-out infinite}
+@keyframes loadingProgress{0%{transform:translateX(-130%)}50%{transform:translateX(85%)}100%{transform:translateX(230%)}}
+.startup-message{
+  position:relative;width:min(620px,calc(100vw - 40px));box-sizing:border-box;
+  background:rgba(255,255,255,.98);border:1px solid #c7d2fe;border-radius:16px;
+  padding:22px 28px;box-shadow:0 12px 38px rgba(15,23,42,.14),0 0 0 5px rgba(99,102,241,.05);
+  color:#334155;font-size:16px;line-height:1.65;text-align:center;
+  animation:startupMessageIn .45s ease-out, startupMessageGlow 2.8s ease-in-out infinite;
+}
+.startup-message::before{content:none;display:none}
+.startup-message-title{font-size:21px;font-weight:850;line-height:1.25;color:#172033;margin-bottom:9px}
+.startup-message-body{font-size:16px;color:#475569}
+.startup-message-body p{margin:0 0 8px}.startup-message-body p:last-child{margin-bottom:0}
+@keyframes startupMessageIn{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+@keyframes startupMessageGlow{0%,100%{box-shadow:0 12px 38px rgba(15,23,42,.14),0 0 0 5px rgba(99,102,241,.05)}50%{box-shadow:0 14px 42px rgba(15,23,42,.17),0 0 0 8px rgba(99,102,241,.07)}}
 
 /* ── Legend ──────────────────────────────────────────────────────────────── */
 .legend{
@@ -986,6 +1039,18 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 .settings-help{font-size:11px;line-height:1.45;color:#64748b;margin-top:9px}
 .settings-help a{color:#4f46e5;text-decoration:none;font-weight:700}
 .settings-help a:hover{text-decoration:underline}
+.settings-startup-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.settings-startup-info{font-size:12px;line-height:1.45;color:#334155}
+.settings-messages-card{max-height:min(520px,70vh);overflow:auto}
+.settings-message-item{border:1px solid #e2e8f0;border-radius:9px;padding:11px 12px;margin-bottom:9px}
+.settings-message-item:last-child{margin-bottom:0}
+.settings-message-title{font-size:12px;font-weight:800;color:#172033;margin-bottom:5px}
+.settings-message-body{font-size:11px;line-height:1.5;color:#475569}
+.settings-message-body p{margin:0 0 7px}
+.settings-message-body p:last-child{margin-bottom:0}
+.settings-message-empty{font-size:12px;line-height:1.5;color:#64748b}
+.settings-back{display:inline-flex;align-items:center;border:0;background:transparent;color:#475569;padding:0;margin:0 0 14px;cursor:pointer;font-size:12px;font-weight:700}
+.settings-back:hover{color:#172033}
 .settings-feedback-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .settings-feedback-info{font-size:12px;line-height:1.45;color:#334155}
 .settings-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:14px}
@@ -1053,6 +1118,7 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
       <h2 id="settings-title">Settings</h2>
       <button class="modal-close" id="settings-close" type="button" aria-label="Close">×</button>
     </div>
+    <div id="settings-main-view">
     <div class="settings-section">
       <div class="settings-section-title">Jira account</div>
       <div class="settings-credential-row">
@@ -1078,6 +1144,13 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
       </div>
     </div>
     <div class="settings-section">
+      <div class="settings-section-title">Startup messages</div>
+      <div class="settings-startup-row">
+        <div class="settings-startup-info">View the messages shown while the app is loading.</div>
+        <button class="modal-secondary" id="settings-see-startup-messages" type="button">See all messages</button>
+      </div>
+    </div>
+    <div class="settings-section">
       <div class="settings-section-title">Feedback and Features</div>
       <div class="settings-feedback-row">
         <div class="settings-feedback-info">Request a feature or improvement:</div>
@@ -1090,6 +1163,11 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
         <div class="settings-version-info">Current version <span class="settings-version-value" id="settings-current-version">Checking…</span><div class="settings-version-status" id="settings-latest-version">Checking latest release…</div></div>
         <a class="settings-version-link" id="settings-release-link" href="https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest" target="_blank" rel="noopener">View release</a>
       </div>
+    </div>
+    </div>
+    <div id="settings-messages-view" style="display:none">
+      <button class="settings-back" id="settings-back" type="button">← Back to Settings</button>
+      <div class="settings-messages-card" id="settings-messages-list"></div>
     </div>
     <div class="settings-actions">
       <button class="modal-secondary" id="settings-close-bottom" type="button">Close</button>
@@ -1203,7 +1281,7 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
     </div>
   </div>
 </div>
-<div id="loading"><div class="spinner"></div><div id="loading-stage">1 of 10</div><div class="loading-progress"><div id="loading-progress-bar"></div></div><div id="loading-label">Connecting to Jira&hellip;</div></div>
+<div id="loading"><div class="loading-favicon-wrap"><img class="loading-favicon" src="https://warwick.ac.uk/services/marketing/teams/cds/opd/1486504840-cog-cogwheel-gear-repr-options-setting_81360.png" alt=""></div><div id="loading-label">Connecting to Jira&hellip;</div><div class="loading-progress"><div id="loading-progress-bar"></div></div><div id="loading-status">Working on it…</div><div id="startup-message" class="startup-message" style="display:none"></div></div>
 <div id="app"><main id="board"><svg id="lines" aria-hidden="true"></svg></main></div>
 
 
@@ -1232,6 +1310,7 @@ const state = {
 const board              = document.getElementById('board');
 const lines              = document.getElementById('lines');
 const loading            = document.getElementById('loading');
+const dependencyStatus    = document.getElementById('dependency-status');
 const statusText         = document.getElementById('status-text');
 const errorEl            = document.getElementById('error');
 const searchWrap         = document.getElementById('search-wrap');
@@ -1261,20 +1340,20 @@ const settingsManageCredential = document.getElementById('settings-manage-creden
 const settingsUseJiraModal = document.getElementById('settings-use-jira-modal');
 const settingsClose = document.getElementById('settings-close');
 const settingsCloseBottom = document.getElementById('settings-close-bottom');
+const settingsMainView = document.getElementById('settings-main-view');
+const settingsMessagesView = document.getElementById('settings-messages-view');
+const settingsSeeStartupMessages = document.getElementById('settings-see-startup-messages');
+const settingsBack = document.getElementById('settings-back');
+const settingsMessagesList = document.getElementById('settings-messages-list');
+const startupMessage = document.getElementById('startup-message');
 
 let loadingTimer = null;
-let loadingStageNo = 1;
-const loadingStages = [
+let loadingStatusNo = 0;
+const loadingStatuses = [
   'Connecting to Jira…',
-  'Authenticating…',
-  'Requesting tickets…',
-  'Fetching Jira data…',
-  'Reading ticket details…',
-  'Building dependencies…',
-  'Calculating levels…',
-  'Preparing the board…',
-  'Rendering tickets…',
-  'Ready'
+  'Fetching your dependency data…',
+  'Building the dependency map…',
+  'Preparing the board…'
 ];
 
 
@@ -1296,7 +1375,66 @@ function updateJiraModalSetting(){
   const stateLabel = settingsUseJiraModal.querySelector('.settings-toggle-state');
   if(stateLabel) stateLabel.textContent = enabled ? 'On' : 'Off';
 }
-function closeSettings(){ settingsModal.classList.remove('open'); }
+function showSettingsMain(){
+  settingsMainView.style.display = '';
+  settingsMessagesView.style.display = 'none';
+}
+function renderStartupMessages(items){
+  settingsMessagesList.innerHTML = '';
+  if(!items.length){
+    settingsMessagesList.innerHTML = '<div class="settings-message-empty">No startup messages are currently available.</div>';
+    return;
+  }
+  items.forEach(item => {
+    const el = document.createElement('div');
+    el.className = 'settings-message-item';
+    const title = document.createElement('div');
+    title.className = 'settings-message-title';
+    title.textContent = item.title || '';
+    const body = document.createElement('div');
+    body.className = 'settings-message-body';
+    body.innerHTML = item.parsedContentBody || '';
+    el.appendChild(title);
+    el.appendChild(body);
+    settingsMessagesList.appendChild(el);
+  });
+}
+async function fetchStartupMessages(){
+  const url = '/api/startup-messages?ts=' + Date.now();
+  console.log('[Startup Messages] Fetching:', url);
+  try{
+    const r = await fetch(url,{cache:'no-store'});
+    console.log('[Startup Messages] Browser response:', r.status, r.statusText);
+    const data = await r.json().catch(async () => {
+      console.error('[Startup Messages] Response was not valid JSON');
+      return {};
+    });
+    console.log('[Startup Messages] Browser received:', data);
+    if(!r.ok || !Array.isArray(data.items)){
+      throw new Error(data.error || 'Unable to load startup messages');
+    }
+    console.log('[Startup Messages] Received', data.items.length, 'message(s)');
+    return data.items;
+  }catch(e){
+    console.error('[Startup Messages] Fetch failed:', e);
+    throw e;
+  }
+}
+async function showAllStartupMessages(){
+  console.log('[Startup Messages] Opening "See all messages"');
+  settingsMainView.style.display = 'none';
+  settingsMessagesView.style.display = '';
+  settingsMessagesList.innerHTML = '<div class="settings-message-empty">Loading messages…</div>';
+  try{
+    const items = await fetchStartupMessages();
+    console.log('[Startup Messages] Rendering', items.length, 'message(s) in Sitebuilder order');
+    renderStartupMessages(items);
+  }catch(e){
+    console.error('[Startup Messages] Settings load failed:', e);
+    settingsMessagesList.innerHTML = '<div class="settings-message-empty">Startup messages could not be loaded.</div>';
+  }
+}
+function closeSettings(){ settingsModal.classList.remove('open'); showSettingsMain(); }
 async function openSettings(){
   updateJiraModalSetting();
   settingsModal.classList.add('open');
@@ -1425,36 +1563,64 @@ async function initialiseApp(){
 function esc(v){ return String(v == null ? '' : v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function showError(msg){ errorEl.textContent = msg; errorEl.style.display = 'block'; }
 function hideError(){ errorEl.style.display = 'none'; }
+let startupMessagePromise = null;
+
 function setLoading(on, msg){
   loading.classList.toggle('show', on);
+  dependencyStatus.classList.toggle('loading-hidden', on);
   if(on){
     if(loadingTimer) clearInterval(loadingTimer);
-    loadingStageNo = 1;
-    loadingStage.textContent = '1 of 10';
-    loadingProgressBar.style.width = '10%';
-    document.getElementById('loading-label').textContent = msg || loadingStages[0];
+    loadingStatusNo = 0;
+    document.getElementById('loading-label').textContent = msg || loadingStatuses[0];
+    document.getElementById('loading-status').textContent = 'Working on it…';
+
+    // Fetch the Sitebuilder message independently of the loading animation,
+    // but keep the overlay open until the message request has completed so a
+    // fast Jira response cannot make the startup message disappear.
+    startupMessage.style.display = 'none';
+    startupMessage.innerHTML = '';
+    console.log('[Startup Messages] Starting fresh startup-message fetch');
+    startupMessagePromise = fetchStartupMessages()
+      .then(items => {
+        console.log('[Startup Messages] Loader received', items.length, 'message(s)');
+        if(!items.length){
+          console.warn('[Startup Messages] No usable messages returned; hiding message box');
+          startupMessage.style.display = 'none';
+          return items;
+        }
+        const item = items[Math.floor(Math.random() * items.length)];
+        startupMessage.innerHTML = '<div class="startup-message-title">' + esc(item.title || '') + '</div>' +
+          '<div class="startup-message-body">' + (item.parsedContentBody || '') + '</div>';
+        startupMessage.style.display = 'block';
+        console.log('[Startup Messages] Displaying startup message:', item.title || '(untitled)');
+        return items;
+      })
+      .catch(e => {
+        console.error('[Startup Messages] Startup message fetch failed; hiding message box:', e);
+        startupMessage.style.display = 'none';
+        startupMessage.innerHTML = '';
+        return [];
+      });
   }else{
     if(loadingTimer) clearInterval(loadingTimer);
     loadingTimer = null;
+    loadingStatusNo = 0;
+    document.getElementById('loading-status').textContent = '';
+    startupMessagePromise = null;
   }
 }
 function startLoadingStages(msg){
-  setLoading(true, msg || loadingStages[0]);
+  setLoading(true, msg || loadingStatuses[0]);
   loadingTimer = setInterval(() => {
-    if(loadingStageNo >= 9) return;
-    loadingStageNo += 1;
-    loadingStage.textContent = loadingStageNo + ' of 10';
-    loadingProgressBar.style.width = (loadingStageNo * 10) + '%';
-    document.getElementById('loading-label').textContent = loadingStages[loadingStageNo - 1];
-  }, 350);
+    loadingStatusNo = (loadingStatusNo + 1) % loadingStatuses.length;
+    document.getElementById('loading-label').textContent = loadingStatuses[loadingStatusNo];
+  }, 900);
 }
 function finishLoadingStages(){
   if(loadingTimer) clearInterval(loadingTimer);
   loadingTimer = null;
-  loadingStageNo = 10;
-  loadingStage.textContent = '10 of 10';
-  loadingProgressBar.style.width = '100%';
-  document.getElementById('loading-label').textContent = loadingStages[9];
+  document.getElementById('loading-label').textContent = 'Ready';
+  document.getElementById('loading-status').textContent = 'Your dependency map is ready';
 }
 function normaliseSearch(value){
   return String(value || '')
@@ -3026,6 +3192,10 @@ async function load(resetSelection){
       state.showBlocked = false;
     }
     render(); updateSaveButton();
+    // Do not finish the loading screen until the fresh Sitebuilder startup
+    // message request has completed. This prevents a fast Jira response from
+    // hiding the message before it has had a chance to render.
+    if(startupMessagePromise) await startupMessagePromise;
     finishLoadingStages();
     await new Promise(resolve => setTimeout(resolve, 180));
   }catch(e){ showError(e.message || String(e)); statusText.textContent = 'Load failed'; }
@@ -3130,6 +3300,8 @@ settingsBtn.addEventListener('click', openSettings);
 settingsUseJiraModal.addEventListener('click', () => {
   setUseJiraModal(!getUseJiraModal());
 });
+settingsSeeStartupMessages.addEventListener('click', showAllStartupMessages);
+settingsBack.addEventListener('click', showSettingsMain);
 settingsClose.addEventListener('click', closeSettings);
 settingsCloseBottom.addEventListener('click', closeSettings);
 settingsModal.addEventListener('click', e => { if(e.target === settingsModal) closeSettings(); });
@@ -3219,7 +3391,7 @@ if __name__ == "__main__":
     # - run the tray application
     #
     # Local .py behaviour:
-    # - never kill another process using the port
+    # - reclaim the fixed port before starting Flask
     # - do not require pystray/Pillow or the packaged tray asset
     # - start Flask and open the browser directly
     if getattr(sys, "frozen", False):
@@ -3274,7 +3446,11 @@ if __name__ == "__main__":
 
     else:
         # Local Python development mode.
-        # Keep this completely separate from the packaged tray application.
+        # Reclaim the fixed port just like the packaged application so an
+        # existing local instance cannot prevent this copy from starting.
+        # Keep the tray application behaviour completely separate.
+        clear_port_windows(PORT)
+
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
 
