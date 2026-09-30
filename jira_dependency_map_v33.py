@@ -20,6 +20,10 @@ CREDENTIAL_TARGET="Jira Dependency Map"
 CRED_TYPE_GENERIC=1
 CRED_PERSIST_LOCAL_MACHINE=2
 
+def resource_path(relative_path):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative_path)
+
 def _version_tuple(value):
     try:
         parts=str(value or "").strip().lstrip("vV").split(".")
@@ -3140,19 +3144,11 @@ exit 1
 
 
 def make_tray_icon():
-    from PIL import Image, ImageDraw
-    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-    d   = ImageDraw.Draw(img)
-    d.rounded_rectangle([2, 8, 62, 62], radius=8, fill='#16213e')
-    d.rounded_rectangle([2, 8, 62, 26], radius=8, fill='#6366f1')
-    d.rectangle([2, 17, 62, 26], fill='#6366f1')
-    for rx in (15, 39):
-        d.rounded_rectangle([rx, 2, rx + 9, 18], radius=3, fill='white')
-    for row in range(3):
-        for col in range(4):
-            x, y = 10 + col * 14, 32 + row * 10
-            d.ellipse([x, y, x + 5, y + 5], fill=(255, 255, 255, 180))
-    return img
+    from PIL import Image
+    path = resource_path(os.path.join("assets", "tray-icon.png"))
+    return Image.open(path).convert("RGBA").resize(
+        (64, 64), Image.Resampling.LANCZOS
+    )
 
 def run_flask():
     app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False)
