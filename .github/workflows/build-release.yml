@@ -44,16 +44,26 @@ jobs:
           Set-Content -Path $path -Value $content -Encoding UTF8
 
       - name: Build application and launcher
+        shell: pwsh
         run: |
           python -m PyInstaller --clean --noconfirm jira_dependency_map.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           python -m PyInstaller --clean --noconfirm jira_dependency_map_launcher.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package versioned application
         shell: pwsh
         run: |
+          $appDir = "dist/Jira-Dependency-Map"
           $zip = "dist/Jira-Dependency-Map-win64.zip"
+
+          if (-not (Test-Path -LiteralPath $appDir -PathType Container)) {
+            throw "PyInstaller application directory was not created: $appDir"
+          }
+
           Compress-Archive `
-            -Path "dist/Jira-Dependency-Map/*" `
+            -Path "$appDir/*" `
             -DestinationPath $zip `
             -CompressionLevel Optimal
 
