@@ -22,6 +22,7 @@ exe = EXE(
     a.datas,
     [],
     name="Jira-Dependency-Map",
+    icon="assets/jira-dependency-map.ico",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
