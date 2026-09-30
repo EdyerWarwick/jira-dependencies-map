@@ -1,15 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = collect_submodules("pystray")
+project_dir = Path(SPECPATH)
 tray_icon = project_dir / "assets" / "tray-icon.png"
 
+if not tray_icon.is_file():
+    raise FileNotFoundError(f"Tray icon not found: {tray_icon}")
+
 a = Analysis(
-    ["jira_dependency_map_v33.py"],
-    pathex=[],
+    [str(project_dir / "jira_dependency_map_v33.py")],
+    pathex=[str(project_dir)],
     binaries=[],
     datas=[(str(tray_icon), "assets")],
-    hiddenimports=hiddenimports,
+    hiddenimports=collect_submodules("pystray"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
