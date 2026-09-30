@@ -2,12 +2,13 @@
 from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = collect_submodules("pystray")
+tray_icon = project_dir / "assets" / "tray-icon.png"
 
 a = Analysis(
     ["jira_dependency_map_v33.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[(str(tray_icon), "assets")],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
