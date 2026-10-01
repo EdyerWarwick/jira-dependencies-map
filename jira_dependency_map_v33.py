@@ -6,7 +6,7 @@ import requests as req
 from flask import Flask,Response,jsonify,request
 
 JIRA_BASE_URL="https://uow-idg.atlassian.net"
-JQL_QUERY="project IN (OPD, WT) AND status NOT IN (Epics, Component) AND issuetype != Epic AND issuetype NOT IN subTaskIssueTypes()"
+JQL_QUERY="project IN (OPD, WT) AND status NOT IN (Epics, Component) AND issuetype != Epic AND issuetype NOT IN subTaskIssueTypes() AND parent != OPD-457"
 PORT=5001
 STARTUP_MESSAGES_URL="https://sitebuilder.warwick.ac.uk/sitebuilder2/api/dataentry/entries.json?page=/services/marketing/teams/cds/opd/startup/"
 
@@ -3247,6 +3247,14 @@ toggleMilestonesBtn.addEventListener('click', () => {
   render();
 });
 
+searchEl.addEventListener('keydown', e => {
+  // The main search is live as you type. Enter must not activate/select a card
+  // or trigger any browser/default keyboard action.
+  if(e.key === 'Enter'){
+    e.preventDefault();
+    e.stopPropagation();
+  }
+});
 searchEl.addEventListener('input', () => {
   // Never rebuild the board while typing. Filter the existing cards directly so
   // the input value and the search state cannot get out of sync.
@@ -3279,11 +3287,6 @@ document.addEventListener('keydown', e => {
   }
   if(mod && (key === 'y' || (e.shiftKey && key === 'z'))){
     e.preventDefault(); redoLocal(); return;
-  }
-  if(e.key === 'Enter' && document.activeElement === searchEl){
-    const first = [...board.querySelectorAll('.card')].find(c => !c.hidden);
-    if(first){ e.preventDefault(); first.click(); }
-    return;
   }
   if(e.key === 'Escape'){
     if(dependencyModal.classList.contains('open')){ closeDependencyModal(); return; }
