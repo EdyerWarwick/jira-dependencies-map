@@ -192,21 +192,101 @@ def jira_error(resp):
         data=resp.json(); return str(data.get("errorMessages") or data.get("errors") or data)
     except Exception: return resp.text or resp.reason
 
-def jira_fetch_all_issues():
+def _jira_search(jql, fields, label):
+    """Run a paginated Jira JQL search and return all matching issues."""
     url=f"{JIRA_BASE_URL}/rest/api/3/search/jql"
-    # parent = next-gen epic; customfield_10014 = classic epic link (optional — ignored if absent)
-    fields=["summary","status","priority","assignee","issuelinks","parent","customfield_10014","labels"]
     all_issues=[]; token=None; page=0
     while True:
-        page+=1; body={"jql":JQL_QUERY,"maxResults":100,"fields":fields}
+        page+=1; body={"jql":jql,"maxResults":100,"fields":fields}
         if token: body["nextPageToken"]=token
-        print(f"  -> Jira page {page} (have {len(all_issues):,} so far)")
+        print(f"  -> Jira {label} page {page} (have {len(all_issues):,} so far)")
         started=time.time(); resp=req.post(url,headers=get_jira_headers(),json=body,timeout=60)
         print(f"  <- HTTP {resp.status_code} ({len(resp.content):,} bytes, {time.time()-started:.2f}s)")
         if not resp.ok: raise RuntimeError(f"Jira API {resp.status_code}: {jira_error(resp)}")
         data=resp.json(); batch=data.get("issues",[]); all_issues.extend(batch); token=data.get("nextPageToken")
         if not token or not batch: break
-    print(f"  OK fetched {len(all_issues):,} issues")
+    print(f"  OK {label}: fetched {len(all_issues):,} issues")
+    return all_issues
+
+def _external_blocker_keys(raw_issues):
+    """Return linked blocker keys that were outside the main JQL result set."""
+    in_scope={str(r.get("key") or "").strip() for r in raw_issues if r.get("key")}
+    external=set()
+    for r in raw_issues:
+        source=r.get("key")
+        if source not in in_scope: continue
+        for link in (r.get("fields") or {}).get("issuelinks") or []:
+            t=link.get("type") or {}
+            inward=(t.get("inward") or "").strip().lower()
+            outward=(t.get("outward") or "").strip().lower()
+            blocker=blocked=None
+            if outward=="blocks" and link.get("outwardIssue"):
+                blocker=source; blocked=link["outwardIssue"].get("key")
+            elif inward=="is blocked by" and link.get("inwardIssue"):
+                blocker=link["inwardIssue"].get("key"); blocked=source
+            if blocker and blocked and blocker!=blocked and blocker not in in_scope and blocked in in_scope:
+                external.add(str(blocker).strip())
+    return sorted(k for k in external if k)
+
+def jira_fetch_external_issues(raw_issues):
+    """Recursively fetch external blockers until no new blocker keys are found."""
+    fields=["summary","status","priority","assignee","issuelinks","parent","customfield_10014","labels"]
+    # Jira can impose a limit on the number of values in an IN clause. Keep the
+    # normal case to one JQL request, and only split unusually large sets.
+    chunk_size=1000
+
+    known={str(r.get("key")).strip() for r in raw_issues if r.get("key")}
+    pending=set(_external_blocker_keys(raw_issues)) - known
+    fetched=[]
+    round_no=0
+
+    while pending:
+        round_no += 1
+        current=sorted(pending)
+        pending.clear()
+        print(f"  External blockers: round {round_no}, {len(current):,} new ticket(s) to fetch")
+
+        round_fetched=[]
+        for start in range(0,len(current),chunk_size):
+            chunk=current[start:start+chunk_size]
+            key_list=", ".join(chunk)
+            jql=f"key in ({key_list})"
+            print(f"  External blockers: requesting {len(chunk):,} ticket(s) in one JQL")
+            round_fetched.extend(_jira_search(jql,fields,"external blocker"))
+
+        # Only successfully returned issues are candidates for another round.
+        # This also prevents circular dependency chains from causing an endless loop.
+        new_issues=[]
+        for issue in round_fetched:
+            key=str(issue.get("key") or "").strip()
+            if key and key not in known:
+                known.add(key)
+                new_issues.append(issue)
+
+        fetched.extend(new_issues)
+
+        # Inspect the newly fetched issues for blockers that are still outside
+        # the complete set we've already seen, then fetch those in the next round.
+        if new_issues:
+            pending.update(set(_external_blocker_keys(new_issues)) - known)
+
+        print(f"  External blockers: round {round_no} found {len(new_issues):,} new issue(s); {len(pending):,} more blocker(s) queued")
+
+    print(f"  External blockers: recursively found {len(fetched):,} additional issue(s)")
+    return fetched
+
+def jira_fetch_all_issues():
+    # parent = next-gen epic; customfield_10014 = classic epic link (optional — ignored if absent)
+    fields=["summary","status","priority","assignee","issuelinks","parent","customfield_10014","labels"]
+    all_issues=_jira_search(JQL_QUERY,fields,"main")
+
+    # Some blockers sit outside the main OPD/WT JQL. Fetch those specific keys
+    # in a second batched JQL so they become full issues on the dependency map.
+    external_issues=jira_fetch_external_issues(all_issues)
+    if external_issues:
+        existing={r.get("key") for r in all_issues}
+        all_issues.extend(r for r in external_issues if r.get("key") not in existing)
+    print(f"  OK fetched {len(all_issues):,} total issues including external blockers")
     return all_issues
 
 def _extract_epic(fields):
@@ -581,14 +661,15 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   box-shadow:0 2px 14px rgba(0,0,0,.25);
 }
 .brand{display:flex;align-items:center;gap:9px;font-weight:700;flex-shrink:0}
-.brand-icon{font-size:20px}
+.brand-icon{width:30px;height:30px;border-radius:50%;background:#fff;display:inline-flex;align-items:center;justify-content:center;flex:0 0 30px;overflow:hidden}
+.brand-icon img{width:21px;height:21px;object-fit:contain;display:block}
 .brand small{display:block;font-size:11px;color:#94a3b8;font-weight:400;margin-top:1px}
-.header-center{flex:1;display:flex;justify-content:center}
+.header-center{flex:1;display:flex;align-items:center;gap:7px}
 .search-wrap{width:100%;max-width:360px;position:relative}
 .search-wrap svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);pointer-events:none;opacity:.45}
 #search{
   width:100%;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);
-  color:#fff;border-radius:7px;padding:7px 30px 7px 32px;font-size:13px;
+  color:#fff;border-radius:7px;padding:7px 10px 7px 32px;font-size:13px;
   outline:none;transition:background .15s,border-color .15s;
 }
 #search:focus{background:rgba(255,255,255,.16);border-color:rgba(255,255,255,.45)}
@@ -599,24 +680,40 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   font-size:15px;line-height:1;padding:2px;display:none;
 }
 #search-clear.visible{display:block}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .header-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.filter-controls{display:flex;align-items:center;gap:7px;position:relative;flex-shrink:0}
+.filter-menu{display:none;position:absolute;top:calc(100% + 8px);left:0;width:300px;background:#fff;color:#172033;border:1px solid #dbe2ea;border-radius:10px;box-shadow:0 12px 30px rgba(15,23,42,.2);padding:12px;z-index:10000}
+.filter-menu.open{display:block}
+.filter-menu-title{font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.07em;color:#64748b;margin:0 0 10px}
+.filter-option{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 4px;border-bottom:1px solid #eef2f7}
+.filter-option:last-child{border-bottom:0}
+.filter-option-label{font-size:13px;font-weight:650;color:#334155}
+.filter-checkbox{width:17px;height:17px;accent-color:#6366f1}
+.filter-user-select{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;padding:7px 8px;font:inherit;font-size:13px}
+.filter-clear{border-color:rgba(239,68,68,.3);background:rgba(239,68,68,.08);color:#fecaca}
+.filter-clear:not(:disabled):hover{background:rgba(239,68,68,.16)}
+.filter-clear:disabled{opacity:.45;cursor:default}
 .btn{
   border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.08);
   color:#e2e8f0;border-radius:7px;padding:7px 11px;cursor:pointer;font-size:13px;
   transition:background .12s;display:inline-flex;align-items:center;gap:5px;
 }
 .btn:hover{background:rgba(255,255,255,.17)}
-.btn-save{font-weight:800;min-width:96px}
+.btn-save{font-weight:800;min-width:36px;width:36px;height:32px;padding:0;justify-content:center}.btn-save[hidden],.btn-discard[hidden]{display:none!important}
 .btn-save.unsaved{background:#f59e0b;color:#172033;border-color:#fbbf24;box-shadow:0 0 0 2px rgba(245,158,11,.25);opacity:1}
 .btn-save:disabled{opacity:.45;cursor:default}
-#save-state{font-size:10px;color:#94a3b8;white-space:nowrap;min-width:92px}
-#save-state.unsaved{color:#fbbf24;font-weight:800}
-#save-state:not(.unsaved){color:#94a3b8}
+.btn-discard{font-weight:800;min-width:36px;width:36px;height:32px;padding:0;justify-content:center;background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.45);color:#fecaca}
+.btn-discard:hover{background:rgba(239,68,68,.24);border-color:rgba(248,113,113,.7);color:#fff}
+.save-progress{position:fixed;right:18px;bottom:18px;z-index:20000;display:none;min-width:220px;max-width:320px;padding:11px 14px;background:#172033;color:#fff;border:1px solid #334155;border-radius:9px;box-shadow:0 10px 30px rgba(15,23,42,.28);font-size:12px;font-weight:750}
+.save-progress.show{display:block}
+.save-progress-text{display:flex;align-items:center;justify-content:space-between;gap:14px}
+.save-progress-bar{height:4px;margin-top:8px;background:#334155;border-radius:999px;overflow:hidden}
+.save-progress-fill{height:100%;width:0;background:#6366f1;border-radius:999px;transition:width .15s ease}
 .header-divider{width:1px;height:22px;background:#334155;opacity:.45;margin:0 2px}
 .btn-refresh{min-width:32px;padding-left:8px;padding-right:8px;font-size:16px}
 .btn-settings{min-width:32px;width:32px;height:32px;padding:0;justify-content:center;font-size:18px;color:#cbd5e1}
 .btn-settings:hover{color:#fff}
-#save-state.unsaved{color:#fbbf24;font-weight:800}
 #deselect{display:none;border-color:rgba(99,102,241,.5);background:rgba(99,102,241,.18);color:#c7d2fe}
 #deselect.visible{display:inline-flex}
 /* ── Completed toggle ────────────────────────────────────────────────────── */
@@ -677,7 +774,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   text-decoration-thickness:1.5px;
   text-decoration-color:currentColor;
 }
-.milestone-blocked-item{display:block;width:100%;border:1px solid #e2e8f0;border-radius:5px;background:#f8fafc;padding:5px 7px;text-align:left;cursor:pointer;font-size:10px;line-height:1.3;color:#475569;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.milestone-blocked-item{display:block;width:100%;border:1px solid #e2e8f0;border-radius:5px;background:#f8fafc;padding:5px 7px;text-align:left;cursor:pointer;font-size:12px;line-height:1.3;color:#475569;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .milestone-blocked-item:hover{background:#fffaf0;border-color:#fed7aa}
 .milestone-blocked-item a{color:inherit;text-decoration:none}
 .milestone-blocked-item a:hover{text-decoration:underline}
@@ -699,7 +796,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .dependency-flash{animation:dependencyFlash .9s ease-out}
 @keyframes milestoneFlash{0%{box-shadow:0 0 0 4px rgba(56,189,248,.75)}100%{box-shadow:0 0 0 0 rgba(56,189,248,0)}}
 @keyframes dependencyFlash{0%{box-shadow:0 0 0 4px rgba(99,102,241,.75)}100%{box-shadow:0 0 0 0 rgba(99,102,241,0)}}
-#status-text{font-size:12px;color:#94a3b8;white-space:nowrap}
+#status-text{font-size:12px;color:#fff;white-space:nowrap}
 
 /* ── Jira ticket preview modal ─────────────────────────────────────────── */
 .ticket-preview-backdrop{
@@ -1063,7 +1160,16 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 .settings-toggle.active .settings-toggle-track{background:#6366f1}
 .settings-toggle.active .settings-toggle-track::after{transform:translateX(14px)}
 .settings-toggle-state{font-size:11px;font-weight:700;min-width:22px;text-align:right}
-.settings-feedback-button{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;text-decoration:none;font-weight:700;white-space:nowrap}
+.settings-button{
+  display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;
+  min-width:132px;height:36px;padding:0 14px;
+  border:1px solid #cbd5e1;background:#fff;color:#334155;border-radius:7px;
+  font:inherit;font-size:12px;font-weight:700;line-height:1.2;
+  cursor:pointer;text-decoration:none;white-space:nowrap;
+}
+.settings-button:hover{background:#f8fafc;border-color:#94a3b8}
+.settings-button.primary{background:#6366f1;border-color:#6366f1;color:#fff;font-weight:800}
+.settings-button.primary:hover{background:#4f46e5;border-color:#4f46e5}
 .settings-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
 /* ── Credential setup / management ───────────────────────────────────────── */
 #credential-modal{
@@ -1089,20 +1195,17 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
   padding:9px 10px;font-size:10px;line-height:1.45;color:#64748b;margin:10px 0 15px;
 }
 .credential-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:17px}
-.credential-primary{
-  border:0;background:#6366f1;color:#fff;border-radius:7px;padding:9px 14px;
-  font-weight:800;cursor:pointer;
-}
-.credential-primary:hover{background:#4f46e5}
-.credential-danger{
-  border:1px solid #fecaca;background:#fff;color:#b91c1c;border-radius:7px;
-  padding:9px 14px;font-weight:700;cursor:pointer;margin-right:auto;
-}
-.credential-danger:hover{background:#fef2f2}
-.credential-secondary{
+.credential-actions #credential-remove{margin-right:auto}
+.credential-button{
+  display:inline-flex;align-items:center;justify-content:center;
   border:1px solid #cbd5e1;background:#fff;color:#334155;border-radius:7px;
-  padding:9px 14px;cursor:pointer;
+  padding:9px 14px;font-weight:700;cursor:pointer;text-decoration:none;
+  font:inherit;line-height:1.2;
 }
+.credential-button:hover{background:#f8fafc;border-color:#94a3b8}
+.credential-button.primary{background:#6366f1;border-color:#6366f1;color:#fff;font-weight:800}
+.credential-button.primary:hover{background:#4f46e5;border-color:#4f46e5}
+.credential-button:disabled{opacity:.55;cursor:not-allowed}
 .credential-error{display:none;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:7px;padding:9px 10px;font-size:11px;line-height:1.4;margin-bottom:12px}
 .credential-error.visible{display:block}
 .credential-help{font-size:11px;color:#64748b;margin:-2px 0 10px;line-height:1.4}
@@ -1123,7 +1226,7 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
       <div class="settings-section-title">Jira account</div>
       <div class="settings-credential-row">
         <div class="settings-credential-info">Stored credential<br><span class="settings-credential-email" id="settings-email">Not configured</span></div>
-        <button class="modal-secondary" id="settings-manage-credential" type="button">Manage credential</button>
+        <button class="settings-button" id="settings-manage-credential" type="button">Manage credential</button>
       </div>
       <div class="settings-help">
         Need an API token?
@@ -1147,21 +1250,21 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
       <div class="settings-section-title">Startup messages</div>
       <div class="settings-startup-row">
         <div class="settings-startup-info">View the messages shown while the app is loading.</div>
-        <button class="modal-secondary" id="settings-see-startup-messages" type="button">See all messages</button>
+        <button class="settings-button" id="settings-see-startup-messages" type="button">See all messages</button>
       </div>
     </div>
     <div class="settings-section">
       <div class="settings-section-title">Feedback and Features</div>
       <div class="settings-feedback-row">
         <div class="settings-feedback-info">Request a feature or improvement:</div>
-        <a class="modal-secondary settings-feedback-button" href="https://warwick.ac.uk/services/marketing/teams/cds/opd/" target="_blank" rel="noopener noreferrer">Suggest a change</a>
+        <a class="settings-button" href="https://warwick.ac.uk/services/marketing/teams/cds/opd/" target="_blank" rel="noopener noreferrer">Suggest a change</a>
       </div>      
     </div>
     <div class="settings-section">
       <div class="settings-section-title">Application</div>
       <div class="settings-version-row">
         <div class="settings-version-info">Current version <span class="settings-version-value" id="settings-current-version">Checking…</span><div class="settings-version-status" id="settings-latest-version">Checking latest release…</div></div>
-        <a class="settings-version-link" id="settings-release-link" href="https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest" target="_blank" rel="noopener">View release</a>
+        <a class="settings-button" id="settings-release-link" href="https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest" target="_blank" rel="noopener">View latest release</a>
       </div>
     </div>
     </div>
@@ -1170,7 +1273,7 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
       <div class="settings-messages-card" id="settings-messages-list"></div>
     </div>
     <div class="settings-actions">
-      <button class="modal-secondary" id="settings-close-bottom" type="button">Close</button>
+      <button class="settings-button" id="settings-close-bottom" type="button">Close</button>
     </div>
   </div>
 </div>
@@ -1195,9 +1298,9 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
     <div class="credential-note">The API key is converted to Jira's base64 Basic Authentication value only in memory when a Jira request is made. It is never written into the Python source or sent to the browser.</div>
     <div class="credential-status" id="credential-status"></div>
     <div class="credential-actions">
-      <button class="credential-danger" id="credential-remove" type="button" style="display:none">Remove credential &amp; restart</button>
-      <button class="credential-secondary" id="credential-cancel" type="button" style="display:none">Cancel</button>
-      <button class="credential-primary" id="credential-save" type="button">Save &amp; connect</button>
+      <button class="credential-button" id="credential-remove" type="button" style="display:none">Remove credential &amp; restart</button>
+      <button class="credential-button" id="credential-cancel" type="button" style="display:none">Cancel</button>
+      <button class="credential-button primary" id="credential-save" type="button">Save &amp; connect</button>
     </div>
   </div>
 </div>
@@ -1213,29 +1316,56 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 
 <header id="app-header">
   <div class="brand">
-    <span class="brand-icon">&#x2197;</span>
+    <span class="brand-icon"><img src="https://warwick.ac.uk/services/marketing/teams/cds/opd/1486504840-cog-cogwheel-gear-repr-options-setting_81360.png" alt="" aria-hidden="true"></span>
     <div>Jira Dependency Map<small>Web Evolution dependencies</small></div>
   </div>
 
   <div class="header-center">
+    <button type="button" class="btn" data-action="escape" title="Home">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V21h13V9.5"/><path d="M9.5 21v-6h5v6"/>
+      </svg>
+      <span class="sr-only">Home</span>
+    </button>
     <!-- Search is shown only when nothing is locked -->
     <div class="search-wrap" id="search-wrap">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
            stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
       </svg>
-      <input id="search" type="search"
+      <input id="search" type="text"
              placeholder="Search key, summary or epic&hellip;" autocomplete="off" spellcheck="false">
-      <button id="search-clear" title="Clear (Esc)">&#x2715;</button>
+    </div>
+    <div class="filter-controls" id="filter-controls">
+      <button class="btn" id="filters-btn" type="button" aria-haspopup="true" aria-expanded="false">Filters</button>
+      <div class="filter-menu" id="filter-menu">
+        <div class="filter-menu-title">Filters</div>
+        <label class="filter-option" style="display:block">
+          <span class="filter-option-label" style="display:block;margin-bottom:6px">User</span>
+          <select class="filter-user-select" id="filter-user" aria-label="Filter by user"></select>
+        </label>
+        <label class="filter-option">
+          <span class="filter-option-label">Include With Remarkable</span>
+          <input class="filter-checkbox" id="filter-remarkable" type="checkbox" checked>
+        </label>
+      </div>
+      <button class="btn filter-clear" id="clear-filters" type="button" title="Clear search and filters" disabled>Clear filters</button>
     </div>
   </div>
 
   <div class="header-actions">
     <span id="status-text">Loading&hellip;</span>
     <button class="btn" id="deselect">&#x2190; Back</button>
-<button type="button" class="btn" data-action="escape" title="Clear the current selection and highlight lock">Esc</button>
-    <span id="save-state">&#10003; All changes saved</span>
-    <button class="btn btn-save" id="save" disabled>SAVE (0)</button>
+    <button class="btn btn-save" id="save" hidden title="Save 0 issues" aria-label="Save 0 issues">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 4h11l3 3v13H5z"/><path d="M8 4v6h8V4"/><path d="M8 20v-6h8v6"/>
+      </svg><span id="save-count">0</span>
+    </button>
+    <button class="btn btn-discard" id="discard" hidden title="Discard all changes" aria-label="Discard all changes">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/>
+      </svg>
+    </button>
     <span class="header-divider" aria-hidden="true"></span>
     <button class="btn btn-toggle-completed" id="toggle-completed" title="Toggle visibility of Done / Completed tickets">
       <span class="toggle-track"></span>Completed
@@ -1283,6 +1413,10 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 </div>
 <div id="loading"><div class="loading-favicon-wrap"><img class="loading-favicon" src="https://warwick.ac.uk/services/marketing/teams/cds/opd/1486504840-cog-cogwheel-gear-repr-options-setting_81360.png" alt=""></div><div id="loading-label">Connecting to Jira&hellip;</div><div class="loading-progress"><div id="loading-progress-bar"></div></div><div id="loading-status">Working on it…</div><div id="startup-message" class="startup-message" style="display:none"></div></div>
 <div id="app"><main id="board"><svg id="lines" aria-hidden="true"></svg></main></div>
+<div class="save-progress" id="save-progress" role="status" aria-live="polite">
+  <div class="save-progress-text"><span id="save-progress-label">Saving 0 of 0&hellip;</span><span id="save-progress-percent">0%</span></div>
+  <div class="save-progress-bar"><div class="save-progress-fill" id="save-progress-fill"></div></div>
+</div>
 
 
 <script>
@@ -1294,8 +1428,11 @@ const state = {
   lockedKey:null,
   selectionHistory:[],
   showBlocked:false,
+  filterUser:"",
+  includeWithRemarkable:true,
   // Each entry: { source, target, action:'add'|'delete' }
   pendingChanges:[],
+  cleanSnapshot:null,
   history:[],
   redoHistory:[],
   historyApplying:false,
@@ -1303,8 +1440,91 @@ const state = {
   showMilestones:false,         // toggle: OFF by default; milestone overview
   displayIssues:[], displayEdges:[], displayLevels:0,
   hoverKey:null, hoverLockKey:null,
-  returnMilestoneKey:null
+  returnMilestoneKey:null,
+  // Preserve each view's independent scroll position across board rebuilds.
+  scrollPositions:{
+    main:{appLeft:0,appTop:0,columns:{}},
+    locked:{appLeft:0,appTop:0,columns:{}},
+    milestone:{appLeft:0,appTop:0,columns:{}}
+  }
 };
+
+// ── Filter preferences ────────────────────────────────────────────────────
+const FILTER_STORAGE_KEY = 'jiraDependencyMap.filters';
+function loadFilterPreferences(){
+  try{
+    const saved = JSON.parse(localStorage.getItem(FILTER_STORAGE_KEY) || '{}');
+    state.showCompleted = saved.showCompleted === true;
+    state.filterUser = typeof saved.filterUser === 'string' ? saved.filterUser : '';
+    state.includeWithRemarkable = saved.includeWithRemarkable !== false;
+  }catch(e){
+    state.showCompleted = false; state.filterUser = ''; state.includeWithRemarkable = true;
+  }
+}
+function saveFilterPreferences(){
+  try{
+    localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify({
+      showCompleted: !!state.showCompleted,
+      filterUser: state.filterUser || '',
+      includeWithRemarkable: state.includeWithRemarkable !== false
+    }));
+  }catch(e){}
+}
+function filterSnapshot(){
+  return {searchTerm: state.searchTerm || '', showCompleted: !!state.showCompleted, filterUser: state.filterUser || '', includeWithRemarkable: state.includeWithRemarkable !== false};
+}
+function restoreFilterSnapshot(snap){
+  const s = snap || {};
+  state.searchTerm = s.searchTerm || '';
+  state.showCompleted = !!s.showCompleted;
+  state.filterUser = s.filterUser || '';
+  state.includeWithRemarkable = s.includeWithRemarkable !== false;
+  if(searchEl) searchEl.value = state.searchTerm;
+  saveFilterPreferences();
+}
+function clearAllFilters(){
+  state.searchTerm = '';
+  state.showCompleted = false;
+  state.filterUser = '';
+  state.includeWithRemarkable = true;
+  if(searchEl) searchEl.value = '';
+  saveFilterPreferences();
+  updateFilterControls();
+  render();
+}
+function activeFilterCount(){
+  return (state.searchTerm ? 1 : 0) + (state.showCompleted ? 1 : 0) + (state.filterUser ? 1 : 0) + (!state.includeWithRemarkable ? 1 : 0);
+}
+function updateFilterControls(){
+  const toggleCompletedBtn = document.getElementById('toggle-completed');
+  if(toggleCompletedBtn) toggleCompletedBtn.classList.toggle('active', !!state.showCompleted);
+  if(filterRemarkable) filterRemarkable.checked = state.includeWithRemarkable !== false;
+  const count = activeFilterCount();
+  if(clearFiltersBtn){
+    clearFiltersBtn.textContent = count ? 'Clear filters (' + count + ')' : 'Clear filters';
+    clearFiltersBtn.disabled = count === 0;
+  }
+  if(filtersBtn) filtersBtn.setAttribute('aria-expanded', filterMenu?.classList.contains('open') ? 'true' : 'false');
+}
+function populateFilterUsers(){
+  if(!filterUser) return;
+  const users = new Map();
+  (state.issues || []).forEach(i => {
+    const id = i.assigneeAccountId || '';
+    const name = (i.assignee || '').trim() || 'Unassigned';
+    if(id && !users.has(id)) users.set(id, name);
+  });
+  const current = state.filterUser || '';
+  filterUser.innerHTML = '<option value="">All users</option>' +
+    [...users.entries()].sort((a,b) => a[1].localeCompare(b[1])).map(([id,name]) => '<option value="' + esc(id) + '">' + esc(name) + '</option>').join('');
+  // Unassigned must always be the first user option after All users.
+  const unassigned = document.createElement('option');
+  unassigned.value = '__UNASSIGNED__'; unassigned.textContent = 'Unassigned';
+  filterUser.insertBefore(unassigned, filterUser.options[1] || null);
+  filterUser.value = current;
+  if(filterUser.value !== current) filterUser.value = '';
+}
+loadFilterPreferences();
 
 // ── DOM refs ─────────────────────────────────────────────────────────────
 const board              = document.getElementById('board');
@@ -1315,9 +1535,13 @@ const statusText         = document.getElementById('status-text');
 const errorEl            = document.getElementById('error');
 const searchWrap         = document.getElementById('search-wrap');
 const searchEl           = document.getElementById('search');
-const searchClear        = document.getElementById('search-clear');
-const deselectBtn        = document.getElementById('deselect');
+const filtersBtn        = document.getElementById('filters-btn');
+const filterMenu        = document.getElementById('filter-menu');
 const toggleCompletedBtn = document.getElementById('toggle-completed');
+const filterUser        = document.getElementById('filter-user');
+const filterRemarkable  = document.getElementById('filter-remarkable');
+const clearFiltersBtn   = document.getElementById('clear-filters');
+const deselectBtn        = document.getElementById('deselect');
 const toggleMilestonesBtn = document.getElementById('toggle-milestones');
 const milestoneBackBtn  = document.getElementById('milestone-back');
 const loadingStage = document.getElementById('loading-stage');
@@ -1685,7 +1909,7 @@ function applySearchFilter(){
     col.style.display = words.length && count === 0 ? 'none' : '';
   });
 
-  searchClear.classList.toggle('visible', !!words.length && !state.lockedKey);
+  updateFilterControls();
   statusText.textContent = words.length
     ? visibleTotal.toLocaleString('en-GB') + ' of ' + state.displayIssues.length.toLocaleString('en-GB') + ' tickets match'
     : state.displayIssues.length.toLocaleString('en-GB') + ' tickets · ' + state.displayEdges.length.toLocaleString('en-GB') + ' dependencies';
@@ -1704,11 +1928,86 @@ function highlight(text, term){
 // ── Compute display-filtered issues & edges ───────────────────────────────
 // Called at the top of render(). Respects the showCompleted toggle and
 // recalculates dependency levels for the visible subset.
+// ── Scroll position preservation ─────────────────────────────────────────
+// The board is rebuilt for selection changes, dependency edits, saves, etc.
+// Capture the old DOM's scroll state before replacing it, then restore the
+// corresponding view after the new columns have been created.
+function getRenderedViewMode(){
+  const app = document.getElementById('app');
+  if(board.classList.contains('milestone-board') || app.classList.contains('milestone-mode')) return 'milestone';
+  if(app.classList.contains('locked')) return 'locked';
+  return 'main';
+}
+
+function captureBoardScroll(){
+  const app = document.getElementById('app');
+  if(!app) return;
+  const mode = getRenderedViewMode();
+  const saved = state.scrollPositions[mode] || (state.scrollPositions[mode] = {appLeft:0,appTop:0,columns:{}});
+  saved.appLeft = app.scrollLeft;
+  saved.appTop = app.scrollTop;
+
+  const columns = {};
+  board.querySelectorAll('.column').forEach((column, index) => {
+    const cards = column.querySelector('.cards');
+    if(!cards) return;
+    const level = column.dataset.level != null ? column.dataset.level : String(index);
+    columns[level] = cards.scrollTop;
+  });
+  saved.columns = columns;
+}
+
+function restoreBoardScroll(){
+  const app = document.getElementById('app');
+  if(!app) return;
+  const mode = getRenderedViewMode();
+  const saved = state.scrollPositions[mode];
+  if(!saved) return;
+
+  app.scrollLeft = saved.appLeft || 0;
+  app.scrollTop = saved.appTop || 0;
+
+  board.querySelectorAll('.column').forEach((column, index) => {
+    const cards = column.querySelector('.cards');
+    if(!cards) return;
+    const level = column.dataset.level != null ? column.dataset.level : String(index);
+    if(Object.prototype.hasOwnProperty.call(saved.columns || {}, level)){
+      cards.scrollTop = saved.columns[level] || 0;
+    }
+  });
+}
+
+function preserveBoardScrollDuringRender(){
+  requestAnimationFrame(() => {
+    restoreBoardScroll();
+    // A second frame catches layout changes from route spacing and card
+    // rendering before the browser paints the final scroll position.
+    requestAnimationFrame(restoreBoardScroll);
+  });
+}
+
 function computeDisplayData(){
   const DONE = new Set(['done','completed']);
-  const issues = state.showCompleted
-    ? state.issues
-    : state.issues.filter(i => !DONE.has((i.status || '').toLowerCase().trim()));
+  // Dependency chains ignore all filters. Milestones ignore search, user and
+  // With Remarkable filters, but still honour the Show completed toggle.
+  let issues = state.issues;
+  if(state.lockedKey){
+    issues = state.issues;
+  }else{
+    issues = state.showCompleted
+      ? state.issues
+      : state.issues.filter(i => !DONE.has((i.status || '').toLowerCase().trim()));
+    if(!state.showMilestones){
+      if(state.filterUser){
+        issues = state.filterUser === '__UNASSIGNED__'
+          ? issues.filter(i => !i.assigneeAccountId)
+          : issues.filter(i => (i.assigneeAccountId || '') === state.filterUser);
+      }
+      if(!state.includeWithRemarkable){
+        issues = issues.filter(i => (i.status || '').trim() !== 'With Remarkable');
+      }
+    }
+  }
 
   const issueKeys = new Set(issues.map(i => i.key));
 
@@ -1855,16 +2154,54 @@ function updateHoverLockButtons(){
 
 // ── Save button ───────────────────────────────────────────────────────────
 function updateSaveButton(){
-  const b = document.getElementById('save'); if(!b) return;
+  const b = document.getElementById('save');
+  const d = document.getElementById('discard');
+  const count = document.getElementById('save-count');
+  if(!b || !d) return;
   const n = state.pendingChanges.length;
-  b.textContent = n ? 'SAVE (' + n + ')' : 'SAVE (0)';
+  if(count) count.textContent = String(n);
+  b.hidden = n === 0;
+  d.hidden = n === 0;
   b.disabled = n === 0;
+  b.title = 'Save ' + n + ' issue' + (n === 1 ? '' : 's');
+  b.setAttribute('aria-label', b.title);
   b.classList.toggle('unsaved', n > 0);
-  const indicator = document.getElementById('save-state');
-  if(indicator){
-    indicator.textContent = n ? '● ' + n + ' unsaved change' + (n === 1 ? '' : 's') : 'All changes saved';
-    indicator.classList.toggle('unsaved', n > 0);
-  }
+}
+
+function updateSaveProgress(done, total, label){
+  const popup = document.getElementById('save-progress');
+  const text = document.getElementById('save-progress-label');
+  const percent = document.getElementById('save-progress-percent');
+  const fill = document.getElementById('save-progress-fill');
+  if(!popup || !text || !percent || !fill) return;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  text.textContent = label || ('Saving ' + done + ' of ' + total + '\u2026');
+  percent.textContent = pct + '%';
+  fill.style.width = pct + '%';
+  popup.classList.add('show');
+}
+
+function hideSaveProgress(){
+  const popup = document.getElementById('save-progress');
+  if(popup) popup.classList.remove('show');
+}
+
+function cloneCleanSnapshot(){
+  return JSON.parse(JSON.stringify({issues:state.issues, edges:state.edges}));
+}
+
+function discardChanges(){
+  if(!state.pendingChanges.length || !state.cleanSnapshot) return;
+  const n = state.pendingChanges.length;
+  if(!confirm('Discard all ' + n + ' unsaved change' + (n === 1 ? '' : 's') + '?')) return;
+  state.issues = JSON.parse(JSON.stringify(state.cleanSnapshot.issues || []));
+  state.edges = JSON.parse(JSON.stringify(state.cleanSnapshot.edges || []));
+  state.pendingChanges = [];
+  state.history = [];
+  state.redoHistory = [];
+  recalcLocalLevels();
+  render();
+  updateSaveButton();
 }
 
 function cloneLocalSnapshot(){
@@ -1990,36 +2327,51 @@ function stageIssueChange(key, field, value){
 async function saveChanges(){
   if(!state.pendingChanges.length) return;
   const changes = [...state.pendingChanges];
-  const adds    = changes.filter(c => c.action === 'add');
-  const deletes = changes.filter(c => c.action === 'delete');
-  const updates = changes.filter(c => c.action === 'update');
-  setLoading(true, 'Saving changes to Jira\u2026'); hideError();
+  const total = changes.length;
+  let done = 0;
+  hideError();
+  updateSaveProgress(0, total);
+  const saveBtn = document.getElementById('save');
+  const discardBtn = document.getElementById('discard');
+  if(saveBtn) saveBtn.disabled = true;
+  if(discardBtn) discardBtn.disabled = true;
   try{
-    // ── Save issue field updates ──
-    if(updates.length){
-      const r = await fetch('/api/issues', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({changes:updates})});
+    for(const change of changes){
+      let r;
+      if(change.action === 'update'){
+        r = await fetch('/api/issues', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({changes:[change]})});
+      }else if(change.action === 'add'){
+        r = await fetch('/api/links', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({links:[change]})});
+      }else if(change.action === 'delete'){
+        r = await fetch('/api/unlink', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({source:change.source, target:change.target})});
+      }else{
+        throw new Error('Unknown change type: ' + change.action);
+      }
       const d = await r.json().catch(() => ({}));
       if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
-    }
-    // ── Save additions ──
-    if(adds.length){
-      const r = await fetch('/api/links', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({links:adds})});
-      const d = await r.json().catch(() => ({}));
-      if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
-    }
-    // ── Save deletions (sequential so each error can be surfaced) ──
-    for(const del of deletes){
-      const r = await fetch('/api/unlink', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({source:del.source, target:del.target})});
-      const d = await r.json().catch(() => ({}));
-      if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+      done++;
+      updateSaveProgress(done, total);
     }
     state.pendingChanges = [];
     state.history = [];
     state.redoHistory = [];
+    state.cleanSnapshot = cloneCleanSnapshot();
+    updateSaveProgress(total, total, 'Done!');
     updateSaveButton();
     render();
-  }catch(e){ showError(e.message || String(e)); }
-  finally{ setLoading(false); }
+    await new Promise(resolve => setTimeout(resolve, 650));
+  }catch(e){
+    // Keep only the changes which were not successfully sent.
+    state.pendingChanges = changes.slice(done);
+    updateSaveProgress(done, total, 'Saving stopped at ' + done + ' of ' + total);
+    showError(e.message || String(e));
+    updateSaveButton();
+  }finally{
+    if(saveBtn) saveBtn.disabled = false;
+    if(discardBtn) discardBtn.disabled = false;
+    if(done < total) setTimeout(hideSaveProgress, 2200);
+    else hideSaveProgress();
+  }
 }
 
 // ── Status badge colour ───────────────────────────────────────────────────
@@ -2372,8 +2724,13 @@ function renderMilestoneOverview(flashKey){
       // Clicking either a milestone card/banner or one of its chain items
       // opens the normal dependency map with that issue at the end of the chain.
       state.returnMilestoneKey = isBlockerItem ? parentMilestoneKey : null;
+      state.selectionHistory = [{key:null, filters:filterSnapshot()}];
+      state.searchTerm = '';
+      state.filterUser = '';
+      state.includeWithRemarkable = true;
+      searchEl.value = '';
+      saveFilterPreferences();
       state.showMilestones = false;
-      state.selectionHistory = [];
       state.lockedKey = key;
       state.showBlocked = false;
       state.milestoneFlashKey = null;
@@ -2411,6 +2768,11 @@ function renderMilestoneOverview(flashKey){
 
 // ── Render ────────────────────────────────────────────────────────────────
 function render(){
+  // Capture the scroll position belonging to the view currently on screen.
+  // This must happen before state.showMilestones/lockedKey changes are applied
+  // and before the existing columns are removed.
+  captureBoardScroll();
+
   const externalStatus = document.getElementById('external-status');
   const cycleStatus = document.getElementById('cycle-status');
   const hasExternal = (state.issues || []).some(i => (i.externalBlockers || []).length);
@@ -2438,8 +2800,9 @@ function render(){
   // Rebuild display data honoring the completed toggle
   computeDisplayData();
 
-  // Sync toggle button appearance
-  toggleCompletedBtn.classList.toggle('active', state.showCompleted);
+  // Sync filter controls
+  populateFilterUsers();
+  updateFilterControls();
   toggleMilestonesBtn.classList.toggle('active', state.showMilestones);
 
   // Milestone overview is a separate horizontal board mode. It clears selection
@@ -2450,7 +2813,9 @@ function render(){
     state.showBlocked = false;
     document.getElementById('app').classList.remove('locked');
     searchWrap.style.visibility = 'hidden';
-    searchClear.classList.remove('visible');
+    if(filterMenu) filterMenu.classList.remove('open');
+    if(filtersBtn) filtersBtn.style.visibility = 'hidden';
+    if(clearFiltersBtn) clearFiltersBtn.style.visibility = 'hidden';
     deselectBtn.classList.remove('visible');
     if(milestoneBackBtn) milestoneBackBtn.classList.remove('visible');
     const flashKey = state.milestoneFlashKey || null;
@@ -2472,7 +2837,8 @@ function render(){
 
   // Header controls
   searchWrap.style.visibility = locked ? 'hidden' : 'visible';
-  searchClear.classList.toggle('visible', !locked && !!searchTerm);
+  if(filtersBtn) filtersBtn.style.visibility = locked ? 'hidden' : 'visible';
+  if(clearFiltersBtn) clearFiltersBtn.style.visibility = locked ? 'hidden' : 'visible';
   deselectBtn.classList.toggle('visible', locked);
   if(milestoneBackBtn){
     const backMilestone = state.returnMilestoneKey ? state.displayIssues.find(i => i.key === state.returnMilestoneKey) : null;
@@ -2553,6 +2919,7 @@ function render(){
   for(let lv = 0; lv <= max; lv++){
     const col = document.createElement('section');
     col.className = 'column' + (locked ? ' unlocked' : '');
+    col.dataset.level = String(lv);
     const items = orders[lv];
     const cardsDiv = document.createElement('div');
     cardsDiv.className = 'cards' + (locked ? ' noscroll' : '');
@@ -2580,6 +2947,9 @@ function render(){
       try{ searchEl.setSelectionRange(searchSelectionStart, searchSelectionEnd); }catch(_){}
     }
   }
+
+  // Restore the saved position after the new columns exist.
+  preserveBoardScrollDuringRender();
 
   if(locked){
     statusText.textContent = visibleIssues.length.toLocaleString('en-GB') + ' tickets in chain · Esc to deselect';
@@ -3024,7 +3394,13 @@ function attachEvents(){
         // Clicking the selected card again keeps the current level in place.
         return;
       }
-      if(state.lockedKey) state.selectionHistory.push(state.lockedKey);
+      state.selectionHistory.push({key: state.lockedKey, filters: filterSnapshot()});
+      // Dependency chains always reveal every ticket, regardless of search or filters.
+      state.searchTerm = '';
+      state.filterUser = '';
+      state.includeWithRemarkable = true;
+      searchEl.value = '';
+      saveFilterPreferences();
       clearHoverLock();
       state.lockedKey = key;
       state.showBlocked = false;
@@ -3182,6 +3558,7 @@ async function load(resetSelection){
     const d = await r.json();
     if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
     state.issues = d.issues || []; state.edges = d.edges || []; state.levels = d.levels || 0;
+    state.cleanSnapshot = cloneCleanSnapshot();
     // A load is a clean Jira reload. Never re-apply unsaved local changes.
     state.pendingChanges = [];
     state.history = [];
@@ -3209,25 +3586,54 @@ document.getElementById('refresh').addEventListener('click', () => {
   if(state.pendingChanges.length && !confirm('Discard ' + state.pendingChanges.length + ' unsaved change' + (state.pendingChanges.length === 1 ? '' : 's') + ' and refresh from Jira?')) return;
   load(true);
 });
-deselectBtn.addEventListener('click', () => {
+function goBackFromSelection(){
   if(state.selectionHistory.length){
-    state.lockedKey = state.selectionHistory.pop();
+    const previous = state.selectionHistory.pop();
+    state.lockedKey = previous.key || null;
+    restoreFilterSnapshot(previous.filters);
     state.showBlocked = false;
   }else{
     state.lockedKey = null;
     state.showBlocked = false;
   }
   render();
-});
+}
+deselectBtn.addEventListener('click', goBackFromSelection);
 
+filtersBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  filterMenu.classList.toggle('open');
+  updateFilterControls();
+});
+filterMenu.addEventListener('click', e => e.stopPropagation());
 toggleCompletedBtn.addEventListener('click', () => {
   state.showCompleted = !state.showCompleted;
+  saveFilterPreferences();
   render();
+});
+filterUser.addEventListener('change', () => {
+  state.filterUser = filterUser.value;
+  saveFilterPreferences();
+  render();
+});
+filterRemarkable.addEventListener('change', () => {
+  state.includeWithRemarkable = filterRemarkable.checked;
+  saveFilterPreferences();
+  render();
+});
+clearFiltersBtn.addEventListener('click', clearAllFilters);
+document.addEventListener('click', () => {
+  if(filterMenu.classList.contains('open')){
+    filterMenu.classList.remove('open');
+    updateFilterControls();
+  }
 });
 
 milestoneBackBtn.addEventListener('click', () => {
   const key = state.returnMilestoneKey;
   if(!key) return;
+  const previous = state.selectionHistory.length ? state.selectionHistory[0] : null;
+  if(previous && previous.filters) restoreFilterSnapshot(previous.filters);
   state.showMilestones = true;
   state.lockedKey = null;
   state.selectionHistory = [];
@@ -3261,13 +3667,6 @@ searchEl.addEventListener('input', () => {
   state.searchTerm = searchEl.value;
   applySearchFilter();
 });
-searchClear.addEventListener('click', () => {
-  state.searchTerm = '';
-  searchEl.value = '';
-  applySearchFilter();
-  searchEl.focus();
-});
-
 document.addEventListener('keydown', e => {
   const mod = e.ctrlKey || e.metaKey;
   const key = e.key.toLowerCase();
@@ -3290,8 +3689,11 @@ document.addEventListener('keydown', e => {
   }
   if(e.key === 'Escape'){
     if(dependencyModal.classList.contains('open')){ closeDependencyModal(); return; }
-    if(state.lockedKey){ state.lockedKey = null; state.selectionHistory = []; state.showBlocked = false; render(); }
-    else if(state.searchTerm){ state.searchTerm = ''; searchEl.value = ''; applySearchFilter(); searchEl.focus(); }
+    if(state.lockedKey || state.selectionHistory.length){
+      goBackFromSelection();
+    }else if(activeFilterCount()){
+      clearAllFilters();
+    }
   }
 });
 
@@ -3300,6 +3702,7 @@ credentialSave.addEventListener('click', saveCredential);
 credentialRemove.addEventListener('click', removeCredential);
 credentialCancel.addEventListener('click', closeCredentialModal);
 settingsBtn.addEventListener('click', openSettings);
+document.getElementById('discard').addEventListener('click', discardChanges);
 settingsUseJiraModal.addEventListener('click', () => {
   setUseJiraModal(!getUseJiraModal());
 });
