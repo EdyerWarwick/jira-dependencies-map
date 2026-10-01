@@ -1988,24 +1988,23 @@ function preserveBoardScrollDuringRender(){
 
 function computeDisplayData(){
   const DONE = new Set(['done','completed']);
-  // Dependency chains ignore all filters. Milestones ignore search, user and
-  // With Remarkable filters, but still honour the Show completed toggle.
-  let issues = state.issues;
-  if(state.lockedKey){
-    issues = state.issues;
-  }else{
-    issues = state.showCompleted
-      ? state.issues
-      : state.issues.filter(i => !DONE.has((i.status || '').toLowerCase().trim()));
-    if(!state.showMilestones){
-      if(state.filterUser){
-        issues = state.filterUser === '__UNASSIGNED__'
-          ? issues.filter(i => !i.assigneeAccountId)
-          : issues.filter(i => (i.assigneeAccountId || '') === state.filterUser);
-      }
-      if(!state.includeWithRemarkable){
-        issues = issues.filter(i => (i.status || '').trim() !== 'With Remarkable');
-      }
+  // Dependency chains ignore search, user and With Remarkable filters, but
+  // still honour the Show completed toggle. Milestones follow the same rule.
+  // The completed toggle applies to every view, including dependency chains.
+  // Chain view may ignore search/user/remarkable filters, but it must still
+  // start from the same completed/active ticket set selected by the toggle.
+  let issues = state.showCompleted
+    ? state.issues
+    : state.issues.filter(i => !DONE.has((i.status || '').toLowerCase().trim()));
+
+  if(!state.lockedKey && !state.showMilestones){
+    if(state.filterUser){
+      issues = state.filterUser === '__UNASSIGNED__'
+        ? issues.filter(i => !i.assigneeAccountId)
+        : issues.filter(i => (i.assigneeAccountId || '') === state.filterUser);
+    }
+    if(!state.includeWithRemarkable){
+      issues = issues.filter(i => (i.status || '').trim() !== 'With Remarkable');
     }
   }
 
