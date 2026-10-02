@@ -836,13 +836,65 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 
 /* ── App shell ───────────────────────────────────────────────────────────── */
 #app{height:calc(100vh - 58px);overflow-x:auto;overflow-y:hidden;position:relative}
-#app.locked{overflow-y:auto}
+#app.locked{
+  height:auto;
+  min-height:calc(100vh - 58px);
+  max-height:calc(100vh - 58px);
+  overflow-x:auto;
+  overflow-y:auto;
+}
+#app.locked #board{
+  /* In a dependency chain, size the board only to the columns/cards that
+     are actually rendered. This prevents an old SVG/board width from leaving
+     a large empty scroll area to the right. */
+  width:max-content;
+  min-width:0;
+  padding-bottom:20px;
+}
 #app.milestone-mode{overflow-x:auto;overflow-y:auto}
+
+/* ── Board mini-map ─────────────────────────────────────────────────────── */
+#board-minimap{
+  position:fixed;right:16px;bottom:16px;width:220px;height:142px;
+  padding:10px;background:linear-gradient(135deg,#0f172a,#1e293b);
+  border:1px solid #cbd5e1;border-radius:10px;
+  box-shadow:0 8px 24px rgba(15,23,42,.16);
+  z-index:35;display:none;box-sizing:border-box;user-select:none;
+}
+#board-minimap.visible{display:block}
+#board-minimap-stage{
+  position:relative;width:100%;height:100%;overflow:hidden;
+  border-radius:6px;background:linear-gradient(135deg,#0f172a,#1e293b);
+}
+.minimap-board{
+  position:absolute;left:0;top:0;transform-origin:top left;
+}
+.minimap-column{
+  position:absolute;border:1px solid #d7dee8;border-radius:3px;
+  background:#eef2f7;box-sizing:border-box;
+}
+.minimap-card{
+  position:absolute;border:1px solid #b8c4d4;border-radius:2px;
+  background:#fff;box-sizing:border-box;
+}
+.minimap-card.selected{border-color:#6366f1;background:#eef2ff}
+#board-minimap-viewport{
+  position:absolute;left:0;top:0;
+  border:2px solid #6366f1;background:rgba(99,102,241,.10);
+  border-radius:3px;box-sizing:border-box;cursor:grab;
+  min-width:8px;min-height:8px;
+}
+#board-minimap-viewport.dragging{cursor:grabbing}
+#board-minimap-hint{
+  position:absolute;right:3px;bottom:3px;font-size:8px;line-height:1;
+  color:#cbd5e1;background:rgba(15,23,42,.82);padding:2px 3px;
+  border-radius:3px;pointer-events:none;
+}
 #board{
   min-width:max-content;position:relative;
   padding:26px 28px 80px;display:flex;gap:42px;align-items:flex-start;
 }
-#lines{position:absolute;inset:0;pointer-events:none;z-index:1;overflow:visible}
+#lines{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;overflow:visible}
 
 /* ── Columns ─────────────────────────────────────────────────────────────── */
 .column{
@@ -1234,7 +1286,7 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
       </div>
     </div>
     <div class="settings-section">
-      <div class="settings-section-title">Jira tickets</div>
+      <div class="settings-section-title">Board settings</div>
       <div class="settings-toggle-row">
         <div class="settings-toggle-info">
           <div class="settings-toggle-title">Use Jira modal</div>
@@ -1243,6 +1295,16 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
         <button class="settings-toggle" id="settings-use-jira-modal" type="button" role="switch" aria-checked="false">
           <span class="settings-toggle-track" aria-hidden="true"></span>
           <span class="settings-toggle-state">Off</span>
+        </button>
+      </div>
+      <div class="settings-toggle-row" style="margin-top:12px">
+        <div class="settings-toggle-info">
+          <div class="settings-toggle-title">Show board minimap</div>
+          <div class="settings-toggle-help">Show the mini overview when viewing a dependency chain.</div>
+        </div>
+        <button class="settings-toggle" id="settings-show-minimap" type="button" role="switch" aria-checked="true">
+          <span class="settings-toggle-track" aria-hidden="true"></span>
+          <span class="settings-toggle-state">On</span>
         </button>
       </div>
     </div>
@@ -1413,6 +1475,13 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 </div>
 <div id="loading"><div class="loading-favicon-wrap"><img class="loading-favicon" src="https://warwick.ac.uk/services/marketing/teams/cds/opd/1486504840-cog-cogwheel-gear-repr-options-setting_81360.png" alt=""></div><div id="loading-label">Connecting to Jira&hellip;</div><div class="loading-progress"><div id="loading-progress-bar"></div></div><div id="loading-status">Working on it…</div><div id="startup-message" class="startup-message" style="display:none"></div></div>
 <div id="app"><main id="board"><svg id="lines" aria-hidden="true"></svg></main></div>
+<div id="board-minimap" aria-label="Board overview">
+  <div id="board-minimap-stage">
+    <div id="board-minimap-content" class="minimap-board"></div>
+    <div id="board-minimap-viewport" aria-label="Current view"></div>
+    <div id="board-minimap-hint">Drag to move</div>
+  </div>
+</div>
 <div class="save-progress" id="save-progress" role="status" aria-live="polite">
   <div class="save-progress-text"><span id="save-progress-label">Saving 0 of 0&hellip;</span><span id="save-progress-percent">0%</span></div>
   <div class="save-progress-bar"><div class="save-progress-fill" id="save-progress-fill"></div></div>
@@ -1438,6 +1507,7 @@ const state = {
   historyApplying:false,
   showCompleted:false,          // toggle: OFF by default (done/completed hidden)
   showMilestones:false,         // toggle: OFF by default; milestone overview
+  showMiniMap: localStorage.getItem('jiraDependencyMap.showMiniMap') !== 'false',
   displayIssues:[], displayEdges:[], displayLevels:0,
   hoverKey:null, hoverLockKey:null,
   returnMilestoneKey:null,
@@ -1529,6 +1599,10 @@ loadFilterPreferences();
 // ── DOM refs ─────────────────────────────────────────────────────────────
 const board              = document.getElementById('board');
 const lines              = document.getElementById('lines');
+const boardMinimap       = document.getElementById('board-minimap');
+const boardMinimapStage  = document.getElementById('board-minimap-stage');
+const boardMinimapContent= document.getElementById('board-minimap-content');
+const boardMinimapViewport = document.getElementById('board-minimap-viewport');
 const loading            = document.getElementById('loading');
 const dependencyStatus    = document.getElementById('dependency-status');
 const statusText         = document.getElementById('status-text');
@@ -1562,6 +1636,7 @@ const settingsLatestVersion = document.getElementById('settings-latest-version')
 const settingsReleaseLink = document.getElementById('settings-release-link');
 const settingsManageCredential = document.getElementById('settings-manage-credential');
 const settingsUseJiraModal = document.getElementById('settings-use-jira-modal');
+const settingsShowMiniMap = document.getElementById('settings-show-minimap');
 const settingsClose = document.getElementById('settings-close');
 const settingsCloseBottom = document.getElementById('settings-close-bottom');
 const settingsMainView = document.getElementById('settings-main-view');
@@ -1590,6 +1665,7 @@ function getUseJiraModal(){
 function setUseJiraModal(enabled){
   try{ localStorage.setItem(JIRA_MODAL_STORAGE_KEY, enabled ? 'true' : 'false'); }catch(e){}
   updateJiraModalSetting();
+updateMiniMapSetting();
 }
 function updateJiraModalSetting(){
   if(!settingsUseJiraModal) return;
@@ -1598,6 +1674,20 @@ function updateJiraModalSetting(){
   settingsUseJiraModal.setAttribute('aria-checked', enabled ? 'true' : 'false');
   const stateLabel = settingsUseJiraModal.querySelector('.settings-toggle-state');
   if(stateLabel) stateLabel.textContent = enabled ? 'On' : 'Off';
+}
+function updateMiniMapSetting(){
+  if(!settingsShowMiniMap) return;
+  const enabled = state.showMiniMap !== false;
+  settingsShowMiniMap.classList.toggle('active', enabled);
+  settingsShowMiniMap.setAttribute('aria-checked', enabled ? 'true' : 'false');
+  const stateLabel = settingsShowMiniMap.querySelector('.settings-toggle-state');
+  if(stateLabel) stateLabel.textContent = enabled ? 'On' : 'Off';
+}
+function setMiniMapSetting(enabled){
+  state.showMiniMap = !!enabled;
+  try{ localStorage.setItem('jiraDependencyMap.showMiniMap', state.showMiniMap ? 'true' : 'false'); }catch(e){}
+  updateMiniMapSetting();
+  scheduleMiniMapUpdate();
 }
 function showSettingsMain(){
   settingsMainView.style.display = '';
@@ -1661,6 +1751,7 @@ async function showAllStartupMessages(){
 function closeSettings(){ settingsModal.classList.remove('open'); showSettingsMain(); }
 async function openSettings(){
   updateJiraModalSetting();
+  updateMiniMapSetting();
   settingsModal.classList.add('open');
   settingsEmail.textContent = 'Checking…';
   settingsCurrentVersion.textContent = 'Checking…';
@@ -1979,11 +2070,61 @@ function restoreBoardScroll(){
 
 function preserveBoardScrollDuringRender(){
   requestAnimationFrame(() => {
-    restoreBoardScroll();
+    // A newly selected card is a new chain view. Do not restore the previous
+    // board position first, otherwise a card on the far right can briefly
+    // jump back to the old left-hand position before being scrolled right.
+    if(!state.revealSelectedKey){
+      restoreBoardScroll();
+    }
+
     // A second frame catches layout changes from route spacing and card
     // rendering before the browser paints the final scroll position.
-    requestAnimationFrame(restoreBoardScroll);
+    requestAnimationFrame(() => {
+      if(!state.revealSelectedKey){
+        restoreBoardScroll();
+      }
+
+      if(state.revealSelectedKey){
+        requestAnimationFrame(() => {
+          // Start the new chain from its natural top-left position and make
+          // one direct, non-animated move to the selected card. This avoids
+          // the visible left-then-right scroll when selecting far-right cards.
+          const app = document.getElementById('app');
+          if(app){
+            app.scrollLeft = 0;
+            app.scrollTop = 0;
+          }
+          board.querySelectorAll('.cards').forEach(cards => {
+            cards.scrollTop = 0;
+            cards.scrollLeft = 0;
+          });
+
+          revealSelectedCard(state.revealSelectedKey);
+          state.revealSelectedKey = null;
+        });
+      }
+    });
   });
+}
+
+function revealSelectedCard(key){
+  if(!key || !state.lockedKey || key !== state.lockedKey) return;
+  const card = board.querySelector('.card[data-key="' + CSS.escape(key) + '"]');
+  if(!card) return;
+
+  // Move directly to the selected card without an animation. The new chain
+  // starts at the top-left, so this produces a single clean reposition rather
+  // than scrolling back to the old position and then scrolling right again.
+  card.scrollIntoView({
+    behavior:'auto',
+    block:'center',
+    inline:'center'
+  });
+
+  card.classList.remove('dependency-flash');
+  void card.offsetWidth;
+  card.classList.add('dependency-flash');
+  setTimeout(() => card.classList.remove('dependency-flash'), 950);
 }
 
 function computeDisplayData(){
@@ -2935,7 +3076,14 @@ function render(){
     board.appendChild(col);
   }
 
-  requestAnimationFrame(() => { spaceLongRoutes(); requestAnimationFrame(() => { drawLines(); attachEvents(); }); });
+  requestAnimationFrame(() => {
+    spaceLongRoutes();
+    requestAnimationFrame(() => {
+      drawLines();
+      attachEvents();
+      scheduleMiniMapUpdate();
+    });
+  });
 
   // Restore search focus/caret after a genuine board rebuild (refresh, toggle,
   // selection change, etc.). Typing itself no longer rebuilds the board.
@@ -2957,6 +3105,190 @@ function render(){
   }
 
 }
+
+// ── Board mini-map ────────────────────────────────────────────────────────
+let minimapFrame = 0;
+let minimapDrag = null;
+
+function scheduleMiniMapUpdate(){
+  if(minimapFrame) return;
+  minimapFrame = requestAnimationFrame(() => {
+    minimapFrame = 0;
+    updateMiniMap();
+  });
+}
+
+function updateMiniMap(){
+  if(!boardMinimap || !boardMinimapStage || !boardMinimapContent || !boardMinimapViewport) return;
+
+  // The overview is a dependency-chain aid only. Never show it on the
+  // normal home board or in milestone view.
+  if(state.showMiniMap === false || !state.lockedKey || state.showMilestones ||
+     board.classList.contains('milestone-board')){
+    boardMinimap.classList.remove('visible');
+    return;
+  }
+
+  const app = document.getElementById('app');
+  if(!app) return;
+
+  const boardRect = board.getBoundingClientRect();
+  const boardWidth = Math.max(board.scrollWidth, board.clientWidth);
+  const boardHeight = Math.max(board.scrollHeight, board.clientHeight);
+  const canScroll = boardWidth > app.clientWidth + 2 || boardHeight > app.clientHeight + 2;
+
+  if(!canScroll){
+    boardMinimap.classList.remove('visible');
+    return;
+  }
+
+  boardMinimap.classList.add('visible');
+
+  const stageW = boardMinimapStage.clientWidth;
+  const stageH = boardMinimapStage.clientHeight;
+  if(!stageW || !stageH || !boardWidth || !boardHeight) return;
+
+  const scale = Math.min(stageW / boardWidth, stageH / boardHeight);
+  const mapW = boardWidth * scale;
+  const mapH = boardHeight * scale;
+  const offsetX = (stageW - mapW) / 2;
+  const offsetY = (stageH - mapH) / 2;
+
+  boardMinimapContent.style.width = boardWidth + 'px';
+  boardMinimapContent.style.height = boardHeight + 'px';
+  boardMinimapContent.style.transform =
+    'translate(' + offsetX + 'px,' + offsetY + 'px) scale(' + scale + ')';
+
+  boardMinimapContent.innerHTML = '';
+
+  // Show columns as light blocks so the overall dependency-map structure is
+  // visible even where individual cards are tightly packed.
+  board.querySelectorAll('.column').forEach(column => {
+    const el = document.createElement('div');
+    el.className = 'minimap-column';
+
+    const x = column.offsetLeft;
+    const y = column.offsetTop;
+    el.style.left = x + 'px';
+    el.style.top = y + 'px';
+    el.style.width = Math.max(column.offsetWidth, 1) + 'px';
+    el.style.height = Math.max(column.scrollHeight, column.offsetHeight) + 'px';
+    boardMinimapContent.appendChild(el);
+  });
+
+  // Card offsetTop/offsetLeft describe their position in the full cards
+  // content, even when the .cards element itself is vertically scrolled.
+  board.querySelectorAll('.column .card').forEach(card => {
+    const cards = card.closest('.cards');
+    const column = card.closest('.column');
+    if(!cards || !column) return;
+
+    const el = document.createElement('div');
+    el.className = 'minimap-card';
+    if(state.lockedKey && card.dataset.key === state.lockedKey) el.classList.add('selected');
+
+    el.style.left = (column.offsetLeft + cards.offsetLeft + card.offsetLeft) + 'px';
+    el.style.top = (column.offsetTop + cards.offsetTop + card.offsetTop) + 'px';
+    el.style.width = Math.max(card.offsetWidth, 8) + 'px';
+    el.style.height = Math.max(card.offsetHeight, 5) + 'px';
+    boardMinimapContent.appendChild(el);
+  });
+
+  // The outline is the portion of the board currently visible through #app.
+  // App scroll and nested .cards scroll are deliberately represented as the
+  // outer board viewport only; the card map itself still shows the full
+  // contents of each column.
+  const maxLeft = Math.max(0, boardWidth - app.clientWidth);
+  const maxTop = Math.max(0, boardHeight - app.clientHeight);
+  const viewW = Math.min(app.clientWidth, boardWidth);
+  const viewH = Math.min(app.clientHeight, boardHeight);
+
+  boardMinimapViewport.style.width = Math.max(viewW * scale, 8) + 'px';
+  boardMinimapViewport.style.height = Math.max(viewH * scale, 8) + 'px';
+  boardMinimapViewport.style.left =
+    (offsetX + Math.min(app.scrollLeft, maxLeft) * scale) + 'px';
+  boardMinimapViewport.style.top =
+    (offsetY + Math.min(app.scrollTop, maxTop) * scale) + 'px';
+}
+
+function miniMapScrollTo(clientX, clientY){
+  const app = document.getElementById('app');
+  if(!app || !boardMinimapStage) return;
+
+  const stageRect = boardMinimapStage.getBoundingClientRect();
+  const boardWidth = Math.max(board.scrollWidth, board.clientWidth);
+  const boardHeight = Math.max(board.scrollHeight, board.clientHeight);
+  const stageW = boardMinimapStage.clientWidth;
+  const stageH = boardMinimapStage.clientHeight;
+  const scale = Math.min(stageW / boardWidth, stageH / boardHeight);
+  const offsetX = (stageW - boardWidth * scale) / 2;
+  const offsetY = (stageH - boardHeight * scale) / 2;
+
+  const boardX = (clientX - stageRect.left - offsetX) / scale;
+  const boardY = (clientY - stageRect.top - offsetY) / scale;
+
+  const maxLeft = Math.max(0, boardWidth - app.clientWidth);
+  const maxTop = Math.max(0, boardHeight - app.clientHeight);
+
+  app.scrollLeft = Math.max(0, Math.min(maxLeft, boardX - app.clientWidth / 2));
+  app.scrollTop = Math.max(0, Math.min(maxTop, boardY - app.clientHeight / 2));
+  scheduleMiniMapUpdate();
+}
+
+function miniMapPointerDown(e){
+  if(!boardMinimap.classList.contains('visible')) return;
+  e.preventDefault();
+
+  const target = e.target;
+  if(target === boardMinimapViewport || boardMinimapViewport.contains(target)){
+    minimapDrag = {
+      pointerId:e.pointerId,
+      startX:e.clientX,
+      startY:e.clientY,
+      startLeft:document.getElementById('app').scrollLeft,
+      startTop:document.getElementById('app').scrollTop
+    };
+    boardMinimapViewport.classList.add('dragging');
+    boardMinimapViewport.setPointerCapture?.(e.pointerId);
+  }else{
+    miniMapScrollTo(e.clientX, e.clientY);
+  }
+}
+
+function miniMapPointerMove(e){
+  if(!minimapDrag || e.pointerId !== minimapDrag.pointerId) return;
+  const app = document.getElementById('app');
+  if(!app) return;
+
+  const boardWidth = Math.max(board.scrollWidth, board.clientWidth);
+  const boardHeight = Math.max(board.scrollHeight, board.clientHeight);
+  const stageW = boardMinimapStage.clientWidth;
+  const stageH = boardMinimapStage.clientHeight;
+  const scale = Math.min(stageW / boardWidth, stageH / boardHeight);
+
+  const maxLeft = Math.max(0, boardWidth - app.clientWidth);
+  const maxTop = Math.max(0, boardHeight - app.clientHeight);
+
+  app.scrollLeft = Math.max(0, Math.min(maxLeft,
+    minimapDrag.startLeft + (e.clientX - minimapDrag.startX) / scale));
+  app.scrollTop = Math.max(0, Math.min(maxTop,
+    minimapDrag.startTop + (e.clientY - minimapDrag.startY) / scale));
+  scheduleMiniMapUpdate();
+}
+
+function miniMapPointerUp(e){
+  if(!minimapDrag || e.pointerId !== minimapDrag.pointerId) return;
+  boardMinimapViewport.classList.remove('dragging');
+  minimapDrag = null;
+}
+
+boardMinimap?.addEventListener('pointerdown', miniMapPointerDown);
+boardMinimap?.addEventListener('pointermove', miniMapPointerMove);
+boardMinimap?.addEventListener('pointerup', miniMapPointerUp);
+boardMinimap?.addEventListener('pointercancel', miniMapPointerUp);
+document.getElementById('app')?.addEventListener('scroll', scheduleMiniMapUpdate, {passive:true});
+board?.addEventListener('scroll', scheduleMiniMapUpdate, true);
+window.addEventListener('resize', scheduleMiniMapUpdate);
 
 // ── Geometry ──────────────────────────────────────────────────────────────
 function spaceLongRoutes(){
@@ -2987,7 +3319,10 @@ function drawLines(){
   if(!state.lockedKey) return;
 
   const br = board.getBoundingClientRect();
-  const W = Math.max(board.scrollWidth, br.width), H = Math.max(board.scrollHeight, br.height);
+  // Use the board's actual rendered dimensions rather than scrollWidth/
+  // scrollHeight. The latter can include the SVG itself, creating a feedback
+  // loop where an old line canvas makes the chain permanently larger.
+  const W = board.clientWidth, H = board.clientHeight;
   if(!W || !H) return;
   lines.setAttribute('width', W); lines.setAttribute('height', H);
   lines.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
@@ -3368,13 +3703,47 @@ document.querySelectorAll('[data-action="escape"]').forEach(btn => {
   btn.addEventListener('click', () => {
     clearHoverLock();
     closeTicketPreviewModal();
+
+    // Home always resets the board position to the top-left. Clear the
+    // stored scroll positions as well so render() cannot restore an old
+    // horizontal/vertical position from the previous view.
+    Object.keys(state.scrollPositions).forEach(mode => {
+      state.scrollPositions[mode] = {appLeft:0, appTop:0, columns:{}};
+    });
+
     if(state.showBlocked || state.lockedKey){
       state.showBlocked = false;
       state.lockedKey = null;
       state.selectionHistory = [];
       state.returnMilestoneKey = null;
+      state.revealSelectedKey = null;
       render();
+    }else{
+      // Already on the main view: reset the existing DOM immediately.
+      const app = document.getElementById('app');
+      if(app) {
+        app.scrollLeft = 0;
+        app.scrollTop = 0;
+      }
+      board.querySelectorAll('.cards').forEach(cards => {
+        cards.scrollTop = 0;
+        cards.scrollLeft = 0;
+      });
     }
+
+    // Apply once more after layout/render so no restored or newly-created
+    // scroll container can retain the previous position.
+    requestAnimationFrame(() => {
+      const app = document.getElementById('app');
+      if(app) {
+        app.scrollLeft = 0;
+        app.scrollTop = 0;
+      }
+      board.querySelectorAll('.cards').forEach(cards => {
+        cards.scrollTop = 0;
+        cards.scrollLeft = 0;
+      });
+    });
   });
 });
 
@@ -3403,6 +3772,9 @@ function attachEvents(){
       clearHoverLock();
       state.lockedKey = key;
       state.showBlocked = false;
+      // The selected card is the focus of the newly revealed chain. Ask render()
+      // to reveal it after the rebuilt layout and scroll restoration have settled.
+      state.revealSelectedKey = key;
       render();
     });
   });
@@ -3705,6 +4077,9 @@ document.getElementById('discard').addEventListener('click', discardChanges);
 settingsUseJiraModal.addEventListener('click', () => {
   setUseJiraModal(!getUseJiraModal());
 });
+settingsShowMiniMap?.addEventListener('click', () => {
+  setMiniMapSetting(!(state.showMiniMap !== false));
+});
 settingsSeeStartupMessages.addEventListener('click', showAllStartupMessages);
 settingsBack.addEventListener('click', showSettingsMain);
 settingsClose.addEventListener('click', closeSettings);
@@ -3739,7 +4114,7 @@ window.addEventListener('beforeunload', e => {
   }
 });
 
-window.addEventListener('resize', () => requestAnimationFrame(drawLines));
+window.addEventListener('resize', () => { requestAnimationFrame(drawLines); scheduleMiniMapUpdate(); });
 // Do not redraw dependency SVG paths while the app scrolls. In the selected
 // view the board, cards and SVG move together, so rebuilding the paths on
 // every scroll frame only causes flicker.
