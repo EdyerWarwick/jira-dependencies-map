@@ -734,9 +734,9 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .btn-toggle-completed.active .toggle-track::after{transform:translateX(12px)}
 .btn-toggle-milestones{padding-left:11px;padding-right:11px}
 .btn-toggle-milestones.active{background:rgba(56,189,248,.16);border-color:rgba(56,189,248,.45);color:#bae6fd}
-#board.milestone-board{display:block;width:max-content;min-width:100%;}
+#board.milestone-board{display:block;width:max-content;min-width:100%;padding-bottom:10px;}
 #board.milestone-board #lines{display:none!important}
-.milestone-overview{width:max-content;min-width:100%;padding:0 0 70px;display:flex;flex-direction:column;gap:18px}
+.milestone-overview{width:max-content;min-width:100%;padding:0;display:flex;flex-direction:column;gap:18px}
 .milestone-overview-header{display:flex;align-items:center;justify-content:space-between;padding:0 2px}
 .milestone-overview-title{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted)}
 .milestone-overview-count{font-size:12px;background:#e0f2fe;border-radius:999px;padding:3px 9px;color:#0369a1;font-weight:800}
@@ -747,7 +747,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .milestone-blocked-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}
 .milestone-blocked-title{font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:800;color:#9a6700}
 .milestone-blocked-count{font-size:10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:999px;padding:2px 6px;color:#9a6700;font-weight:800}
-.milestone-blocked-list{display:flex;flex-direction:column;gap:4px}
+.milestone-blocked-list{display:flex;flex-direction:column;gap:4px;max-height:calc(100vh - 285px);overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
 .milestone-blocked-group{display:flex;flex-direction:column;gap:4px}
 .milestone-blocked-group + .milestone-blocked-group{margin-top:7px}
 .milestone-blocked-level{font-size:9px;text-transform:uppercase;letter-spacing:.05em;font-weight:800;color:#94a3b8;padding:2px 1px}
@@ -762,6 +762,11 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .hover-lock-btn.active{
   background:#fff7ed;border-color:#f59e0b;color:#b45309;
   box-shadow:0 0 0 2px rgba(245,158,11,.16);
+}
+.card.selection-highlight{
+  outline:2px solid #8b5cf6;
+  outline-offset:-2px;
+  box-shadow:0 0 0 3px rgba(139,92,246,.14);
 }
 .card.highlight-locked{
   outline:2px solid #f59e0b;
@@ -877,7 +882,10 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   position:absolute;border:1px solid #b8c4d4;border-radius:2px;
   background:#fff;box-sizing:border-box;
 }
-.minimap-card.selected{border-color:#6366f1;background:#eef2ff}
+.minimap-card.milestone{border-color:#2563eb;background:#60a5fa}
+.minimap-card.selected{border-color:#7c3aed;background:#a78bfa}
+.minimap-card.highlight-locked{border-color:#d97706;background:#f59e0b}
+.minimap-card.dimmed{opacity:.5}
 #board-minimap-viewport{
   position:absolute;left:0;top:0;
   border:2px solid #6366f1;background:rgba(99,102,241,.10);
@@ -996,6 +1004,8 @@ mark{background:#fef08a;border-radius:2px;padding:0 1px;color:inherit}
 .relation-box.up{background:#fff7ed;border-color:#fed7aa}.relation-box.up .relation-key{color:#9a6700}
 .relation-box.down{background:#f5f3ff;border-color:#ddd6fe}.relation-box.down .relation-key{color:#4338ca}
 .relation-key{color:var(--accent);font-weight:800;text-decoration:none}
+.relation-box.up:has(.relation-key.completed),.relation-box.down:has(.relation-key.completed){background:transparent}
+a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:2px}
 .relation-key:hover{text-decoration:underline}
 .relation-arrow{font-weight:900;color:#64748b;line-height:1}
 .external-key{color:#9a6700}
@@ -1973,11 +1983,20 @@ function applySearchFilter(){
 
   const words = searchWords(state.searchTerm);
   const cards = [...board.querySelectorAll('.card')];
+  const userFilter = state.filterUser || '';
   let visibleTotal = 0;
 
   cards.forEach(card => {
     const haystack = normaliseSearch(card.dataset.searchIndex || '');
-    const match = !words.length || words.every(word => haystack.includes(word));
+    const textMatch = !words.length || words.every(word => haystack.includes(word));
+
+    const assigneeId = card.dataset.assigneeAccountId || '';
+    const userMatch = !userFilter ||
+      (userFilter === '__UNASSIGNED__'
+        ? !assigneeId
+        : assigneeId === userFilter);
+
+    const match = textMatch && userMatch;
     card.hidden = !match;
     if(match) visibleTotal++;
 
@@ -1993,17 +2012,22 @@ function applySearchFilter(){
     const countEl = col.querySelector('.column-count');
     if(countEl) countEl.textContent = count;
 
-    // While searching, hide entire dependency levels that contain no matches.
-    // This keeps matching levels adjacent so users do not have to horizontally
-    // scroll through empty columns (e.g. matches in Level 3 and Level 5 only).
-    // When the search is cleared, restore all columns.
-    col.style.display = words.length && count === 0 ? 'none' : '';
+    // When searching or filtering by user, hide levels containing no
+    // matching cards, but never recalculate or renumber the levels themselves.
+    col.style.display = (words.length || userFilter) && count === 0 ? 'none' : '';
   });
 
   updateFilterControls();
-  statusText.textContent = words.length
-    ? visibleTotal.toLocaleString('en-GB') + ' of ' + state.displayIssues.length.toLocaleString('en-GB') + ' tickets match'
-    : state.displayIssues.length.toLocaleString('en-GB') + ' tickets · ' + state.displayEdges.length.toLocaleString('en-GB') + ' dependencies';
+  if(words.length || userFilter){
+    const activeParts = [];
+    if(words.length) activeParts.push('search');
+    if(userFilter) activeParts.push('user');
+    statusText.textContent = visibleTotal.toLocaleString('en-GB') + ' of ' +
+      state.displayIssues.length.toLocaleString('en-GB') + ' tickets match';
+  }else{
+    statusText.textContent = state.displayIssues.length.toLocaleString('en-GB') +
+      ' tickets · ' + state.displayEdges.length.toLocaleString('en-GB') + ' dependencies';
+  }
 }
 
 // Highlight matched text — properly regex-escapes the term BEFORE matching
@@ -2139,11 +2163,8 @@ function computeDisplayData(){
     : state.issues.filter(i => !DONE.has((i.status || '').toLowerCase().trim()));
 
   if(!state.lockedKey && !state.showMilestones){
-    if(state.filterUser){
-      issues = state.filterUser === '__UNASSIGNED__'
-        ? issues.filter(i => !i.assigneeAccountId)
-        : issues.filter(i => (i.assigneeAccountId || '') === state.filterUser);
-    }
+    // User filtering is applied after dependency levels are calculated, like
+    // the text search, so matching tickets retain their original level.
     if(!state.includeWithRemarkable){
       issues = issues.filter(i => (i.status || '').trim() !== 'With Remarkable');
     }
@@ -2241,6 +2262,7 @@ function renderHoverHighlight(key){
     const inChain = hc.has(p.dataset.from) && hc.has(p.dataset.to);
     p.classList.toggle('hover-dimmed', !inChain);
   });
+  scheduleMiniMapUpdate();
 }
 
 function applyHoverHighlight(key){
@@ -2256,6 +2278,7 @@ function clearHoverHighlight(){
   state.hoverKey = null;
   board.querySelectorAll('.card.hover-dimmed').forEach(c => c.classList.remove('hover-dimmed'));
   lines.querySelectorAll('.hover-dimmed').forEach(el => el.classList.remove('hover-dimmed'));
+  scheduleMiniMapUpdate();
 }
 
 function lockHoverHighlight(key){
@@ -2271,6 +2294,7 @@ function clearHoverLock(){
   board.querySelectorAll('.card.hover-dimmed').forEach(c => c.classList.remove('hover-dimmed'));
   lines.querySelectorAll('.hover-dimmed').forEach(el => el.classList.remove('hover-dimmed'));
   updateHoverLockButtons();
+  scheduleMiniMapUpdate();
 }
 
 function updateHoverLockButtons(){
@@ -2283,13 +2307,17 @@ function updateHoverLockButtons(){
     // Every rendered card belongs to the selected dependency chain, so expose
     // a lock control on each one while chain view is active.
     btn.hidden = !state.lockedKey;
-    if(card) card.classList.toggle('highlight-locked', active);
+    if(card){
+      card.classList.toggle('selection-highlight', selected);
+      card.classList.toggle('highlight-locked', active);
+    }
 
     btn.classList.toggle('active', active);
     btn.textContent = active ? '🔒' : '🔓';
     btn.title = active ? 'Unlock highlight' : 'Lock highlight to this chain';
     btn.setAttribute('aria-label', btn.title);
   });
+  scheduleMiniMapUpdate();
 }
 
 // ── Save button ───────────────────────────────────────────────────────────
@@ -2544,13 +2572,17 @@ function priorityIconHtml(pri){
 // ── Relations HTML ────────────────────────────────────────────────────────
 function relationHtml(i){
   const visible = state.lockedKey ? activeSelectionChain(state.lockedKey) : null;
-  const blockedBy = (i.blockers || []).filter(k => !visible || visible.has(k)).sort();
+  const blockedBy = (i.blockers || []).filter(k => {
+    if(!visible || visible.has(k)) return true;
+    const dependency = state.issues.find(x => x.key === k);
+    return dependency && isCompletedStatus(dependency.status);
+  }).sort();
   const external = (i.externalBlockers || []).filter(x => !visible || i.key === state.lockedKey).sort((a,b) => a.key.localeCompare(b.key));
   const blocks = (i.blocked || []).slice().sort();
 
   function keyItem(k, direction, extraCls){
     const x = state.issues.find(v => v.key === k);
-    const cls = extraCls || 'relation-key';
+    const cls = (extraCls || 'relation-key') + (x && isCompletedStatus(x.status) ? ' completed' : '');
     const issueUrl = x ? x.url : (CFG.jiraBaseUrl + '/browse/' + encodeURIComponent(k));
     const anchor = '<a class="' + cls + '" href="' + esc(issueUrl) +
       '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' +
@@ -2607,7 +2639,7 @@ function cardHtml(i, searchTerm){
 
   const searchIndex = buildSearchIndex(i);
   const isCompleted = isCompletedStatus(i.status);
-  return '<article class="card' + (i.cycle ? ' cycle' : '') + (isExternal ? ' external' : '') + (isCompleted ? ' completed' : '') + '" data-key="' + esc(i.key) + '" data-search-index="' + esc(searchIndex) + '" data-summary="' + esc(i.summary || '') + '">'
+  return '<article class="card' + (i.cycle ? ' cycle' : '') + (isExternal ? ' external' : '') + (isCompleted ? ' completed' : '') + '" data-key="' + esc(i.key) + '" data-assignee-account-id="' + esc(i.assigneeAccountId || '') + '" data-search-index="' + esc(searchIndex) + '" data-summary="' + esc(i.summary || '') + '">'
     + (isMilestone ? '<div class="milestone-banner">MILESTONE</div>' : '')
     + '<div class="card-top">'
     +   '<div class="card-top-left">'
@@ -2892,7 +2924,9 @@ function renderMilestoneOverview(flashKey){
   statusText.textContent = milestones.length.toLocaleString('en-GB') + ' milestone' + (milestones.length === 1 ? '' : 's');
   const app = document.getElementById('app');
   requestAnimationFrame(() => {
-    app.scrollLeft = 0;
+    const savedMilestoneScroll = state.scrollPositions.milestone || {};
+    app.scrollLeft = savedMilestoneScroll.appLeft || 0;
+    app.scrollTop = savedMilestoneScroll.appTop || 0;
     if(flashKey){
       const target = board.querySelector('.milestone-overview-card[data-milestone-card="' + CSS.escape(flashKey) + '"]');
       if(target){
@@ -2991,7 +3025,7 @@ function render(){
   // Search is applied after the cards are rendered. In selected mode the
   // dependency chain is still structurally filtered as before.
   let visibleKeys = locked ? activeSelectionChain(state.lockedKey) : null;
-  const visibleIssues = visibleKeys
+  let visibleIssues = visibleKeys
     ? state.displayIssues.filter(i => visibleKeys.has(i.key))
     : state.displayIssues;
 
@@ -3169,10 +3203,17 @@ function updateMiniMap(){
 
     const x = column.offsetLeft;
     const y = column.offsetTop;
-    el.style.left = x + 'px';
-    el.style.top = y + 'px';
-    el.style.width = Math.max(column.offsetWidth, 1) + 'px';
-    el.style.height = Math.max(column.scrollHeight, column.offsetHeight) + 'px';
+    // Keep the column backdrop slightly inset so it never visually
+    // overlaps the ticket rectangles on the minimap.
+    const inset = 2;
+    const colW = Math.max(column.offsetWidth, 1);
+    const header = column.querySelector('.column-header');
+    const colH = Math.max(header ? header.offsetHeight : 20, 1);
+    el.style.left = (x + inset) + 'px';
+    el.style.top = (y + inset) + 'px';
+    el.style.width = Math.max(colW - inset * 2, 1) + 'px';
+    el.style.height = Math.max(colH - inset * 2, 1) + 'px';
+    el.style.zIndex = '0';
     boardMinimapContent.appendChild(el);
   });
 
@@ -3185,12 +3226,19 @@ function updateMiniMap(){
 
     const el = document.createElement('div');
     el.className = 'minimap-card';
-    if(state.lockedKey && card.dataset.key === state.lockedKey) el.classList.add('selected');
+    const key = card.dataset.key;
+    const issue = state.displayIssues.find(i => i.key === key) || state.issues.find(i => i.key === key);
+    const isMilestone = !!issue && (issue.labels || []).some(label => String(label).toLowerCase() === 'milestone');
+    if(isMilestone) el.classList.add('milestone');
+    if(state.lockedKey && key === state.lockedKey) el.classList.add('selected');
+    if(state.hoverLockKey && key === state.hoverLockKey) el.classList.add('highlight-locked');
+    if(card.classList.contains('hover-dimmed')) el.classList.add('dimmed');
 
     el.style.left = (column.offsetLeft + cards.offsetLeft + card.offsetLeft) + 'px';
     el.style.top = (column.offsetTop + cards.offsetTop + card.offsetTop) + 'px';
     el.style.width = Math.max(card.offsetWidth, 8) + 'px';
     el.style.height = Math.max(card.offsetHeight, 5) + 'px';
+    el.style.zIndex = '1';
     boardMinimapContent.appendChild(el);
   });
 
