@@ -779,7 +779,11 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   text-decoration-thickness:1.5px;
   text-decoration-color:currentColor;
 }
-.milestone-blocked-item{display:block;width:100%;border:1px solid #e2e8f0;border-radius:5px;background:#f8fafc;padding:5px 7px;text-align:left;cursor:pointer;font-size:12px;line-height:1.3;color:#475569;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.milestone-blocked-item{display:flex;align-items:center;width:100%;box-sizing:border-box;border:1px solid #e2e8f0;border-radius:5px;background:#f8fafc;padding:5px 7px;text-align:left;cursor:pointer;font-size:12px;line-height:1.3;color:#475569;overflow:hidden;white-space:nowrap}
+.milestone-blocked-content{display:block;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.milestone-blocked-priority{display:inline-flex;align-items:center;vertical-align:middle;margin-right:6px;flex-shrink:0}
+.milestone-blocked-assignee{display:inline-flex;flex:0 0 20px;align-items:center;justify-content:center;width:20px;height:20px;margin:-2px 0 -2px 6px;border-radius:50%;background:#e2e8f0;color:#475569;font-size:9px;font-weight:800;line-height:20px;vertical-align:middle}
+.milestone-blocked-assignee.unassigned{background:#2563eb;color:#fff}
 .milestone-blocked-item:hover{background:#fffaf0;border-color:#fed7aa}
 .milestone-blocked-item a{color:inherit;text-decoration:none}
 .milestone-blocked-item a:hover{text-decoration:underline}
@@ -957,6 +961,8 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .card-top-left{display:flex;align-items:center;gap:6px;min-width:0}
 .assignee-select{font:inherit;border:0;background:transparent;color:var(--muted);cursor:pointer;min-width:0;padding:0;outline:none}
 .assignee-select{font-size:11px;max-width:100%;margin-top:7px}
+.assignee-select.unassigned{background:#2563eb;color:#fff;border-radius:999px;padding:2px 7px;font-weight:700}
+.assignee-select.unassigned option{background:#fff;color:#334155}
 .priority-picker{position:relative;display:inline-flex;align-items:center;flex-shrink:0}
 .priority-trigger{display:flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:0;background:transparent;border-radius:4px;cursor:pointer}
 .priority-trigger:hover,.priority-picker.open .priority-trigger{background:#f1f5f9}
@@ -1018,6 +1024,14 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
   color:#94a3b8;font-size:13px;padding:15px 8px;
   border:1px dashed #cbd5e1;border-radius:8px;text-align:center;
 }
+.no-active-user{width:min(520px,calc(100% - 40px));margin:70px auto 0;padding:24px;border:1px solid #dbe2ea;border-radius:12px;background:#fff;box-shadow:0 8px 24px rgba(15,23,42,.08);text-align:center;color:#475569}
+.no-active-user-title{font-size:18px;font-weight:800;color:#172033;margin-bottom:7px}
+.no-active-user-label{font-size:13px;color:#64748b;margin-bottom:16px}
+.no-active-user-select-label{display:flex;align-items:center;justify-content:center;gap:9px;font-size:12px;font-weight:700;color:#475569;flex-wrap:wrap}
+.no-active-user-select{min-width:210px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;font:inherit;font-weight:500}
+.no-results{width:min(520px,calc(100% - 40px));margin:70px auto 0;padding:24px;border:1px solid #dbe2ea;border-radius:12px;background:#fff;box-shadow:0 8px 24px rgba(15,23,42,.08);text-align:center;color:#475569}
+.no-results-title{font-size:18px;font-weight:800;color:#172033;margin-bottom:7px}
+.no-results-message{font-size:13px;color:#64748b}
 
 
 /* ── Dependency modal ─────────────────────────────────────────────────────── */
@@ -1589,12 +1603,27 @@ function updateFilterControls(){
 function populateFilterUsers(){
   if(!filterUser) return;
   const users = new Map();
-  (state.issues || []).forEach(i => {
+  // Build the user list from the tickets currently eligible for display.
+  // This means users who only have completed tickets disappear when
+  // Show completed is off, and reappear when it is enabled.
+  const eligibleIssues = state.displayIssues || [];
+  eligibleIssues.forEach(i => {
     const id = i.assigneeAccountId || '';
     const name = (i.assignee || '').trim() || 'Unassigned';
     if(id && !users.has(id)) users.set(id, name);
   });
   const current = state.filterUser || '';
+
+  // Keep the currently selected user in the list even if they no longer have
+  // an active ticket. This lets the UI explain that the selection is now empty
+  // instead of silently changing the filter back to All users.
+  if(current && current !== '__UNASSIGNED__' && !users.has(current)){
+    const currentIssue = (state.issues || []).find(i => (i.assigneeAccountId || '') === current);
+    if(currentIssue){
+      users.set(current, (currentIssue.assignee || '').trim() || current);
+    }
+  }
+
   filterUser.innerHTML = '<option value="">All users</option>' +
     [...users.entries()].sort((a,b) => a[1].localeCompare(b[1])).map(([id,name]) => '<option value="' + esc(id) + '">' + esc(name) + '</option>').join('');
   // Unassigned must always be the first user option after All users.
@@ -2017,11 +2046,56 @@ function applySearchFilter(){
     col.style.display = (words.length || userFilter) && count === 0 ? 'none' : '';
   });
 
+  // If a selected user has become inactive because Completed was switched
+  // off, keep that selection visible and explain the empty result in the board.
+  const existingNoActiveUser = board.querySelector('.no-active-user');
+  if(existingNoActiveUser) existingNoActiveUser.remove();
+  const existingNoResults = board.querySelector('.no-results');
+  if(existingNoResults) existingNoResults.remove();
+
+  if(userFilter && visibleTotal === 0 && !words.length){
+    const selectedName = userFilter === '__UNASSIGNED__'
+      ? 'Unassigned'
+      : ((state.issues || []).find(i => (i.assigneeAccountId || '') === userFilter)?.assignee || 'User');
+
+    const activeUsers = new Map();
+    (state.displayIssues || []).forEach(i => {
+      const id = i.assigneeAccountId || '';
+      if(id && !activeUsers.has(id)) activeUsers.set(id, (i.assignee || '').trim() || id);
+    });
+
+    const options = [...activeUsers.entries()]
+      .sort((a,b) => a[1].localeCompare(b[1]))
+      .map(([id,name]) => '<option value="' + esc(id) + '">' + esc(name) + '</option>').join('');
+
+    const notice = document.createElement('div');
+    notice.className = 'no-active-user';
+    notice.innerHTML = '<div class="no-active-user-title">User has no active tickets</div>' +
+      '<div class="no-active-user-label">' + esc(selectedName) + '</div>' +
+      '<label class="no-active-user-select-label">Please select another user:<select class="no-active-user-select">' +
+        '<option value="">Please select another user:</option>' +
+        '<option value="__UNASSIGNED__">Unassigned</option>' +
+        options +
+      '</select></label>';
+    board.appendChild(notice);
+
+    const replacementSelect = notice.querySelector('.no-active-user-select');
+    replacementSelect.addEventListener('change', () => {
+      if(!replacementSelect.value) return;
+      state.filterUser = replacementSelect.value;
+      saveFilterPreferences();
+      render();
+    });
+  } else if((words.length || userFilter) && visibleTotal === 0){
+    const notice = document.createElement('div');
+    notice.className = 'no-results';
+    notice.innerHTML = '<div class="no-results-title">No results to show.</div>' +
+      '<div class="no-results-message">Please adjust your search term.</div>';
+    board.appendChild(notice);
+  }
+
   updateFilterControls();
   if(words.length || userFilter){
-    const activeParts = [];
-    if(words.length) activeParts.push('search');
-    if(userFilter) activeParts.push('user');
     statusText.textContent = visibleTotal.toLocaleString('en-GB') + ' of ' +
       state.displayIssues.length.toLocaleString('en-GB') + ' tickets match';
   }else{
@@ -2631,7 +2705,7 @@ function cardHtml(i, searchTerm){
     + priorityIconHtml(p) + '<span>' + esc(p) + '</span></button>'
   ).join('');
   const assigneeOptions = assignees.map(a => '<option value="' + esc(a.accountId) + '"' + (a.accountId === (i.assigneeAccountId || '') ? ' selected' : '') + '>' + esc(a.name) + '</option>').join('');
-  const assigneeSelect = '<select class="assignee-select" data-field="assignee" data-stop-propagation="1" title="Change assignee"><option value="">Unassigned</option>' + assigneeOptions + '</select>';
+  const assigneeSelect = '<select class="assignee-select' + (!i.assigneeAccountId ? ' unassigned' : '') + '" data-field="assignee" data-stop-propagation="1" title="Change assignee"><option value="">Unassigned</option>' + assigneeOptions + '</select>';
   const prioritySelect = '<span class="priority-picker" data-stop-propagation="1" title="Change priority">'
     + '<button type="button" class="priority-trigger" data-stop-propagation="1" aria-label="Change priority" aria-haspopup="true" aria-expanded="false">' + priorityIconHtml(i.priority) + '</button>'
     + '<span class="priority-menu" role="menu">' + priorityOptions + '</span>'
@@ -2818,6 +2892,14 @@ function milestoneCardHtml(i){
 }
 
 function milestoneOverviewHtml(milestones){
+  function assigneeInitials(name){
+    const clean = String(name || '').trim();
+    if(!clean || clean.toLowerCase() === 'unassigned') return '';
+    const parts = clean.split(/\s+/).filter(Boolean);
+    if(parts.length === 1) return parts[0].slice(0,2).toUpperCase();
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  }
+
   function blockerItems(i){
     const blockers = milestoneChainItems(i.key);
     const count = blockers.length;
@@ -2832,13 +2914,21 @@ function milestoneOverviewHtml(milestones){
           const label = level === 0 ? 'Unblocked' : 'Level ' + level;
           return '<div class="milestone-blocked-group">' +
             '<div class="milestone-blocked-level">' + label + '</div>' +
-            groups.get(level).sort((a,b) => a.key.localeCompare(b.key)).map(b =>
+            groups.get(level).sort((a,b) => {
+              const pa = priorityRank(a.priority);
+              const pb = priorityRank(b.priority);
+              return pa === pb ? a.key.localeCompare(b.key) : pa - pb;
+            }).map(b =>
               '<div class="milestone-blocked-item' + (isCompletedStatus(b.status) ? ' completed' : '') +
                 '" data-milestone-chain="' + esc(b.key) + '" title="' + esc(b.key + ' - ' + (b.summary || '')) + '">' +
-                '<a class="milestone-blocked-key" href="' + esc(b.url || (CFG.jiraBaseUrl + '/browse/' + b.key)) +
-                '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' +
-                esc(b.key) + '">' + esc(b.key) + '</a>' +
-                ' - ' + esc(b.summary || '') +
+                '<span class="milestone-blocked-content">' +
+                  '<span class="milestone-blocked-priority">' + priorityIconHtml(b.priority) + '</span>' +
+                  '<a class="milestone-blocked-key" href="' + esc(b.url || (CFG.jiraBaseUrl + '/browse/' + b.key)) +
+                  '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' +
+                  esc(b.key) + '">' + esc(b.key) + '</a>' +
+                  ' - ' + esc(b.summary || '') +
+                '</span>' +
+                (assigneeInitials(b.assignee) ? '<span class="milestone-blocked-assignee" title="Assigned to ' + esc(b.assignee) + '">' + esc(assigneeInitials(b.assignee)) + '</span>' : '<span class="milestone-blocked-assignee unassigned" title="Unassigned">U</span>') +
               '</div>'
             ).join('') +
           '</div>';
@@ -2966,7 +3056,7 @@ function render(){
   const searchSelectionEnd = searchEl ? searchEl.selectionEnd : null;
 
   document.querySelectorAll('.priority-picker.open').forEach(closePriorityPicker);
-  [...board.querySelectorAll('.column, .milestone-overview')].forEach(x => x.remove());
+  [...board.querySelectorAll('.column, .milestone-overview, .no-active-user, .no-results')].forEach(x => x.remove());
   board.classList.toggle('milestone-board', state.showMilestones);
   document.getElementById('app').classList.toggle('milestone-mode', state.showMilestones);
   lines.innerHTML = '';
@@ -3056,6 +3146,19 @@ function render(){
       });
     }
   }
+  if(!locked){
+    // On the default board, each level follows the exact same priority order
+    // exposed by the priority menu. Priority is the primary order, with the
+    // Jira key used only as a stable tie-breaker for tickets with the same priority.
+    for(let lv = 0; lv <= max; lv++){
+      orders[lv].sort((a,b) => {
+        const pa = priorityRank(a.priority);
+        const pb = priorityRank(b.priority);
+        return pa === pb ? a.key.localeCompare(b.key) : pa - pb;
+      });
+    }
+  }
+
   if(locked){
     // Order the revealed chain around the selected card. Upstream blockers remain
     // on the blocking side; when downstream cards are revealed they continue away
@@ -3759,11 +3862,15 @@ document.querySelectorAll('[data-action="escape"]').forEach(btn => {
       state.scrollPositions[mode] = {appLeft:0, appTop:0, columns:{}};
     });
 
-    if(state.showBlocked || state.lockedKey){
+    if(state.showMilestones || state.showBlocked || state.lockedKey){
+      // Home from any alternate view must return to the normal default board,
+      // not simply reset the horizontal scroll position of the current view.
+      state.showMilestones = false;
       state.showBlocked = false;
       state.lockedKey = null;
       state.selectionHistory = [];
       state.returnMilestoneKey = null;
+      state.milestoneFlashKey = null;
       state.revealSelectedKey = null;
       render();
     }else{
@@ -3873,6 +3980,7 @@ function attachEvents(){
       e.stopPropagation();
       const card = select.closest('.card');
       if(!card) return;
+      if(select.dataset.field === 'assignee') select.classList.toggle('unassigned', !select.value);
       stageIssueChange(card.dataset.key, select.dataset.field, select.value);
     });
     select.addEventListener('click', e => e.stopPropagation());
