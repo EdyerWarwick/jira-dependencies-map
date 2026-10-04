@@ -5,6 +5,25 @@ from collections import defaultdict,deque
 import requests as req
 from flask import Flask,Response,jsonify,request
 
+JIRA_BATCH_SIZE=1000
+_loading_progress={"phase":"Idle","batch":0,"fetched":0,"total":None,"detail":""}
+_loading_progress_lock=threading.Lock()
+
+def _set_loading_progress(**values):
+    with _loading_progress_lock:
+        _loading_progress.update(values)
+
+def _get_loading_progress():
+    with _loading_progress_lock:
+        return dict(_loading_progress)
+
+JIRA_HTTP_SESSION=req.Session()
+
+# Background cache for the slower full/completed-ticket load. The initial board
+# can render from active tickets while this cache is populated.
+_completed_loads={}
+_completed_loads_lock=threading.Lock()
+
 JIRA_BASE_URL="https://uow-idg.atlassian.net"
 JQL_QUERY="project IN (OPD, WT) AND status NOT IN (Epics, Component) AND issuetype != Epic AND issuetype NOT IN subTaskIssueTypes() AND parent != OPD-457"
 PORT=5001
@@ -195,16 +214,29 @@ def jira_error(resp):
 def _jira_search(jql, fields, label):
     """Run a paginated Jira JQL search and return all matching issues."""
     url=f"{JIRA_BASE_URL}/rest/api/3/search/jql"
-    all_issues=[]; token=None; page=0
+    all_issues=[]; token=None; page=0; batch_size=JIRA_BATCH_SIZE
+    _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=0,fetched=0,total=None,detail="Connecting to Jira…")
     while True:
-        page+=1; body={"jql":jql,"maxResults":100,"fields":fields}
+        page+=1
+        body={"jql":jql,"maxResults":batch_size,"fields":fields}
         if token: body["nextPageToken"]=token
-        print(f"  -> Jira {label} page {page} (have {len(all_issues):,} so far)")
-        started=time.time(); resp=req.post(url,headers=get_jira_headers(),json=body,timeout=60)
+        _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=page,fetched=len(all_issues),detail=f"Requesting batch {page}…")
+        print(f"  -> Jira {label} page {page} (have {len(all_issues):,} so far; batch size {batch_size:,})")
+        started=time.time()
+        resp=JIRA_HTTP_SESSION.post(url,headers=get_jira_headers(),json=body,timeout=60)
+        # Some Jira configurations enforce a smaller maxResults limit. Fall back once.
+        if resp.status_code==400 and batch_size!=100:
+            print(f"  <- Jira rejected batch size {batch_size}; retrying with 100")
+            batch_size=100
+            page-=1
+            continue
         print(f"  <- HTTP {resp.status_code} ({len(resp.content):,} bytes, {time.time()-started:.2f}s)")
         if not resp.ok: raise RuntimeError(f"Jira API {resp.status_code}: {jira_error(resp)}")
         data=resp.json(); batch=data.get("issues",[]); all_issues.extend(batch); token=data.get("nextPageToken")
+        total=data.get("total")
+        _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=page,fetched=len(all_issues),total=total,detail=f"Batch {page}: {len(batch):,} downloaded ({len(all_issues):,}" + (f" of {total:,}" if isinstance(total,int) else "") + ")")
         if not token or not batch: break
+    _set_loading_progress(phase=f"Downloaded {label} work items",batch=page,fetched=len(all_issues),total=len(all_issues),detail=f"{len(all_issues):,} work items downloaded")
     print(f"  OK {label}: fetched {len(all_issues):,} issues")
     return all_issues
 
@@ -228,7 +260,7 @@ def _external_blocker_keys(raw_issues):
                 external.add(str(blocker).strip())
     return sorted(k for k in external if k)
 
-def jira_fetch_external_issues(raw_issues):
+def jira_fetch_external_issues(raw_issues, include_completed=True):
     """Recursively fetch external blockers until no new blocker keys are found."""
     fields=["summary","status","priority","assignee","issuelinks","parent","customfield_10014","labels"]
     # Jira can impose a limit on the number of values in an IN clause. Keep the
@@ -251,6 +283,8 @@ def jira_fetch_external_issues(raw_issues):
             chunk=current[start:start+chunk_size]
             key_list=", ".join(chunk)
             jql=f"key in ({key_list})"
+            if not include_completed:
+                jql=f"({jql}) AND statusCategory != Done"
             print(f"  External blockers: requesting {len(chunk):,} ticket(s) in one JQL")
             round_fetched.extend(_jira_search(jql,fields,"external blocker"))
 
@@ -272,22 +306,97 @@ def jira_fetch_external_issues(raw_issues):
 
         print(f"  External blockers: round {round_no} found {len(new_issues):,} new issue(s); {len(pending):,} more blocker(s) queued")
 
+    _set_loading_progress(phase="Processing dependencies…",batch=0,fetched=len(fetched),total=len(fetched),detail=f"{len(fetched):,} external blockers downloaded")
     print(f"  External blockers: recursively found {len(fetched):,} additional issue(s)")
     return fetched
 
-def jira_fetch_all_issues():
-    # parent = next-gen epic; customfield_10014 = classic epic link (optional — ignored if absent)
-    fields=["summary","status","priority","assignee","issuelinks","parent","customfield_10014","labels"]
-    all_issues=_jira_search(JQL_QUERY,fields,"main")
+def _base_issue_fields():
+    return ["summary","status","priority","assignee","issuelinks","parent","customfield_10014","labels"]
 
-    # Some blockers sit outside the main OPD/WT JQL. Fetch those specific keys
-    # in a second batched JQL so they become full issues on the dependency map.
-    external_issues=jira_fetch_external_issues(all_issues)
-    if external_issues:
-        existing={r.get("key") for r in all_issues}
-        all_issues.extend(r for r in external_issues if r.get("key") not in existing)
-    print(f"  OK fetched {len(all_issues):,} total issues including external blockers")
+def _completed_jql(jql):
+    """Restrict a JQL query to Jira's Done status category."""
+    base=str(jql or JQL_QUERY).strip() or JQL_QUERY
+    return f"({base}) AND statusCategory = Done"
+
+def _merge_issues(target, additions):
+    existing={str(r.get("key") or "").strip() for r in target if r.get("key")}
+    for issue in additions or []:
+        key=str(issue.get("key") or "").strip()
+        if key and key not in existing:
+            target.append(issue)
+            existing.add(key)
+    return target
+
+def jira_fetch_active_issues(jql=None):
+    fields=_base_issue_fields()
+    active_jql=_active_jql(jql)
+    all_issues=_jira_search(active_jql,fields,"open")
+
+    # First external-ticket pass: only after every open/main ticket has been
+    # downloaded. This keeps the first board build focused on active work.
+    _set_loading_progress(phase="Checking external blockers for open tickets…",batch=0,fetched=len(all_issues),total=len(all_issues),detail="Checking links from open tickets…")
+    external_issues=jira_fetch_external_issues(all_issues, include_completed=True)
+    _merge_issues(all_issues, external_issues)
     return all_issues
+
+def jira_fetch_completed_issues(jql=None):
+    fields=_base_issue_fields()
+    completed_jql=_completed_jql(jql)
+    completed=_jira_search(completed_jql,fields,"completed")
+
+    # Second external-ticket pass: only after every completed ticket has been
+    # downloaded, so blockers referenced solely by completed work are included.
+    _set_loading_progress(phase="Checking external blockers for completed tickets…",batch=0,fetched=len(completed),total=len(completed),detail="Checking links from completed tickets…")
+    external_issues=jira_fetch_external_issues(completed, include_completed=True)
+    _merge_issues(completed, external_issues)
+    return completed
+
+def jira_fetch_all_issues(jql=None):
+    """Load open tickets, check their externals, then completed tickets, then their externals."""
+    active=jira_fetch_active_issues(jql)
+    completed=jira_fetch_completed_issues(jql)
+    all_issues=[]
+    _merge_issues(all_issues,active)
+    _merge_issues(all_issues,completed)
+    _set_loading_progress(phase="Processing dependencies…",batch=0,fetched=len(all_issues),total=len(all_issues),detail=f"{len(all_issues):,} tickets ready")
+    print(f"  OK fetched {len(all_issues):,} total issues after open/completed external checks")
+    return all_issues
+
+def _active_jql(jql):
+    """Restrict a JQL query to Jira's non-Done status category."""
+    base=str(jql or JQL_QUERY).strip() or JQL_QUERY
+    return f"({base}) AND statusCategory != Done"
+
+def _completed_cache_key(jql):
+    return str(jql or JQL_QUERY).strip() or JQL_QUERY
+
+def _background_completed_load(jql, active_raw):
+    key=_completed_cache_key(jql)
+    try:
+        with _completed_loads_lock:
+            _completed_loads[key]={"status":"downloading","fetched":0,"detail":"Starting completed ticket download…","graph":None,"error":None}
+        print(f"  Background completed load started for JQL: {key}")
+        completed=jira_fetch_completed_issues(key)
+        raw=[]
+        _merge_issues(raw,active_raw)
+        _merge_issues(raw,completed)
+        graph=serialize_graph(raw,key)
+        with _completed_loads_lock:
+            _completed_loads[key]={"status":"ready","fetched":len(raw),"detail":f"{len(raw):,} total tickets downloaded","graph":graph,"error":None}
+        print(f"  Background completed load complete: {len(raw):,} total tickets")
+    except Exception as e:
+        with _completed_loads_lock:
+            _completed_loads[key]={"status":"error","fetched":0,"detail":"Completed ticket download failed","graph":None,"error":str(e)}
+        print(f"  Background completed load failed: {e}")
+
+def _start_background_full_load(jql, active_raw):
+    key=_completed_cache_key(jql)
+    with _completed_loads_lock:
+        existing=_completed_loads.get(key)
+        if existing and existing.get("status") in {"downloading","ready"}:
+            return
+        _completed_loads[key]={"status":"queued","fetched":0,"detail":"Queued completed ticket download…","graph":None,"error":None}
+    threading.Thread(target=_background_completed_load,args=(key,active_raw),daemon=True,name="jira-completed-loader").start()
 
 def _extract_epic(fields):
     """Return {key, summary, url} for the parent epic, or None."""
@@ -393,7 +502,7 @@ def calculate_levels(issues,edges):
         if k in cycles: level[k]=0
     return level,cycles
 
-def serialize_graph(raw):
+def serialize_graph(raw, jql=None):
     issues,edges=parse_dependency_graph(raw); levels,cycles=calculate_levels(issues,edges); out=[]
     for k,v in issues.items():
         out.append({
@@ -407,17 +516,50 @@ def serialize_graph(raw):
     out.sort(key=lambda x:(x["level"],x["key"]))
     return {"issues":out,"edges":[{"from":a,"to":b} for a,b in sorted(edges)],
             "levels":max((i["level"] for i in out),default=0),
-            "cycleKeys":sorted(cycles),"total":len(out),"jql":JQL_QUERY}
+            "cycleKeys":sorted(cycles),"total":len(out),"jql":str(jql or JQL_QUERY).strip() or JQL_QUERY}
 
 # ---------------------------------------------------------------------------
 # Flask routes
 # ---------------------------------------------------------------------------
 
+@app.route("/api/loading-status")
+def api_loading_status():
+    return jsonify(_get_loading_progress())
+
 @app.route("/api/dependencies")
 def api_dependencies():
-    try: return jsonify(serialize_graph(jira_fetch_all_issues()))
+    try:
+        jql=request.args.get("jql")
+        if jql is not None and not str(jql).strip():
+            jql=None
+        active_jql=str(jql or JQL_QUERY).strip() or JQL_QUERY
+        mode=(request.args.get("mode") or "all").strip().lower()
+        if mode == "active":
+            raw=jira_fetch_active_issues(active_jql)
+            # Start the slower complete download only after the active result has
+            # been obtained, so the first response is not competing with it.
+            _start_background_full_load(active_jql, raw)
+            return jsonify(serialize_graph(raw,active_jql))
+        return jsonify(serialize_graph(jira_fetch_all_issues(active_jql), active_jql))
     except RuntimeError as e: return jsonify({"error":str(e)}),502
     except Exception as e: return jsonify({"error":f"Unexpected error: {e}"}),500
+
+@app.route("/api/completed-status")
+def api_completed_status():
+    jql=str(request.args.get("jql") or JQL_QUERY).strip() or JQL_QUERY
+    with _completed_loads_lock:
+        data=dict(_completed_loads.get(_completed_cache_key(jql) or "", {"status":"not-started","fetched":0,"detail":"Completed tickets have not started downloading.","graph":None,"error":None}))
+    data.pop("graph",None)
+    return jsonify(data)
+
+@app.route("/api/completed-data")
+def api_completed_data():
+    jql=str(request.args.get("jql") or JQL_QUERY).strip() or JQL_QUERY
+    with _completed_loads_lock:
+        data=_completed_loads.get(_completed_cache_key(jql))
+        if not data or data.get("status") != "ready":
+            return jsonify({"status":(data or {}).get("status","not-started")}),202
+        return jsonify(data.get("graph") or {}),200
 
 @app.route("/api/links",methods=["POST"])
 def api_links():
@@ -578,7 +720,8 @@ def api_update_health():
 
 
 @app.route("/api/config")
-def api_config(): return jsonify({"jiraBaseUrl":JIRA_BASE_URL,"port":PORT,"jql":JQL_QUERY})
+def api_config():
+    return jsonify({"jiraBaseUrl":JIRA_BASE_URL,"port":PORT,"jql":JQL_QUERY})
 
 @app.route("/api/link",methods=["POST"])
 def api_link():
@@ -747,7 +890,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .milestone-blocked-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}
 .milestone-blocked-title{font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:800;color:#9a6700}
 .milestone-blocked-count{font-size:10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:999px;padding:2px 6px;color:#9a6700;font-weight:800}
-.milestone-blocked-list{display:flex;flex-direction:column;gap:4px;max-height:calc(100vh - 285px);overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
+.milestone-blocked-list{display:flex;flex-direction:column;gap:4px;max-height:calc(100vh - 335px);overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
 .milestone-blocked-group{display:flex;flex-direction:column;gap:4px}
 .milestone-blocked-group + .milestone-blocked-group{margin-top:7px}
 .milestone-blocked-level{font-size:9px;text-transform:uppercase;letter-spacing:.05em;font-weight:800;color:#94a3b8;padding:2px 1px}
@@ -1032,6 +1175,9 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .no-results{width:min(520px,calc(100% - 40px));margin:70px auto 0;padding:24px;border:1px solid #dbe2ea;border-radius:12px;background:#fff;box-shadow:0 8px 24px rgba(15,23,42,.08);text-align:center;color:#475569}
 .no-results-title{font-size:18px;font-weight:800;color:#172033;margin-bottom:7px}
 .no-results-message{font-size:13px;color:#64748b}
+.completed-download-notice{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:120;background:#fff7ed;border:1px solid #fed7aa;border-radius:9px;box-shadow:0 8px 24px rgba(15,23,42,.12);padding:10px 14px;min-width:min(420px,calc(100vw - 32px));text-align:center}
+.completed-download-title{font-size:12px;font-weight:800;color:#9a6700;margin-bottom:3px}
+.completed-download-message{font-size:11px;color:#7c5a17;line-height:1.4}
 
 
 /* ── Dependency modal ─────────────────────────────────────────────────────── */
@@ -1195,7 +1341,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 /* ── Settings ───────────────────────────────────────────────────────────── */
 #settings-modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.52);backdrop-filter:blur(2px);z-index:10040;align-items:center;justify-content:center;padding:16px}
 #settings-modal.open{display:flex}
-.settings-card{width:min(480px,calc(100vw - 32px));background:#fff;border-radius:14px;box-shadow:0 24px 70px rgba(15,23,42,.28);padding:22px}
+.settings-card{width:min(480px,calc(100vw - 32px));max-height:calc(100vh - 32px);box-sizing:border-box;overflow-y:auto;background:#fff;border-radius:14px;box-shadow:0 24px 70px rgba(15,23,42,.28);padding:22px}
 .settings-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
 .settings-head h2{font-size:18px;line-height:1.2;margin:0;color:#172033}
 .settings-section{border:1px solid #e2e8f0;border-radius:9px;padding:12px;margin-bottom:10px}
@@ -1247,6 +1393,27 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .settings-button.primary{background:#6366f1;border-color:#6366f1;color:#fff;font-weight:800}
 .settings-button.primary:hover{background:#4f46e5;border-color:#4f46e5}
 .settings-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+/* ── Advanced JQL settings ─────────────────────────────────────────────── */
+.settings-advanced-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px}
+.settings-advanced-info{font-size:11px;line-height:1.45;color:#64748b}
+.settings-advanced-link{border:0;background:transparent;color:#475569;font:inherit;font-size:12px;font-weight:750;cursor:pointer;padding:4px 0;text-align:left}
+.settings-advanced-link:hover{color:#6366f1;text-decoration:underline}
+.settings-jql-view{display:none}
+.settings-jql-view.open{display:block}
+.settings-jql-back{border:0;background:transparent;color:#64748b;font:inherit;font-size:12px;font-weight:750;cursor:pointer;padding:0;margin-bottom:14px}
+.settings-jql-back:hover{color:#334155}
+.settings-jql-label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:800;color:#64748b;margin-bottom:6px}
+.settings-jql-default{width:100%;background:#f8fafc;border:1px solid #e2e8f0;border-radius:7px;padding:10px;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;color:#334155;white-space:pre-wrap;overflow-wrap:anywhere;margin-bottom:14px}
+.settings-jql-help{font-size:11px;line-height:1.5;color:#64748b;margin-bottom:8px}
+.settings-jql-help a{color:#0057b8;text-decoration:underline}
+.settings-jql-input{width:100%;min-height:125px;resize:vertical;padding:10px 11px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#172033;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;outline:none}
+.settings-jql-input:focus{border-color:#818cf8;box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+.settings-jql-status{min-height:17px;font-size:11px;line-height:1.4;margin-top:8px;color:#64748b}
+.settings-jql-status.error{color:#b91c1c}
+.settings-jql-status.success{color:#166534}
+.settings-jql-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}
+.custom-jql-indicator{display:none;min-width:36px;height:32px;padding:0 9px;box-sizing:border-box;align-items:center;justify-content:center;color:#172033;background:#f59e0b;border:1px solid #fbbf24;border-radius:7px;box-shadow:0 0 0 2px rgba(245,158,11,.25);text-decoration:none;cursor:pointer}
+.custom-jql-indicator.active{display:inline-flex}
 /* ── Credential setup / management ───────────────────────────────────────── */
 #credential-modal{
   display:none;position:fixed;inset:0;background:rgba(15,23,42,.68);
@@ -1254,7 +1421,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 }
 #credential-modal.open{display:flex}
 .credential-card{
-  width:min(460px,calc(100vw - 32px));background:#fff;border-radius:14px;
+  width:min(460px,calc(100vw - 32px));max-height:calc(100vh - 40px);box-sizing:border-box;overflow-y:auto;background:#fff;border-radius:14px;
   box-shadow:0 24px 80px rgba(15,23,42,.35);padding:25px;
 }
 .credential-card h2{font-size:20px;line-height:1.2;color:#172033;margin-bottom:8px}
@@ -1308,6 +1475,10 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
         Need an API token?
         <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noopener noreferrer">Create one in Atlassian</a>
       </div>
+      <div class="settings-advanced-row settings-advanced-row-inline">
+        <div class="settings-advanced-info">Change the Jira query used to build the dependency map.</div>
+        <button class="settings-advanced-link" id="settings-advanced" type="button">Advanced</button>
+      </div>
     </div>
     <div class="settings-section">
       <div class="settings-section-title">Board settings</div>
@@ -1353,6 +1524,25 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
         <a class="settings-button" id="settings-release-link" href="https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest" target="_blank" rel="noopener">View latest release</a>
       </div>
     </div>
+    </div>
+    <div id="settings-jql-view" class="settings-jql-view">
+      <button class="settings-jql-back" id="settings-jql-back" type="button">← Back to Settings</button>
+      <div class="settings-section">
+        <div class="settings-section-title">Custom JQL</div>
+        <label class="settings-jql-label" for="settings-jql-input">Default JQL</label>
+        <div class="settings-jql-default" id="settings-jql-default"></div>
+        <div class="settings-jql-help">
+          Add your own JQL. Please validate your JQL query here
+          <a href="https://uow-idg.atlassian.net/issues/" target="_blank" rel="noopener noreferrer">https://uow-idg.atlassian.net/issues/</a>
+          before adding.
+        </div>
+        <textarea class="settings-jql-input" id="settings-jql-input" spellcheck="false" placeholder="Enter your JQL query…"></textarea>
+        <div class="settings-jql-status" id="settings-jql-status"></div>
+        <div class="settings-jql-actions">
+          <button class="settings-button" id="settings-jql-reset" type="button">Reset to default</button>
+          <button class="settings-button primary" id="settings-jql-save" type="button">Save JQL</button>
+        </div>
+      </div>
     </div>
     <div id="settings-messages-view" style="display:none">
       <button class="settings-back" id="settings-back" type="button">← Back to Settings</button>
@@ -1403,10 +1593,13 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 <header id="app-header">
   <div class="brand">
     <span class="brand-icon"><img src="https://warwick.ac.uk/services/marketing/teams/cds/opd/1486504840-cog-cogwheel-gear-repr-options-setting_81360.png" alt="" aria-hidden="true"></span>
-    <div>Jira Dependency Map<small>Web Evolution dependencies</small></div>
+    <div>Jira Dependency Map<small id="brand-subtitle">Web Evolution dependencies</small></div>
   </div>
 
   <div class="header-center">
+    <a class="custom-jql-indicator" id="custom-jql-indicator" href="#custom-jql" title="Custom JQL settings" aria-label="Open Custom JQL settings">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"/></svg>
+    </a>
     <button type="button" class="btn" data-action="escape" title="Home">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V21h13V9.5"/><path d="M9.5 21v-6h5v6"/>
@@ -1530,6 +1723,7 @@ const state = {
   redoHistory:[],
   historyApplying:false,
   showCompleted:false,          // toggle: OFF by default (done/completed hidden)
+  completedDownloadStatus:'not-started',
   showMilestones:false,         // toggle: OFF by default; milestone overview
   showMiniMap: localStorage.getItem('jiraDependencyMap.showMiniMap') !== 'false',
   displayIssues:[], displayEdges:[], displayLevels:0,
@@ -1674,6 +1868,17 @@ const settingsCurrentVersion = document.getElementById('settings-current-version
 const settingsLatestVersion = document.getElementById('settings-latest-version');
 const settingsReleaseLink = document.getElementById('settings-release-link');
 const settingsManageCredential = document.getElementById('settings-manage-credential');
+const settingsAdvanced = document.getElementById('settings-advanced');
+const settingsJqlView = document.getElementById('settings-jql-view');
+const settingsJqlBack = document.getElementById('settings-jql-back');
+const settingsJqlDefault = document.getElementById('settings-jql-default');
+const settingsJqlInput = document.getElementById('settings-jql-input');
+const settingsJqlStatus = document.getElementById('settings-jql-status');
+const settingsJqlSave = document.getElementById('settings-jql-save');
+const settingsJqlReset = document.getElementById('settings-jql-reset');
+const customJqlIndicator = document.getElementById('custom-jql-indicator');
+const brandSubtitle = document.getElementById('brand-subtitle');
+
 const settingsUseJiraModal = document.getElementById('settings-use-jira-modal');
 const settingsShowMiniMap = document.getElementById('settings-show-minimap');
 const settingsClose = document.getElementById('settings-close');
@@ -1686,16 +1891,92 @@ const settingsMessagesList = document.getElementById('settings-messages-list');
 const startupMessage = document.getElementById('startup-message');
 
 let loadingTimer = null;
-let loadingStatusNo = 0;
-const loadingStatuses = [
-  'Connecting to Jira…',
-  'Fetching your dependency data…',
-  'Building the dependency map…',
-  'Preparing the board…'
-];
+let loadingProgressTimer = null;
 
+function updateLoadingProgress(data){
+  if(!data) return;
+  const label=document.getElementById('loading-label');
+  const status=document.getElementById('loading-status');
+  if(data.phase) label.textContent=data.phase;
+  if(data.detail) status.textContent=data.detail;
+}
+function startLoadingProgressPolling(){
+  if(loadingProgressTimer) clearInterval(loadingProgressTimer);
+  const poll=async()=>{
+    try{
+      const r=await fetch('/api/loading-status?ts='+Date.now(),{cache:'no-store'});
+      if(r.ok) updateLoadingProgress(await r.json());
+    }catch(e){}
+  };
+  poll();
+  loadingProgressTimer=setInterval(poll,350);
+}
+function stopLoadingProgressPolling(){
+  if(loadingProgressTimer) clearInterval(loadingProgressTimer);
+  loadingProgressTimer=null;
+}
 
 // ── Settings ───────────────────────────────────────────────────────────────
+const CUSTOM_JQL_STORAGE_KEY = 'jiraDependencyMap.customJql';
+let DEFAULT_JQL = "";
+
+function getCustomJql(){
+  try{
+    const value = (localStorage.getItem(CUSTOM_JQL_STORAGE_KEY) || '').trim();
+    return value || '';
+  }catch(e){ return ''; }
+}
+function setCustomJql(value){
+  try{
+    const clean = String(value || '').trim();
+    if(clean) localStorage.setItem(CUSTOM_JQL_STORAGE_KEY, clean);
+    else localStorage.removeItem(CUSTOM_JQL_STORAGE_KEY);
+  }catch(e){}
+  updateCustomJqlIndicator();
+}
+function getActiveJql(){ return getCustomJql() || DEFAULT_JQL; }
+function updateCustomJqlIndicator(){
+  const active = !!getCustomJql();
+  if(customJqlIndicator) customJqlIndicator.classList.toggle('active', active);
+  if(brandSubtitle) brandSubtitle.textContent = active ? 'Custom dependencies' : 'Web Evolution dependencies';
+}
+function setJqlStatus(message, type=''){
+  if(!settingsJqlStatus) return;
+  settingsJqlStatus.textContent = message || '';
+  settingsJqlStatus.className = 'settings-jql-status' + (type ? ' ' + type : '');
+}
+function showSettingsJql(){
+  settingsMainView.style.display = 'none';
+  settingsMessagesView.style.display = 'none';
+  settingsJqlView.classList.add('open');
+  settingsJqlDefault.textContent = DEFAULT_JQL || "Loading default JQL…";
+  settingsJqlInput.value = getCustomJql();
+  setJqlStatus(getCustomJql() ? 'Custom JQL is currently active.' : 'Using the default JQL.');
+  settingsJqlInput.focus();
+}
+function showSettingsMain(){
+  settingsMainView.style.display = '';
+  settingsMessagesView.style.display = 'none';
+  settingsJqlView.classList.remove('open');
+}
+function saveCustomJql(){
+  const value = settingsJqlInput.value.trim();
+  if(!value){
+    setJqlStatus('Enter a JQL query, or use Reset to default.', 'error');
+    return;
+  }
+  setCustomJql(value);
+  setJqlStatus('Custom JQL saved. Refreshing the dependency map…', 'success');
+  closeSettings();
+  load(true);
+}
+function resetCustomJql(){
+  setCustomJql('');
+  settingsJqlInput.value = '';
+  setJqlStatus('Reset to the default JQL. Refreshing the dependency map…', 'success');
+  closeSettings();
+  load(true);
+}
 const JIRA_MODAL_STORAGE_KEY = 'jiraDependencyMap.useJiraModal';
 function getUseJiraModal(){
   try{ return localStorage.getItem(JIRA_MODAL_STORAGE_KEY) === 'true'; }
@@ -1727,10 +2008,6 @@ function setMiniMapSetting(enabled){
   try{ localStorage.setItem('jiraDependencyMap.showMiniMap', state.showMiniMap ? 'true' : 'false'); }catch(e){}
   updateMiniMapSetting();
   scheduleMiniMapUpdate();
-}
-function showSettingsMain(){
-  settingsMainView.style.display = '';
-  settingsMessagesView.style.display = 'none';
 }
 function renderStartupMessages(items){
   settingsMessagesList.innerHTML = '';
@@ -1788,9 +2065,10 @@ async function showAllStartupMessages(){
   }
 }
 function closeSettings(){ settingsModal.classList.remove('open'); showSettingsMain(); }
-async function openSettings(){
+async function openSettings(openJql = false){
   updateJiraModalSetting();
   updateMiniMapSetting();
+  updateCustomJqlIndicator();
   settingsModal.classList.add('open');
   settingsEmail.textContent = 'Checking…';
   settingsCurrentVersion.textContent = 'Checking…';
@@ -1800,6 +2078,12 @@ async function openSettings(){
     const data = await r.json().catch(()=>({}));
     settingsEmail.textContent = data.configured ? (data.email || 'Configured') : 'Not configured';
   }catch(e){ settingsEmail.textContent = 'Unable to check'; }
+  try{
+    const r = await fetch('/api/config',{cache:'no-store'});
+    const data = await r.json().catch(()=>({}));
+    if(r.ok && data.jql) DEFAULT_JQL = data.jql;
+    if(openJql) showSettingsJql();
+  }catch(e){ if(openJql) showSettingsJql(); }
   try{
     const r = await fetch('/api/app-version?ts=' + Date.now(),{cache:'no-store'});
     const data = await r.json().catch(()=>({}));
@@ -1893,6 +2177,8 @@ async function removeCredential(){
     credentialStatus.textContent = '';
   }
 }
+updateCustomJqlIndicator();
+
 async function initialiseApp(){
   try{
     const r = await fetch('/api/credential-status',{cache:'no-store'});
@@ -1906,6 +2192,13 @@ async function initialiseApp(){
       openCredentialModal(false);
       return;
     }
+    const configResponse = await fetch('/api/config?ts=' + Date.now(),{cache:'no-store'});
+    const config = await configResponse.json().catch(()=>({}));
+    if(!configResponse.ok || !config.jql){
+      throw new Error(config.error || 'Unable to load the default Jira JQL.');
+    }
+    DEFAULT_JQL = String(config.jql).trim();
+    updateCustomJqlIndicator();
     load(true);
   }catch(e){
     openCredentialModal(false);
@@ -1923,58 +2216,33 @@ function setLoading(on, msg){
   loading.classList.toggle('show', on);
   dependencyStatus.classList.toggle('loading-hidden', on);
   if(on){
-    if(loadingTimer) clearInterval(loadingTimer);
-    loadingStatusNo = 0;
-    document.getElementById('loading-label').textContent = msg || loadingStatuses[0];
-    document.getElementById('loading-status').textContent = 'Working on it…';
-
-    // Fetch the Sitebuilder message independently of the loading animation,
-    // but keep the overlay open until the message request has completed so a
-    // fast Jira response cannot make the startup message disappear.
+    document.getElementById('loading-label').textContent = msg || 'Connecting to Jira…';
+    document.getElementById('loading-status').textContent = 'Connecting to Jira…';
+    startLoadingProgressPolling();
     startupMessage.style.display = 'none';
     startupMessage.innerHTML = '';
-    console.log('[Startup Messages] Starting fresh startup-message fetch');
     startupMessagePromise = fetchStartupMessages()
       .then(items => {
-        console.log('[Startup Messages] Loader received', items.length, 'message(s)');
-        if(!items.length){
-          console.warn('[Startup Messages] No usable messages returned; hiding message box');
-          startupMessage.style.display = 'none';
-          return items;
-        }
-        const item = items[Math.floor(Math.random() * items.length)];
-        startupMessage.innerHTML = '<div class="startup-message-title">' + esc(item.title || '') + '</div>' +
-          '<div class="startup-message-body">' + (item.parsedContentBody || '') + '</div>';
-        startupMessage.style.display = 'block';
-        console.log('[Startup Messages] Displaying startup message:', item.title || '(untitled)');
+        if(!items.length){ startupMessage.style.display='none'; return items; }
+        const item=items[Math.floor(Math.random()*items.length)];
+        startupMessage.innerHTML='<div class="startup-message-title">'+esc(item.title || '')+'</div><div class="startup-message-body">'+(item.parsedContentBody || '')+'</div>';
+        startupMessage.style.display='block';
         return items;
       })
       .catch(e => {
-        console.error('[Startup Messages] Startup message fetch failed; hiding message box:', e);
-        startupMessage.style.display = 'none';
-        startupMessage.innerHTML = '';
-        return [];
+        console.error('[Startup Messages] Startup message fetch failed:',e);
+        startupMessage.style.display='none'; startupMessage.innerHTML=''; return [];
       });
   }else{
-    if(loadingTimer) clearInterval(loadingTimer);
-    loadingTimer = null;
-    loadingStatusNo = 0;
-    document.getElementById('loading-status').textContent = '';
-    startupMessagePromise = null;
+    stopLoadingProgressPolling();
+    startupMessagePromise=null;
   }
 }
 function startLoadingStages(msg){
-  setLoading(true, msg || loadingStatuses[0]);
-  loadingTimer = setInterval(() => {
-    loadingStatusNo = (loadingStatusNo + 1) % loadingStatuses.length;
-    document.getElementById('loading-label').textContent = loadingStatuses[loadingStatusNo];
-  }, 900);
+  setLoading(true, msg || 'Connecting to Jira…');
 }
 function finishLoadingStages(){
-  if(loadingTimer) clearInterval(loadingTimer);
-  loadingTimer = null;
-  document.getElementById('loading-label').textContent = 'Ready';
-  document.getElementById('loading-status').textContent = 'Your dependency map is ready';
+  updateLoadingProgress({phase:'Ready',detail:'Your dependency map is ready'});
 }
 function normaliseSearch(value){
   return String(value || '')
@@ -3057,6 +3325,7 @@ function render(){
 
   document.querySelectorAll('.priority-picker.open').forEach(closePriorityPicker);
   [...board.querySelectorAll('.column, .milestone-overview, .no-active-user, .no-results')].forEach(x => x.remove());
+  if(state.completedDownloadStatus === 'ready' || !state.showCompleted) hideCompletedDownloadNotice();
   board.classList.toggle('milestone-board', state.showMilestones);
   document.getElementById('app').classList.toggle('milestone-mode', state.showMilestones);
   lines.innerHTML = '';
@@ -4078,31 +4347,77 @@ function attachEvents(){
 }
 
 // ── Load data ─────────────────────────────────────────────────────────────
+async function fetchGraph(mode){
+  const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()), {cache:'no-store'});
+  const d = await r.json();
+  if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+  return d;
+}
+
+let completedDownloadPollTimer = null;
+async function pollCompletedDownload(){
+  if(completedDownloadPollTimer) clearInterval(completedDownloadPollTimer);
+  const poll=async()=>{
+    try{
+      const r=await fetch('/api/completed-status?jql=' + encodeURIComponent(getActiveJql()) + '&ts=' + Date.now(),{cache:'no-store'});
+      if(!r.ok) return;
+      const d=await r.json();
+      state.completedDownloadStatus=d.status || 'not-started';
+      if(state.showCompleted && state.completedDownloadStatus !== 'ready') {
+        showCompletedDownloadNotice(d.detail || 'Still downloading completed tickets…');
+      }
+      if(d.status === 'ready'){
+        const dataResponse=await fetch('/api/completed-data?jql=' + encodeURIComponent(getActiveJql()) + '&ts=' + Date.now(),{cache:'no-store'});
+        if(!dataResponse.ok) return;
+        const data=await dataResponse.json();
+        state.issues=data.issues || [];
+        state.edges=data.edges || [];
+        state.levels=data.levels || 0;
+        state.cleanSnapshot=cloneCleanSnapshot();
+        state.completedDownloadStatus='ready';
+        render();
+        if(completedDownloadPollTimer) clearInterval(completedDownloadPollTimer);
+        completedDownloadPollTimer=null;
+      }else if(d.status === 'error'){
+        if(state.showCompleted) showCompletedDownloadNotice(d.error || 'Completed tickets could not be downloaded.');
+        if(completedDownloadPollTimer) clearInterval(completedDownloadPollTimer);
+        completedDownloadPollTimer=null;
+      }
+    }catch(e){}
+  };
+  await poll();
+  if(state.completedDownloadStatus !== 'ready' && state.completedDownloadStatus !== 'error') completedDownloadPollTimer=setInterval(poll,700);
+}
+function showCompletedDownloadNotice(message){
+  const existing=board.querySelector('.completed-download-notice');
+  if(existing){ existing.querySelector('.completed-download-message').textContent=message; return; }
+  const notice=document.createElement('div');
+  notice.className='completed-download-notice';
+  notice.innerHTML='<div class="completed-download-title">Still downloading completed tickets</div><div class="completed-download-message">'+esc(message || 'Please wait while completed tickets are downloaded.')+'</div>';
+  board.appendChild(notice);
+}
+function hideCompletedDownloadNotice(){
+  board.querySelector('.completed-download-notice')?.remove();
+}
+
 async function load(resetSelection){
-  startLoadingStages('Connecting to Jira\u2026'); hideError();
+  startLoadingStages('Connecting to Jira…'); hideError();
   try{
-    const r = await fetch('/api/dependencies', {cache:'no-store'});
-    const d = await r.json();
-    if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
-    state.issues = d.issues || []; state.edges = d.edges || []; state.levels = d.levels || 0;
-    state.cleanSnapshot = cloneCleanSnapshot();
-    // A load is a clean Jira reload. Never re-apply unsaved local changes.
-    state.pendingChanges = [];
-    state.history = [];
-    state.redoHistory = [];
+    const wantCompleted=!!state.showCompleted;
+    const d=await fetchGraph(wantCompleted ? 'all' : 'active');
+    state.issues=d.issues || []; state.edges=d.edges || []; state.levels=d.levels || 0;
+    state.completedDownloadStatus=wantCompleted ? 'ready' : 'downloading';
+    state.cleanSnapshot=cloneCleanSnapshot();
+    state.pendingChanges=[]; state.history=[]; state.redoHistory=[];
     if(resetSelection){
-      state.lockedKey = null;
-      state.selectionHistory = [];
-      state.showBlocked = false;
+      state.lockedKey=null; state.selectionHistory=[]; state.showBlocked=false;
     }
     render(); updateSaveButton();
-    // Do not finish the loading screen until the fresh Sitebuilder startup
-    // message request has completed. This prevents a fast Jira response from
-    // hiding the message before it has had a chance to render.
     if(startupMessagePromise) await startupMessagePromise;
     finishLoadingStages();
-    await new Promise(resolve => setTimeout(resolve, 180));
-  }catch(e){ showError(e.message || String(e)); statusText.textContent = 'Load failed'; }
+    if(!wantCompleted) pollCompletedDownload();
+    await new Promise(resolve => setTimeout(resolve,180));
+  }catch(e){ showError(e.message || String(e)); statusText.textContent='Load failed'; }
   finally{ setLoading(false); }
 }
 
@@ -4136,6 +4451,13 @@ filterMenu.addEventListener('click', e => e.stopPropagation());
 toggleCompletedBtn.addEventListener('click', () => {
   state.showCompleted = !state.showCompleted;
   saveFilterPreferences();
+  if(state.showCompleted && state.completedDownloadStatus !== 'ready'){
+    showCompletedDownloadNotice('Completed tickets are still downloading. The active tickets remain available while this finishes.');
+    render();
+    pollCompletedDownload();
+    return;
+  }
+  hideCompletedDownloadNotice();
   render();
 });
 filterUser.addEventListener('change', () => {
@@ -4228,7 +4550,20 @@ document.addEventListener('keydown', e => {
 credentialSave.addEventListener('click', saveCredential);
 credentialRemove.addEventListener('click', removeCredential);
 credentialCancel.addEventListener('click', closeCredentialModal);
-settingsBtn.addEventListener('click', openSettings);
+settingsBtn.addEventListener('click', () => openSettings());
+customJqlIndicator?.addEventListener('click', e => {
+  e.preventDefault();
+  if(!getCustomJql()) return;
+  openSettings(true);
+});
+customJqlIndicator?.addEventListener('keydown', e => {
+  if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); if(getCustomJql()) openSettings(true); }
+});
+settingsAdvanced?.addEventListener('click', showSettingsJql);
+settingsJqlBack?.addEventListener('click', showSettingsMain);
+settingsJqlSave?.addEventListener('click', saveCustomJql);
+settingsJqlReset?.addEventListener('click', resetCustomJql);
+
 document.getElementById('discard').addEventListener('click', discardChanges);
 settingsUseJiraModal.addEventListener('click', () => {
   setUseJiraModal(!getUseJiraModal());
