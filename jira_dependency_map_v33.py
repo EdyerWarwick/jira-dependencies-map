@@ -2591,33 +2591,25 @@ function revealSelectedCard(key){
 
 function computeDisplayData(){
   const DONE = new Set(['done','completed']);
-  // Dependency chains ignore search, user and With Remarkable filters, but
-  // still honour the Show completed toggle. Milestones follow the same rule.
-  // The completed toggle applies to every view, including dependency chains.
-  // Chain view may ignore search/user/remarkable filters, but it must still
-  // start from the same completed/active ticket set selected by the toggle.
-  let issues = state.showCompleted
+  // Dependency structure must be calculated from the full active/completed
+  // ticket set before the With Remarkable display filter is applied. A hidden
+  // With Remarkable ticket is still a real blocker, so hiding it must never
+  // promote the ticket it blocks into an earlier level.
+  // Dependency chains still ignore search, user and With Remarkable filters,
+  // but continue to honour the Show completed toggle.
+  const structuralIssues = state.showCompleted
     ? state.issues
     : state.issues.filter(i => !DONE.has((i.status || '').toLowerCase().trim()));
 
-  if(!state.lockedKey && !state.showMilestones){
-    // User filtering is applied after dependency levels are calculated, like
-    // the text search, so matching tickets retain their original level.
-    if(!state.includeWithRemarkable){
-      issues = issues.filter(i => (i.status || '').trim() !== 'With Remarkable');
-    }
-  }
+  const structuralKeys = new Set(structuralIssues.map(i => i.key));
+  const structuralEdges = state.edges.filter(e => structuralKeys.has(e.from) && structuralKeys.has(e.to));
 
-  const issueKeys = new Set(issues.map(i => i.key));
-
-  // Keep only edges where both endpoints are visible
-  const edges = state.edges.filter(e => issueKeys.has(e.from) && issueKeys.has(e.to));
-
-  // Recalculate levels for this visible subset (BFS / relaxation)
-  const level = new Map(issues.map(i => [i.key, (i.externalBlockers && i.externalBlockers.length) ? 1 : 0]));
-  for(let pass = 0; pass < issues.length; pass++){
+  // Calculate levels from the structural graph, before any display-only
+  // filtering. This preserves dependency depth when With Remarkable is hidden.
+  const level = new Map(structuralIssues.map(i => [i.key, (i.externalBlockers && i.externalBlockers.length) ? 1 : 0]));
+  for(let pass = 0; pass < structuralIssues.length; pass++){
     let changed = false;
-    for(const e of edges){
+    for(const e of structuralEdges){
       if(!level.has(e.from) || !level.has(e.to)) continue;
       const v = level.get(e.from) + 1;
       if(v > level.get(e.to)){ level.set(e.to, v); changed = true; }
@@ -2625,7 +2617,17 @@ function computeDisplayData(){
     if(!changed) break;
   }
 
-  // Build display copies with recalculated level
+  let issues = structuralIssues;
+  if(!state.lockedKey && !state.showMilestones && !state.includeWithRemarkable){
+    issues = issues.filter(i => (i.status || '').trim() !== 'With Remarkable');
+  }
+
+  const issueKeys = new Set(issues.map(i => i.key));
+  // Only draw relationships whose endpoints are actually displayed.
+  const edges = structuralEdges.filter(e => issueKeys.has(e.from) && issueKeys.has(e.to));
+
+  // Keep the structural level on each displayed card even when its blocker is
+  // hidden by the With Remarkable filter.
   state.displayIssues = issues.map(i => ({...i, level: level.get(i.key) ?? 0}));
   state.displayEdges  = edges;
   state.displayLevels = state.displayIssues.length ? Math.max(...state.displayIssues.map(i => i.level)) : 0;
@@ -4228,6 +4230,14 @@ document.querySelectorAll('[data-action="escape"]').forEach(btn => {
     });
 
     if(state.showMilestones || state.showBlocked || state.lockedKey){
+      // Home returns to the normal board view, but it must not change filters.
+      // If a card was selected, restore the filters that were active before the
+      // selection temporarily hid them for the dependency-chain view.
+      const homeFilterSnapshot = state.selectionHistory.length
+        ? state.selectionHistory[0].filters
+        : null;
+      if(homeFilterSnapshot) restoreFilterSnapshot(homeFilterSnapshot);
+
       // Home from any alternate view must return to the normal default board,
       // not simply reset the horizontal scroll position of the current view.
       state.showMilestones = false;
