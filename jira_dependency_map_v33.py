@@ -367,36 +367,38 @@ def _active_jql(jql):
     base=str(jql or JQL_QUERY).strip() or JQL_QUERY
     return f"({base}) AND statusCategory != Done"
 
-def _completed_cache_key(jql):
-    return str(jql or JQL_QUERY).strip() or JQL_QUERY
+def _completed_cache_key(jql, generation=None):
+    base=str(jql or JQL_QUERY).strip() or JQL_QUERY
+    generation=str(generation or "").strip()
+    return f"{base}\n__load_generation__={generation}" if generation else base
 
-def _background_completed_load(jql, active_raw):
-    key=_completed_cache_key(jql)
+def _background_completed_load(jql, active_raw, generation=None):
+    key=_completed_cache_key(jql,generation)
     try:
         with _completed_loads_lock:
             _completed_loads[key]={"status":"downloading","fetched":0,"detail":"Starting completed ticket download…","graph":None,"error":None}
-        print(f"  Background completed load started for JQL: {key}")
-        completed=jira_fetch_completed_issues(key)
+        print(f"  Background completed load started for JQL generation {generation}: {jql}")
+        completed=jira_fetch_completed_issues(jql)
         raw=[]
         _merge_issues(raw,active_raw)
         _merge_issues(raw,completed)
-        graph=serialize_graph(raw,key)
+        graph=serialize_graph(raw,jql)
         with _completed_loads_lock:
             _completed_loads[key]={"status":"ready","fetched":len(raw),"detail":f"{len(raw):,} total tickets downloaded","graph":graph,"error":None}
-        print(f"  Background completed load complete: {len(raw):,} total tickets")
+        print(f"  Background completed load complete for generation {generation}: {len(raw):,} total tickets")
     except Exception as e:
         with _completed_loads_lock:
             _completed_loads[key]={"status":"error","fetched":0,"detail":"Completed ticket download failed","graph":None,"error":str(e)}
-        print(f"  Background completed load failed: {e}")
+        print(f"  Background completed load failed for generation {generation}: {e}")
 
-def _start_background_full_load(jql, active_raw):
-    key=_completed_cache_key(jql)
+def _start_background_full_load(jql, active_raw, generation=None):
+    key=_completed_cache_key(jql,generation)
     with _completed_loads_lock:
         existing=_completed_loads.get(key)
         if existing and existing.get("status") in {"downloading","ready"}:
             return
         _completed_loads[key]={"status":"queued","fetched":0,"detail":"Queued completed ticket download…","graph":None,"error":None}
-    threading.Thread(target=_background_completed_load,args=(key,active_raw),daemon=True,name="jira-completed-loader").start()
+    threading.Thread(target=_background_completed_load,args=(jql,active_raw,generation),daemon=True,name="jira-completed-loader").start()
 
 def _extract_epic(fields):
     """Return {key, summary, url} for the parent epic, or None."""
@@ -534,11 +536,13 @@ def api_dependencies():
             jql=None
         active_jql=str(jql or JQL_QUERY).strip() or JQL_QUERY
         mode=(request.args.get("mode") or "all").strip().lower()
+        generation=str(request.args.get("generation") or "").strip()
         if mode == "active":
             raw=jira_fetch_active_issues(active_jql)
-            # Start the slower complete download only after the active result has
-            # been obtained, so the first response is not competing with it.
-            _start_background_full_load(active_jql, raw)
+            # Associate the slower completed-ticket load with the exact browser
+            # refresh that requested it. An older refresh must never publish its
+            # snapshot into a newer refresh.
+            _start_background_full_load(active_jql, raw, generation)
             return jsonify(serialize_graph(raw,active_jql))
         return jsonify(serialize_graph(jira_fetch_all_issues(active_jql), active_jql))
     except RuntimeError as e: return jsonify({"error":str(e)}),502
@@ -547,16 +551,18 @@ def api_dependencies():
 @app.route("/api/completed-status")
 def api_completed_status():
     jql=str(request.args.get("jql") or JQL_QUERY).strip() or JQL_QUERY
+    generation=str(request.args.get("generation") or "").strip()
     with _completed_loads_lock:
-        data=dict(_completed_loads.get(_completed_cache_key(jql) or "", {"status":"not-started","fetched":0,"detail":"Completed tickets have not started downloading.","graph":None,"error":None}))
+        data=dict(_completed_loads.get(_completed_cache_key(jql,generation) or "", {"status":"not-started","fetched":0,"detail":"Completed tickets have not started downloading.","graph":None,"error":None}))
     data.pop("graph",None)
     return jsonify(data)
 
 @app.route("/api/completed-data")
 def api_completed_data():
     jql=str(request.args.get("jql") or JQL_QUERY).strip() or JQL_QUERY
+    generation=str(request.args.get("generation") or "").strip()
     with _completed_loads_lock:
-        data=_completed_loads.get(_completed_cache_key(jql))
+        data=_completed_loads.get(_completed_cache_key(jql,generation))
         if not data or data.get("status") != "ready":
             return jsonify({"status":(data or {}).get("status","not-started")}),202
         return jsonify(data.get("graph") or {}),200
@@ -1724,6 +1730,8 @@ const state = {
   historyApplying:false,
   showCompleted:false,          // toggle: OFF by default (done/completed hidden)
   completedDownloadStatus:'not-started',
+  // Incremented for every Jira load. Older responses/background jobs are ignored.
+  loadGeneration:0,
   showMilestones:false,         // toggle: OFF by default; milestone overview
   showMiniMap: localStorage.getItem('jiraDependencyMap.showMiniMap') !== 'false',
   displayIssues:[], displayEdges:[], displayLevels:0,
@@ -4347,29 +4355,42 @@ function attachEvents(){
 }
 
 // ── Load data ─────────────────────────────────────────────────────────────
-async function fetchGraph(mode){
-  const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()), {cache:'no-store'});
+async function fetchGraph(mode, loadGeneration){
+  const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(String(loadGeneration || '')), {cache:'no-store'});
   const d = await r.json();
   if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
   return d;
 }
 
 let completedDownloadPollTimer = null;
-async function pollCompletedDownload(){
+async function pollCompletedDownload(loadGeneration){
   if(completedDownloadPollTimer) clearInterval(completedDownloadPollTimer);
+  const generation=String(loadGeneration || '');
   const poll=async()=>{
+    // A newer Jira load owns the UI now. Do not let this poll touch its state.
+    if(loadGeneration !== state.loadGeneration){
+      if(completedDownloadPollTimer) clearInterval(completedDownloadPollTimer);
+      completedDownloadPollTimer=null;
+      return;
+    }
     try{
-      const r=await fetch('/api/completed-status?jql=' + encodeURIComponent(getActiveJql()) + '&ts=' + Date.now(),{cache:'no-store'});
+      const r=await fetch('/api/completed-status?jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(generation) + '&ts=' + Date.now(),{cache:'no-store'});
       if(!r.ok) return;
       const d=await r.json();
+      if(loadGeneration !== state.loadGeneration) return;
       state.completedDownloadStatus=d.status || 'not-started';
       if(state.showCompleted && state.completedDownloadStatus !== 'ready') {
         showCompletedDownloadNotice(d.detail || 'Still downloading completed tickets…');
       }
       if(d.status === 'ready'){
-        const dataResponse=await fetch('/api/completed-data?jql=' + encodeURIComponent(getActiveJql()) + '&ts=' + Date.now(),{cache:'no-store'});
+        // Check again after the async status request. A refresh may have started
+        // while this request was in flight.
+        if(loadGeneration !== state.loadGeneration) return;
+        const dataResponse=await fetch('/api/completed-data?jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(generation) + '&ts=' + Date.now(),{cache:'no-store'});
         if(!dataResponse.ok) return;
         const data=await dataResponse.json();
+        // Never apply a completed graph belonging to an older refresh.
+        if(loadGeneration !== state.loadGeneration) return;
         state.issues=data.issues || [];
         state.edges=data.edges || [];
         state.levels=data.levels || 0;
@@ -4401,10 +4422,14 @@ function hideCompletedDownloadNotice(){
 }
 
 async function load(resetSelection){
+  const loadGeneration=++state.loadGeneration;
   startLoadingStages('Connecting to Jira…'); hideError();
   try{
     const wantCompleted=!!state.showCompleted;
-    const d=await fetchGraph(wantCompleted ? 'all' : 'active');
+    const d=await fetchGraph(wantCompleted ? 'all' : 'active', loadGeneration);
+    // A newer refresh may have started while Jira was loading. Its response
+    // is authoritative, so discard this older response completely.
+    if(loadGeneration !== state.loadGeneration) return;
     state.issues=d.issues || []; state.edges=d.edges || []; state.levels=d.levels || 0;
     state.completedDownloadStatus=wantCompleted ? 'ready' : 'downloading';
     state.cleanSnapshot=cloneCleanSnapshot();
@@ -4415,10 +4440,16 @@ async function load(resetSelection){
     render(); updateSaveButton();
     if(startupMessagePromise) await startupMessagePromise;
     finishLoadingStages();
-    if(!wantCompleted) pollCompletedDownload();
+    if(!wantCompleted) pollCompletedDownload(loadGeneration);
     await new Promise(resolve => setTimeout(resolve,180));
-  }catch(e){ showError(e.message || String(e)); statusText.textContent='Load failed'; }
-  finally{ setLoading(false); }
+  }catch(e){
+    if(loadGeneration === state.loadGeneration){
+      showError(e.message || String(e));
+      statusText.textContent='Load failed';
+    }
+  }finally{
+    if(loadGeneration === state.loadGeneration) setLoading(false);
+  }
 }
 
 // ── Global event wiring ───────────────────────────────────────────────────
