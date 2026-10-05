@@ -40,6 +40,59 @@ CREDENTIAL_TARGET="Jira Dependency Map"
 CRED_TYPE_GENERIC=1
 CRED_PERSIST_LOCAL_MACHINE=2
 
+# Per-user application preferences are stored outside the browser profile.
+# This survives browser cache/site-data cleanup and is scoped to the current
+# Windows user. The file contains only non-sensitive UI/application settings.
+PREFERENCES_DIR=os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),"JiraDependencyMap")
+PREFERENCES_FILE=os.path.join(PREFERENCES_DIR,"preferences.txt")
+DEFAULT_PREFERENCES={
+    "showCompleted":False,"filterUser":"","includeWithRemarkable":True,
+    "customJql":"","useJiraModal":False,"showMiniMap":True,
+}
+_preferences_lock=threading.Lock()
+
+def _normalise_preferences(data):
+    out=dict(DEFAULT_PREFERENCES)
+    if isinstance(data,dict):
+        out.update({k:data[k] for k in DEFAULT_PREFERENCES if k in data})
+    out["showCompleted"]=out["showCompleted"] is True
+    out["filterUser"]=str(out["filterUser"] or "")
+    out["includeWithRemarkable"]=out["includeWithRemarkable"] is not False
+    out["customJql"]=str(out["customJql"] or "").strip()
+    out["useJiraModal"]=out["useJiraModal"] is True
+    out["showMiniMap"]=out["showMiniMap"] is not False
+    return out
+
+def _read_preferences():
+    with _preferences_lock:
+        try:
+            with open(PREFERENCES_FILE,"r",encoding="utf-8") as fh:
+                return _normalise_preferences(json.load(fh))
+        except FileNotFoundError:
+            return dict(DEFAULT_PREFERENCES)
+        except Exception as e:
+            print(f"  Preferences: could not read {PREFERENCES_FILE}: {e}")
+            return dict(DEFAULT_PREFERENCES)
+
+def _write_preferences(updates):
+    if not isinstance(updates,dict):
+        raise ValueError("Preferences must be an object.")
+    with _preferences_lock:
+        try:
+            with open(PREFERENCES_FILE,"r",encoding="utf-8") as fh:
+                data=_normalise_preferences(json.load(fh))
+        except Exception:
+            data=dict(DEFAULT_PREFERENCES)
+        data.update({k:updates[k] for k in DEFAULT_PREFERENCES if k in updates})
+        data=_normalise_preferences(data)
+        os.makedirs(PREFERENCES_DIR,exist_ok=True)
+        temp_file=PREFERENCES_FILE+".tmp"
+        with open(temp_file,"w",encoding="utf-8") as fh:
+            json.dump(data,fh,indent=2,ensure_ascii=False)
+            fh.write("\n")
+        os.replace(temp_file,PREFERENCES_FILE)
+        return data
+
 def resource_path(relative_path):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative_path)
@@ -724,6 +777,21 @@ def api_credentials_remove():
 def api_update_health():
     return jsonify({"ok":True,"version":APP_VERSION,"pid":os.getpid()})
 
+
+@app.route("/api/preferences",methods=["GET"])
+def api_preferences():
+    try:
+        return jsonify(_read_preferences())
+    except Exception as e:
+        return jsonify({"error":f"Could not read preferences: {e}"}),500
+
+@app.route("/api/preferences",methods=["POST"])
+def api_preferences_save():
+    try:
+        body=request.get_json(force=True) or {}
+        return jsonify(_write_preferences(body))
+    except Exception as e:
+        return jsonify({"error":f"Could not save preferences: {e}"}),500
 
 @app.route("/api/config")
 def api_config():
@@ -1733,7 +1801,7 @@ const state = {
   // Incremented for every Jira load. Older responses/background jobs are ignored.
   loadGeneration:0,
   showMilestones:false,         // toggle: OFF by default; milestone overview
-  showMiniMap: localStorage.getItem('jiraDependencyMap.showMiniMap') !== 'false',
+  showMiniMap:true, customJql:'', useJiraModal:false,
   displayIssues:[], displayEdges:[], displayLevels:0,
   hoverKey:null, hoverLockKey:null,
   returnMilestoneKey:null,
@@ -1746,28 +1814,52 @@ const state = {
 };
 
 // ── Filter preferences ────────────────────────────────────────────────────
-const FILTER_STORAGE_KEY = 'jiraDependencyMap.filters';
-function loadFilterPreferences(){
+let preferencesReady=false;
+
+async function loadPreferences(){
+  // Preferences are optional. Never let a preferences-file/API problem stop
+  // the main application from starting.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2000);
   try{
-    const saved = JSON.parse(localStorage.getItem(FILTER_STORAGE_KEY) || '{}');
-    state.showCompleted = saved.showCompleted === true;
-    state.filterUser = typeof saved.filterUser === 'string' ? saved.filterUser : '';
-    state.includeWithRemarkable = saved.includeWithRemarkable !== false;
+    const r=await fetch('/api/preferences?ts='+Date.now(),{cache:'no-store',signal:controller.signal});
+    const saved=await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(saved.error || 'Unable to load preferences.');
+    state.showCompleted=saved.showCompleted===true;
+    state.filterUser=typeof saved.filterUser==='string' ? saved.filterUser : '';
+    state.includeWithRemarkable=saved.includeWithRemarkable!==false;
+    state.customJql=typeof saved.customJql==='string' ? saved.customJql.trim() : '';
+    state.useJiraModal=saved.useJiraModal===true;
+    state.showMiniMap=saved.showMiniMap!==false;
   }catch(e){
-    state.showCompleted = false; state.filterUser = ''; state.includeWithRemarkable = true;
+    console.warn('Could not load persistent preferences; using defaults.',e);
+  }finally{
+    clearTimeout(timeout);
+    preferencesReady=true;
   }
 }
-function saveFilterPreferences(){
+
+async function savePreferences(updates){
+  Object.assign(state,updates||{});
+  if(!preferencesReady) return;
   try{
-    localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify({
-      showCompleted: !!state.showCompleted,
-      filterUser: state.filterUser || '',
-      includeWithRemarkable: state.includeWithRemarkable !== false
-    }));
-  }catch(e){}
+    await fetch('/api/preferences',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        showCompleted:!!state.showCompleted, filterUser:state.filterUser||'',
+        includeWithRemarkable:state.includeWithRemarkable!==false,
+        customJql:state.customJql||'', useJiraModal:!!state.useJiraModal,
+        showMiniMap:state.showMiniMap!==false
+      }),cache:'no-store'
+    });
+  }catch(e){ console.warn('Could not save persistent preferences.',e); }
+}
+function saveFilterPreferences(){
+  savePreferences({showCompleted:!!state.showCompleted,filterUser:state.filterUser||'',
+    includeWithRemarkable:state.includeWithRemarkable!==false});
 }
 function filterSnapshot(){
-  return {searchTerm: state.searchTerm || '', showCompleted: !!state.showCompleted, filterUser: state.filterUser || '', includeWithRemarkable: state.includeWithRemarkable !== false};
+  return {searchTerm:state.searchTerm||'',showCompleted:!!state.showCompleted,filterUser:state.filterUser||'',includeWithRemarkable:state.includeWithRemarkable!==false};
 }
 function restoreFilterSnapshot(snap){
   const s = snap || {};
@@ -1835,7 +1927,6 @@ function populateFilterUsers(){
   filterUser.value = current;
   if(filterUser.value !== current) filterUser.value = '';
 }
-loadFilterPreferences();
 
 // ── DOM refs ─────────────────────────────────────────────────────────────
 const board              = document.getElementById('board');
@@ -1925,21 +2016,12 @@ function stopLoadingProgressPolling(){
 }
 
 // ── Settings ───────────────────────────────────────────────────────────────
-const CUSTOM_JQL_STORAGE_KEY = 'jiraDependencyMap.customJql';
 let DEFAULT_JQL = "";
 
-function getCustomJql(){
-  try{
-    const value = (localStorage.getItem(CUSTOM_JQL_STORAGE_KEY) || '').trim();
-    return value || '';
-  }catch(e){ return ''; }
-}
+function getCustomJql(){ return String(state.customJql || '').trim(); }
 function setCustomJql(value){
-  try{
-    const clean = String(value || '').trim();
-    if(clean) localStorage.setItem(CUSTOM_JQL_STORAGE_KEY, clean);
-    else localStorage.removeItem(CUSTOM_JQL_STORAGE_KEY);
-  }catch(e){}
+  state.customJql=String(value || '').trim();
+  savePreferences({customJql:state.customJql});
   updateCustomJqlIndicator();
 }
 function getActiveJql(){ return getCustomJql() || DEFAULT_JQL; }
@@ -1985,15 +2067,12 @@ function resetCustomJql(){
   closeSettings();
   load(true);
 }
-const JIRA_MODAL_STORAGE_KEY = 'jiraDependencyMap.useJiraModal';
-function getUseJiraModal(){
-  try{ return localStorage.getItem(JIRA_MODAL_STORAGE_KEY) === 'true'; }
-  catch(e){ return false; }
-}
+function getUseJiraModal(){ return state.useJiraModal === true; }
 function setUseJiraModal(enabled){
-  try{ localStorage.setItem(JIRA_MODAL_STORAGE_KEY, enabled ? 'true' : 'false'); }catch(e){}
+  state.useJiraModal=!!enabled;
+  savePreferences({useJiraModal:state.useJiraModal});
   updateJiraModalSetting();
-updateMiniMapSetting();
+  updateMiniMapSetting();
 }
 function updateJiraModalSetting(){
   if(!settingsUseJiraModal) return;
@@ -2013,7 +2092,7 @@ function updateMiniMapSetting(){
 }
 function setMiniMapSetting(enabled){
   state.showMiniMap = !!enabled;
-  try{ localStorage.setItem('jiraDependencyMap.showMiniMap', state.showMiniMap ? 'true' : 'false'); }catch(e){}
+  savePreferences({showMiniMap:state.showMiniMap});
   updateMiniMapSetting();
   scheduleMiniMapUpdate();
 }
@@ -2206,7 +2285,16 @@ async function initialiseApp(){
       throw new Error(config.error || 'Unable to load the default Jira JQL.');
     }
     DEFAULT_JQL = String(config.jql).trim();
+
+    // Load optional per-user preferences after the server and Jira
+    // configuration are confirmed. A preferences problem must never prevent
+    // the normal application startup.
+    await loadPreferences();
+    updateJiraModalSetting();
+    updateMiniMapSetting();
     updateCustomJqlIndicator();
+    updateFilterControls();
+
     load(true);
   }catch(e){
     openCredentialModal(false);
