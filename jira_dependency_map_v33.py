@@ -46,8 +46,8 @@ CRED_PERSIST_LOCAL_MACHINE=2
 PREFERENCES_DIR=os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),"JiraDependencyMap")
 PREFERENCES_FILE=os.path.join(PREFERENCES_DIR,"preferences.txt")
 DEFAULT_PREFERENCES={
-    "showCompleted":False,"filterUser":"","includeWithRemarkable":True,
-    "customJql":"","useJiraModal":False,"showMiniMap":True,
+    "showCompleted":False,"filterUser":"","filterDue":"all","includeWithRemarkable":True,
+    "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default",
 }
 _preferences_lock=threading.Lock()
 
@@ -57,10 +57,12 @@ def _normalise_preferences(data):
         out.update({k:data[k] for k in DEFAULT_PREFERENCES if k in data})
     out["showCompleted"]=out["showCompleted"] is True
     out["filterUser"]=str(out["filterUser"] or "")
+    out["filterDue"]=out["filterDue"] if out["filterDue"] in {"all","next7","nextMonth","overdue"} else "all"
     out["includeWithRemarkable"]=out["includeWithRemarkable"] is not False
     out["customJql"]=str(out["customJql"] or "").strip()
     out["useJiraModal"]=out["useJiraModal"] is True
     out["showMiniMap"]=out["showMiniMap"] is not False
+    out["startingView"]=out["startingView"] if out["startingView"] in {"default","dashboard","milestone"} else "default"
     return out
 
 def _read_preferences():
@@ -276,7 +278,9 @@ def _jira_search(jql, fields, label):
         _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=page,fetched=len(all_issues),detail=f"Requesting batch {page}…")
         print(f"  -> Jira {label} page {page} (have {len(all_issues):,} so far; batch size {batch_size:,})")
         started=time.time()
-        resp=JIRA_HTTP_SESSION.post(url,headers=get_jira_headers(),json=body,timeout=60)
+        request_headers=get_jira_headers()
+        request_headers.update({"Cache-Control":"no-cache","Pragma":"no-cache"})
+        resp=JIRA_HTTP_SESSION.post(url,headers=request_headers,json=body,timeout=60)
         # Some Jira configurations enforce a smaller maxResults limit. Fall back once.
         if resp.status_code==400 and batch_size!=100:
             print(f"  <- Jira rejected batch size {batch_size}; retrying with 100")
@@ -290,7 +294,9 @@ def _jira_search(jql, fields, label):
         _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=page,fetched=len(all_issues),total=total,detail=f"Batch {page}: {len(batch):,} downloaded ({len(all_issues):,}" + (f" of {total:,}" if isinstance(total,int) else "") + ")")
         if not token or not batch: break
     _set_loading_progress(phase=f"Downloaded {label} work items",batch=page,fetched=len(all_issues),total=len(all_issues),detail=f"{len(all_issues):,} work items downloaded")
-    print(f"  OK {label}: fetched {len(all_issues):,} issues")
+    due_dates=sum(1 for issue in all_issues if (issue.get("fields") or {}).get("duedate"))
+    link_sets=sum(1 for issue in all_issues if (issue.get("fields") or {}).get("issuelinks"))
+    print(f"  OK {label}: fetched {len(all_issues):,} issues ({due_dates:,} with due dates; {link_sets:,} with issue links)")
     return all_issues
 
 def _external_blocker_keys(raw_issues):
@@ -315,7 +321,7 @@ def _external_blocker_keys(raw_issues):
 
 def jira_fetch_external_issues(raw_issues, include_completed=True):
     """Recursively fetch external blockers until no new blocker keys are found."""
-    fields=["summary","status","priority","assignee","issuelinks","parent","customfield_10014","labels"]
+    fields=["summary","status","priority","assignee","duedate","issuelinks","parent","customfield_10014","labels"]
     # Jira can impose a limit on the number of values in an IN clause. Keep the
     # normal case to one JQL request, and only split unusually large sets.
     chunk_size=1000
@@ -364,7 +370,7 @@ def jira_fetch_external_issues(raw_issues, include_completed=True):
     return fetched
 
 def _base_issue_fields():
-    return ["summary","status","priority","assignee","issuelinks","parent","customfield_10014","labels"]
+    return ["summary","status","priority","assignee","duedate","issuelinks","parent","customfield_10014","labels"]
 
 def _completed_jql(jql):
     """Restrict a JQL query to Jira's Done status category."""
@@ -483,6 +489,7 @@ def parse_dependency_graph(raw):
             "priority":(f.get("priority") or {}).get("name"),
             "assignee":((f.get("assignee") or {}).get("displayName") or (f.get("assignee") or {}).get("name") or "Unassigned"),
             "assigneeAccountId":(f.get("assignee") or {}).get("accountId"),
+            "dueDate":f.get("duedate") or None,
             "labels":f.get("labels") or [],
             "epic":_extract_epic(f),
             "url":f"{JIRA_BASE_URL}/browse/{key}",
@@ -563,6 +570,7 @@ def serialize_graph(raw, jql=None):
         out.append({
             "key":k,"summary":v["summary"],"status":v["status"],"priority":v["priority"],"assignee":v.get("assignee") or "Unassigned","assigneeAccountId":v.get("assigneeAccountId"),
             "labels":v.get("labels") or [],
+            "dueDate":v.get("dueDate"),
             "epic":v.get("epic"),"url":v["url"],
             "blockers":sorted(v["blockers"]),"blocked":sorted(v["blocked"]),
             "externalBlockers":sorted(v["externalBlockers"],key=lambda x:x["key"]),
@@ -658,6 +666,17 @@ def api_issues():
             if "assigneeAccountId" in ch:
                 aid=ch.get("assigneeAccountId")
                 fields["assignee"]={"accountId":aid} if aid else None
+            if "dueDate" in ch:
+                due_date=ch.get("dueDate")
+                if due_date is not None:
+                    due_date=str(due_date).strip()
+                    if due_date:
+                        import datetime as _dt
+                        try: _dt.date.fromisoformat(due_date)
+                        except ValueError: raise RuntimeError(f"Invalid due date for {key}.")
+                    else:
+                        due_date=None
+                fields["duedate"]=due_date
             if not fields: continue
             resp=req.put(f"{JIRA_BASE_URL}/rest/api/3/issue/{key}",headers=get_jira_headers(),json={"fields":fields},timeout=30)
             if not resp.ok: raise RuntimeError(f"Jira API {resp.status_code}: {jira_error(resp)}")
@@ -877,7 +896,8 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   display:flex;align-items:center;gap:12px;padding:0 18px;
   box-shadow:0 2px 14px rgba(0,0,0,.25);
 }
-.brand{display:flex;align-items:center;gap:9px;font-weight:700;flex-shrink:0}
+.brand{display:flex;align-items:center;gap:9px;font-weight:700;flex-shrink:0;cursor:pointer;border-radius:7px}
+.brand:focus-visible{outline:2px solid #7dd3fc;outline-offset:4px}
 .brand-icon{width:30px;height:30px;border-radius:50%;background:#fff;display:inline-flex;align-items:center;justify-content:center;flex:0 0 30px;overflow:hidden}
 .brand-icon img{width:21px;height:21px;object-fit:contain;display:block}
 .brand small{display:block;font-size:11px;color:#94a3b8;font-weight:400;margin-top:1px}
@@ -886,16 +906,18 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .search-wrap svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);pointer-events:none;opacity:.45}
 #search{
   width:100%;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);
-  color:#fff;border-radius:7px;padding:7px 10px 7px 32px;font-size:13px;
+  color:#fff;border-radius:7px;padding:7px 34px 7px 32px;font-size:13px;
   outline:none;transition:background .15s,border-color .15s;
 }
 #search:focus{background:rgba(255,255,255,.16);border-color:rgba(255,255,255,.45)}
 #search::placeholder{color:rgba(255,255,255,.38)}
 #search-clear{
-  position:absolute;right:9px;top:50%;transform:translateY(-50%);
-  background:none;border:none;color:rgba(255,255,255,.5);cursor:pointer;
-  font-size:15px;line-height:1;padding:2px;display:none;
+  position:absolute;right:7px;top:50%;transform:translateY(-50%);
+  width:24px;height:24px;border:0;border-radius:50%;
+  background:transparent;color:rgba(255,255,255,.62);cursor:pointer;
+  font-size:18px;line-height:22px;padding:0;display:none;
 }
+#search-clear:hover,#search-clear:focus-visible{background:rgba(255,255,255,.14);color:#fff;outline:none}
 #search-clear.visible{display:block}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .header-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
@@ -917,6 +939,10 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   transition:background .12s;display:inline-flex;align-items:center;gap:5px;
 }
 .btn:hover{background:rgba(255,255,255,.17)}
+.view-switcher{display:inline-flex;align-items:center;padding:2px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);border-radius:8px;gap:2px}
+.view-switch{border:0;background:transparent;color:#94a3b8;border-radius:6px;padding:6px 9px;font:inherit;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap}
+.view-switch:hover{background:rgba(255,255,255,.09);color:#e2e8f0}
+.view-switch.active{background:#fff;color:#172033;box-shadow:0 1px 2px rgba(0,0,0,.12)}
 .btn-save{font-weight:800;min-width:36px;width:36px;height:32px;padding:0;justify-content:center}.btn-save[hidden],.btn-discard[hidden]{display:none!important}
 .btn-save.unsaved{background:#f59e0b;color:#172033;border-color:#fbbf24;box-shadow:0 0 0 2px rgba(245,158,11,.25);opacity:1}
 .btn-save:disabled{opacity:.45;cursor:default}
@@ -1026,13 +1052,13 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 
 /* ── Jira ticket preview modal ─────────────────────────────────────────── */
 .ticket-preview-backdrop{
-  position:fixed;inset:0;z-index:10009;
+  position:fixed;inset:0;z-index:10079;
   background:rgba(15,23,42,.22);
 }
 .ticket-preview-modal{
   position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
   width:min(1600px,calc(100vw - 48px));height:min(760px,calc(100vh - 48px));
-  z-index:10010;display:flex;flex-direction:column;overflow:hidden;resize:none;
+  z-index:10080;display:flex;flex-direction:column;overflow:hidden;resize:none;
   background:#fff;border:1px solid #cbd5e1;border-radius:10px;
   box-shadow:0 24px 70px rgba(15,23,42,.28);
 }
@@ -1060,6 +1086,12 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   border-bottom:1px solid #fecaca;z-index:40;font-size:13px;
 }
 
+
+.dashboard-ticket-controls{display:flex;align-items:center;gap:8px;margin-top:9px;flex-wrap:wrap}
+.dashboard-assignee-select{max-width:180px}
+.dashboard-ticket-key-wrap{display:flex;align-items:center;gap:5px;min-width:0}
+.dashboard-ticket.chain-date-risk{border-color:#f59e0b;background:#fffbeb}
+.dashboard-risk.chain-date-risk{color:#92400e;background:#fef3c7;border-color:#fcd34d}
 /* ── App shell ───────────────────────────────────────────────────────────── */
 #app{height:calc(100vh - 58px);overflow-x:auto;overflow-y:hidden;position:relative}
 #app.locked{
@@ -1078,6 +1110,8 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   padding-bottom:20px;
 }
 #app.milestone-mode{overflow-x:auto;overflow-y:auto}
+#app.dashboard-mode{overflow-x:hidden;overflow-y:auto}
+#app.dashboard-mode #board{min-width:0;display:block;overflow:visible}
 
 /* ── Board mini-map ─────────────────────────────────────────────────────── */
 #board-minimap{
@@ -1107,6 +1141,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .minimap-card.selected{border-color:#7c3aed;background:#a78bfa}
 .minimap-card.highlight-locked{border-color:#d97706;background:#f59e0b}
 .minimap-card.dimmed{opacity:.5}
+.minimap-card.overdue{border-color:#ef4444;background:#ef4444;box-shadow:0 0 0 1px #b91c1c}
 #board-minimap-viewport{
   position:absolute;left:0;top:0;
   border:2px solid #6366f1;background:rgba(99,102,241,.10);
@@ -1412,6 +1447,110 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .issue-option-summary{color:#64748b}
 
 
+/* ── Due dates ─────────────────────────────────────────────────────────── */
+.card-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}
+.card-meta .assignee-select{margin-top:0;flex:0 1 auto;min-width:150px}
+.due-date{display:inline-flex;align-items:center;gap:4px;border:1px solid #e2e8f0;background:#f8fafc;color:#475569;border-radius:5px;padding:4px 7px;font:inherit;font-size:11px;line-height:1.2;cursor:pointer;white-space:nowrap}
+.due-date:hover{background:#eef2ff;border-color:#c7d2fe;color:#3730a3}
+.due-date.overdue{color:#b91c1c;background:#fef2f2;border-color:#fecaca;font-weight:800}
+.due-date.chain-date-risk{color:#9a3412;background:#fff7ed;border-color:#fb923c;font-weight:850;box-shadow:0 0 0 2px rgba(251,146,60,.22)}
+.due-date.chain-date-risk:hover{color:#7c2d12;background:#ffedd5;border-color:#f97316}
+.card.chain-date-risk-card{box-shadow:inset 0 0 0 2px rgba(249,115,22,.32)}
+.card.overdue-card{outline:2px solid #ef4444;outline-offset:-2px}
+.due-date-empty{color:#64748b}
+.due-date-icon{font-size:11px}
+#due-date-modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.42);backdrop-filter:blur(2px);z-index:10060;align-items:center;justify-content:center;padding:16px}
+#due-date-modal.open{display:flex}
+.due-date-card{width:min(330px,calc(100vw - 32px));background:#fff;border-radius:12px;box-shadow:0 24px 70px rgba(15,23,42,.28);padding:18px}
+.due-date-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px}
+.due-date-title{font-size:14px;font-weight:800;color:#172033}
+.due-date-key{font-size:11px;color:#64748b;margin-top:2px}
+.due-date-input{width:100%;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#172033;font:inherit;font-size:13px}
+.due-date-input:focus{outline:none;border-color:#818cf8;box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+.due-date-actions{display:flex;justify-content:space-between;gap:8px;margin-top:14px}
+.due-date-actions-right{display:flex;gap:8px}
+.due-date-button{border:1px solid #cbd5e1;background:#fff;color:#334155;border-radius:7px;padding:7px 11px;font:inherit;font-size:12px;font-weight:700;cursor:pointer}
+.due-date-button:hover{background:#f8fafc}
+.due-date-button.primary{background:#6366f1;border-color:#6366f1;color:#fff}
+.due-date-button.danger{color:#b91c1c;border-color:#fecaca;background:#fef2f2}
+#chain-date-warning-modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.5);backdrop-filter:blur(2px);z-index:10070;align-items:center;justify-content:center;padding:16px}
+#chain-date-warning-modal.open{display:flex}
+.chain-date-warning-card{width:min(720px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;background:#fff;border-radius:12px;box-shadow:0 24px 70px rgba(15,23,42,.32);padding:20px}
+.chain-date-warning-title{font-size:16px;font-weight:850;color:#991b1b;margin:0 0 12px}
+.chain-date-warning-section{border:1px solid #fed7aa;background:#fffaf5;border-radius:9px;padding:12px}
+.chain-date-warning-section+.chain-date-warning-section{margin-top:14px}
+.chain-date-warning-section-title{font-size:13px;font-weight:850;color:#9a3412;margin:0 0 10px}
+.chain-date-warning-message{font-size:13px;font-weight:750;color:#334155;margin:0 0 9px}
+.chain-date-warning-subsection+.chain-date-warning-subsection{margin-top:12px}
+.chain-date-warning-changes{border:1px solid #cbd5e1;background:#f8fafc;border-radius:9px;padding:12px;margin-bottom:14px}
+.chain-date-warning-changes-title{font-size:12px;font-weight:850;color:#334155;margin:0 0 8px}
+.chain-date-warning-resolved{padding:12px;border:1px solid #bbf7d0;background:#f0fdf4;color:#166534;border-radius:8px;font-size:12px;font-weight:750}
+.chain-date-warning-empty{padding:12px;border:1px solid #e2e8f0;background:#f8fafc;color:#64748b;border-radius:8px;font-size:12px}
+.chain-date-warning-table{width:100%;border-collapse:collapse;font-size:12px}
+.chain-date-warning-table th,.chain-date-warning-table td{padding:8px 9px;border:1px solid #e2e8f0;text-align:left;vertical-align:middle}
+.chain-date-warning-table th{background:#f8fafc;color:#475569;font-size:11px}
+.chain-date-warning-table td:first-child{font-weight:800;white-space:nowrap;color:#3730a3}
+.chain-date-warning-key{color:#3730a3;text-decoration:none;font-weight:850}
+.chain-date-warning-key:hover{text-decoration:underline}
+.chain-date-warning-date{width:145px;max-width:100%;padding:6px 7px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#172033;font:inherit;font-size:12px}
+.chain-date-warning-date:focus{outline:none;border-color:#f97316;box-shadow:0 0 0 3px rgba(249,115,22,.13)}
+.chain-date-warning-current{white-space:nowrap;color:#64748b}
+.chain-date-warning-revert{border:0;background:transparent;color:#4f46e5;font:inherit;font-size:11px;font-weight:750;cursor:pointer;padding:3px}
+.chain-date-warning-revert:hover{text-decoration:underline}
+.chain-date-warning-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+
+/* ── Dashboard ──────────────────────────────────────────────────────────── */
+#board.dashboard-board{width:100%;min-width:0;padding:18px 20px 40px}
+#board.dashboard-board #lines{display:none!important}
+.dashboard{max-width:1500px;margin:0 auto}
+.dashboard-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:16px}
+.dashboard-title{font-size:20px;font-weight:850;color:#172033}
+.dashboard-subtitle{font-size:12px;color:#64748b;margin-top:3px}
+.dashboard-updated{font-size:11px;color:#94a3b8}
+.dashboard-stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:18px}
+.dashboard-stat{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:13px 14px;min-width:0}
+.dashboard-stat-value{font-size:23px;line-height:1;font-weight:850;color:#172033}
+.dashboard-stat-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;font-weight:800;color:#64748b;margin-top:7px}
+.dashboard-stat-help{font-size:10px;line-height:1.35;color:#94a3b8;margin-top:5px}
+.dashboard-stat.risk{border-color:#fecaca;background:#fffafa}
+.dashboard-stat.risk .dashboard-stat-value{color:#b91c1c}
+ .dashboard-health-stat{min-width:0;grid-column:span 2}
+.dashboard-health-stat.green{border-color:#bbf7d0;background:#f7fff9}
+.dashboard-health-stat.amber{border-color:#fde68a;background:#fffdf5}
+.dashboard-health-stat.red{border-color:#fecaca;background:#fff8f8}
+.dashboard-health-score-line{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.dashboard-health-status{font-size:9px;font-weight:850;text-transform:uppercase;letter-spacing:.06em;border-radius:999px;padding:4px 7px}
+.dashboard-health-stat.green .dashboard-health-status{background:#dcfce7;color:#166534}
+.dashboard-health-stat.amber .dashboard-health-status{background:#fef3c7;color:#92400e}
+.dashboard-health-stat.red .dashboard-health-status{background:#fee2e2;color:#b91c1c}
+.dashboard-health-breakdown{margin-top:9px;border-top:1px solid #e2e8f0;padding-top:7px}
+.dashboard-health-row{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:10px}
+.dashboard-health-row-label{font-weight:750;color:#334155;white-space:nowrap}
+.dashboard-health-row-detail{color:#94a3b8;flex:1;min-width:0}
+.dashboard-health-row strong{font-size:10px;white-space:nowrap;color:#64748b}
+.dashboard-health-stat.red .dashboard-health-row strong{color:#b91c1c}
+.dashboard-health-stat.amber .dashboard-health-row strong{color:#92400e}
+.dashboard-section{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:14px}
+.dashboard-section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:11px}
+.dashboard-section-title{font-size:12px;font-weight:850;color:#172033}
+.dashboard-section-count{font-size:10px;color:#64748b}
+.dashboard-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:9px}
+.dashboard-ticket{border:1px solid #e2e8f0;border-radius:8px;padding:9px 10px;background:#f8fafc;cursor:pointer}
+.dashboard-ticket:hover{background:#fff;border-color:#cbd5e1;box-shadow:0 2px 7px rgba(15,23,42,.07)}
+.dashboard-ticket.overdue{border-color:#fecaca;background:#fff7f7}
+.dashboard-ticket-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.dashboard-ticket-key{font-size:11px;font-weight:850;color:#4f46e5;text-decoration:none}.dashboard-ticket-key:hover{text-decoration:underline}
+.dashboard-ticket-summary{font-size:12px;font-weight:650;color:#334155;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dashboard-risks{display:flex;gap:4px;flex-wrap:wrap;margin-top:7px}
+.dashboard-risk{font-size:9px;font-weight:800;border-radius:999px;padding:3px 6px;background:#eef2ff;color:#4338ca}
+.dashboard-risk.overdue{background:#fee2e2;color:#b91c1c}
+.dashboard-risk.unassigned{background:#dbeafe;color:#1d4ed8}
+.dashboard-risk.dependencies{background:#fef3c7;color:#92400e}
+.dashboard-risk.blocked{background:#ffedd5;color:#c2410c}
+.dashboard-empty{font-size:12px;color:#64748b;padding:10px 2px}
+@media(max-width:1000px){.dashboard-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-health-stat{grid-column:1 / -1}}
+@media(max-width:700px){.dashboard-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-grid{grid-template-columns:1fr}}
+
 /* ── Settings ───────────────────────────────────────────────────────────── */
 #settings-modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.52);backdrop-filter:blur(2px);z-index:10040;align-items:center;justify-content:center;padding:16px}
 #settings-modal.open{display:flex}
@@ -1532,6 +1671,31 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 </head>
 <body>
 
+<div id="due-date-modal" role="dialog" aria-modal="true" aria-labelledby="due-date-title">
+  <div class="due-date-card">
+    <div class="due-date-head">
+      <div><div class="due-date-title" id="due-date-title">Set due date</div><div class="due-date-key" id="due-date-key"></div></div>
+      <button type="button" class="modal-close" id="due-date-close" aria-label="Close">×</button>
+    </div>
+    <input class="due-date-input" id="due-date-input" type="date">
+    <div class="due-date-actions">
+      <button type="button" class="due-date-button danger" id="due-date-clear">Clear date</button>
+      <div class="due-date-actions-right"><button type="button" class="due-date-button" id="due-date-cancel">Cancel</button><button type="button" class="due-date-button primary" id="due-date-save">Save date</button></div>
+    </div>
+  </div>
+</div>
+
+<div id="chain-date-warning-modal" role="alertdialog" aria-modal="true" aria-labelledby="chain-date-warning-title">
+  <div class="chain-date-warning-card">
+    <h2 class="chain-date-warning-title" id="chain-date-warning-title">Chain date risk</h2>
+    <div id="chain-date-warning-content"></div>
+    <div class="chain-date-warning-actions">
+      <button type="button" class="due-date-button" id="chain-date-warning-cancel">Cancel</button>
+      <button type="button" class="due-date-button primary" id="chain-date-warning-confirm">Confirm change</button>
+    </div>
+  </div>
+</div>
+
 <div id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
   <div class="settings-card">
     <div class="settings-head">
@@ -1565,6 +1729,17 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
           <span class="settings-toggle-track" aria-hidden="true"></span>
           <span class="settings-toggle-state">Off</span>
         </button>
+      </div>
+      <div class="settings-toggle-row" style="margin-top:12px">
+        <div class="settings-toggle-info">
+          <div class="settings-toggle-title">Starting board view</div>
+          <div class="settings-toggle-help">Choose which view opens when the application starts.</div>
+        </div>
+        <select id="settings-starting-view" class="filter-user-select" style="width:145px">
+          <option value="default">Default board</option>
+          <option value="dashboard">Dashboard</option>
+          <option value="milestone">Milestone view</option>
+        </select>
       </div>
       <div class="settings-toggle-row" style="margin-top:12px">
         <div class="settings-toggle-info">
@@ -1665,7 +1840,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 
 
 <header id="app-header">
-  <div class="brand">
+  <div class="brand" data-action="escape" role="button" tabindex="0" title="Home" aria-label="Home">
     <span class="brand-icon"><img src="https://warwick.ac.uk/services/marketing/teams/cds/opd/1486504840-cog-cogwheel-gear-repr-options-setting_81360.png" alt="" aria-hidden="true"></span>
     <div>Jira Dependency Map<small id="brand-subtitle">Web Evolution dependencies</small></div>
   </div>
@@ -1674,12 +1849,6 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
     <a class="custom-jql-indicator" id="custom-jql-indicator" href="#custom-jql" title="Custom JQL settings" aria-label="Open Custom JQL settings">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"/></svg>
     </a>
-    <button type="button" class="btn" data-action="escape" title="Home">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V21h13V9.5"/><path d="M9.5 21v-6h5v6"/>
-      </svg>
-      <span class="sr-only">Home</span>
-    </button>
     <!-- Search is shown only when nothing is locked -->
     <div class="search-wrap" id="search-wrap">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
@@ -1688,6 +1857,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
       </svg>
       <input id="search" type="text"
              placeholder="Search key, summary or epic&hellip;" autocomplete="off" spellcheck="false">
+      <button id="search-clear" type="button" aria-label="Clear text search" title="Clear text search">&times;</button>
     </div>
     <div class="filter-controls" id="filter-controls">
       <button class="btn" id="filters-btn" type="button" aria-haspopup="true" aria-expanded="false">Filters</button>
@@ -1696,6 +1866,15 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
         <label class="filter-option" style="display:block">
           <span class="filter-option-label" style="display:block;margin-bottom:6px">User</span>
           <select class="filter-user-select" id="filter-user" aria-label="Filter by user"></select>
+        </label>
+        <label class="filter-option" style="display:block">
+          <span class="filter-option-label" style="display:block;margin-bottom:6px">Due date</span>
+          <select class="filter-user-select" id="filter-due" aria-label="Filter by due date">
+            <option value="all">Show all</option>
+            <option value="next7">Due in the next 7 days</option>
+            <option value="nextMonth">Due in the next month</option>
+            <option value="overdue">Overdue</option>
+          </select>
         </label>
         <label class="filter-option">
           <span class="filter-option-label">Include With Remarkable</span>
@@ -1723,9 +1902,11 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
     <button class="btn btn-toggle-completed" id="toggle-completed" title="Toggle visibility of Done / Completed tickets">
       <span class="toggle-track"></span>Completed
     </button>
-    <button class="btn btn-toggle-milestones" id="toggle-milestones" title="View milestone overview">
-      View Milestones
-    </button>
+    <div class="view-switcher" id="view-switcher" role="group" aria-label="Board view">
+      <button class="view-switch active" data-view="default" type="button">Full board</button>
+      <button class="view-switch" data-view="dashboard" type="button">Dashboard</button>
+      <button class="view-switch" data-view="milestone" type="button">Milestones</button>
+    </div>
     <button class="btn btn-settings" id="settings" title="Settings" aria-label="Settings">&#9881;</button>
     <button class="btn btn-refresh" id="refresh" title="Refresh from Jira">&#x21BB;</button>
   </div>
@@ -1789,6 +1970,7 @@ const state = {
   selectionHistory:[],
   showBlocked:false,
   filterUser:"",
+  filterDue:"all",
   includeWithRemarkable:true,
   // Each entry: { source, target, action:'add'|'delete' }
   pendingChanges:[],
@@ -1801,6 +1983,8 @@ const state = {
   // Incremented for every Jira load. Older responses/background jobs are ignored.
   loadGeneration:0,
   showMilestones:false,         // toggle: OFF by default; milestone overview
+  showDashboard:false,
+  startingView:'default',
   showMiniMap:true, customJql:'', useJiraModal:false,
   displayIssues:[], displayEdges:[], displayLevels:0,
   hoverKey:null, hoverLockKey:null,
@@ -1815,6 +1999,7 @@ const state = {
 
 // ── Filter preferences ────────────────────────────────────────────────────
 let preferencesReady=false;
+let startupViewPending=true;
 
 async function loadPreferences(){
   // Preferences are optional. Never let a preferences-file/API problem stop
@@ -1827,10 +2012,12 @@ async function loadPreferences(){
     if(!r.ok) throw new Error(saved.error || 'Unable to load preferences.');
     state.showCompleted=saved.showCompleted===true;
     state.filterUser=typeof saved.filterUser==='string' ? saved.filterUser : '';
+    state.filterDue=['all','next7','nextMonth','overdue'].includes(saved.filterDue) ? saved.filterDue : 'all';
     state.includeWithRemarkable=saved.includeWithRemarkable!==false;
     state.customJql=typeof saved.customJql==='string' ? saved.customJql.trim() : '';
     state.useJiraModal=saved.useJiraModal===true;
     state.showMiniMap=saved.showMiniMap!==false;
+    state.startingView=['default','dashboard','milestone'].includes(saved.startingView) ? saved.startingView : 'default';
   }catch(e){
     console.warn('Could not load persistent preferences; using defaults.',e);
   }finally{
@@ -1846,26 +2033,27 @@ async function savePreferences(updates){
     await fetch('/api/preferences',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
-        showCompleted:!!state.showCompleted, filterUser:state.filterUser||'',
+        showCompleted:!!state.showCompleted, filterUser:state.filterUser||'', filterDue:state.filterDue||'all',
         includeWithRemarkable:state.includeWithRemarkable!==false,
         customJql:state.customJql||'', useJiraModal:!!state.useJiraModal,
-        showMiniMap:state.showMiniMap!==false
+        showMiniMap:state.showMiniMap!==false, startingView:state.startingView || 'default'
       }),cache:'no-store'
     });
   }catch(e){ console.warn('Could not save persistent preferences.',e); }
 }
 function saveFilterPreferences(){
-  savePreferences({showCompleted:!!state.showCompleted,filterUser:state.filterUser||'',
+  savePreferences({showCompleted:!!state.showCompleted,filterUser:state.filterUser||'',filterDue:state.filterDue||'all',
     includeWithRemarkable:state.includeWithRemarkable!==false});
 }
 function filterSnapshot(){
-  return {searchTerm:state.searchTerm||'',showCompleted:!!state.showCompleted,filterUser:state.filterUser||'',includeWithRemarkable:state.includeWithRemarkable!==false};
+  return {searchTerm:state.searchTerm||'',showCompleted:!!state.showCompleted,filterUser:state.filterUser||'',filterDue:state.filterDue||'all',includeWithRemarkable:state.includeWithRemarkable!==false};
 }
 function restoreFilterSnapshot(snap){
   const s = snap || {};
   state.searchTerm = s.searchTerm || '';
   state.showCompleted = !!s.showCompleted;
   state.filterUser = s.filterUser || '';
+  state.filterDue = ['all','next7','nextMonth','overdue'].includes(s.filterDue) ? s.filterDue : 'all';
   state.includeWithRemarkable = s.includeWithRemarkable !== false;
   if(searchEl) searchEl.value = state.searchTerm;
   saveFilterPreferences();
@@ -1874,6 +2062,7 @@ function clearAllFilters(){
   state.searchTerm = '';
   state.showCompleted = false;
   state.filterUser = '';
+  state.filterDue = 'all';
   state.includeWithRemarkable = true;
   if(searchEl) searchEl.value = '';
   saveFilterPreferences();
@@ -1881,12 +2070,13 @@ function clearAllFilters(){
   render();
 }
 function activeFilterCount(){
-  return (state.searchTerm ? 1 : 0) + (state.showCompleted ? 1 : 0) + (state.filterUser ? 1 : 0) + (!state.includeWithRemarkable ? 1 : 0);
+  return (state.searchTerm ? 1 : 0) + (state.showCompleted ? 1 : 0) + (state.filterUser ? 1 : 0) + (state.filterDue !== 'all' ? 1 : 0) + (!state.includeWithRemarkable ? 1 : 0);
 }
 function updateFilterControls(){
   const toggleCompletedBtn = document.getElementById('toggle-completed');
   if(toggleCompletedBtn) toggleCompletedBtn.classList.toggle('active', !!state.showCompleted);
   if(filterRemarkable) filterRemarkable.checked = state.includeWithRemarkable !== false;
+  if(filterDue) filterDue.value = state.filterDue || 'all';
   const count = activeFilterCount();
   if(clearFiltersBtn){
     clearFiltersBtn.textContent = count ? 'Clear filters (' + count + ')' : 'Clear filters';
@@ -1941,14 +2131,15 @@ const statusText         = document.getElementById('status-text');
 const errorEl            = document.getElementById('error');
 const searchWrap         = document.getElementById('search-wrap');
 const searchEl           = document.getElementById('search');
+const searchClearBtn     = document.getElementById('search-clear');
 const filtersBtn        = document.getElementById('filters-btn');
 const filterMenu        = document.getElementById('filter-menu');
 const toggleCompletedBtn = document.getElementById('toggle-completed');
 const filterUser        = document.getElementById('filter-user');
+const filterDue         = document.getElementById('filter-due');
 const filterRemarkable  = document.getElementById('filter-remarkable');
 const clearFiltersBtn   = document.getElementById('clear-filters');
 const deselectBtn        = document.getElementById('deselect');
-const toggleMilestonesBtn = document.getElementById('toggle-milestones');
 const milestoneBackBtn  = document.getElementById('milestone-back');
 const loadingStage = document.getElementById('loading-stage');
 const loadingProgressBar = document.getElementById('loading-progress-bar');
@@ -1980,6 +2171,7 @@ const brandSubtitle = document.getElementById('brand-subtitle');
 
 const settingsUseJiraModal = document.getElementById('settings-use-jira-modal');
 const settingsShowMiniMap = document.getElementById('settings-show-minimap');
+const settingsStartingView = document.getElementById('settings-starting-view');
 const settingsClose = document.getElementById('settings-close');
 const settingsCloseBottom = document.getElementById('settings-close-bottom');
 const settingsMainView = document.getElementById('settings-main-view');
@@ -1988,6 +2180,12 @@ const settingsSeeStartupMessages = document.getElementById('settings-see-startup
 const settingsBack = document.getElementById('settings-back');
 const settingsMessagesList = document.getElementById('settings-messages-list');
 const startupMessage = document.getElementById('startup-message');
+const dueDateModal = document.getElementById('due-date-modal');
+const dueDateInput = document.getElementById('due-date-input');
+const dueDateKey = document.getElementById('due-date-key');
+const chainDateWarningModal = document.getElementById('chain-date-warning-modal');
+const chainDateWarningContent = document.getElementById('chain-date-warning-content');
+let pendingDueDateChange = null;
 
 let loadingTimer = null;
 let loadingProgressTimer = null;
@@ -2082,6 +2280,14 @@ function updateJiraModalSetting(){
   const stateLabel = settingsUseJiraModal.querySelector('.settings-toggle-state');
   if(stateLabel) stateLabel.textContent = enabled ? 'On' : 'Off';
 }
+function updateStartingViewSetting(){
+  if(settingsStartingView) settingsStartingView.value = ['default','dashboard','milestone'].includes(state.startingView) ? state.startingView : 'default';
+}
+function setStartingView(value){
+  state.startingView = ['default','dashboard','milestone'].includes(value) ? value : 'default';
+  savePreferences({startingView:state.startingView});
+  updateStartingViewSetting();
+}
 function updateMiniMapSetting(){
   if(!settingsShowMiniMap) return;
   const enabled = state.showMiniMap !== false;
@@ -2155,6 +2361,7 @@ function closeSettings(){ settingsModal.classList.remove('open'); showSettingsMa
 async function openSettings(openJql = false){
   updateJiraModalSetting();
   updateMiniMapSetting();
+  updateStartingViewSetting();
   updateCustomJqlIndicator();
   settingsModal.classList.add('open');
   settingsEmail.textContent = 'Checking…';
@@ -2292,6 +2499,7 @@ async function initialiseApp(){
     await loadPreferences();
     updateJiraModalSetting();
     updateMiniMapSetting();
+    updateStartingViewSetting();
     updateCustomJqlIndicator();
     updateFilterControls();
 
@@ -2377,6 +2585,7 @@ function applySearchFilter(){
   const words = searchWords(state.searchTerm);
   const cards = [...board.querySelectorAll('.card')];
   const userFilter = state.filterUser || '';
+  const dueFilter = state.filterDue || 'all';
   let visibleTotal = 0;
 
   cards.forEach(card => {
@@ -2389,7 +2598,12 @@ function applySearchFilter(){
         ? !assigneeId
         : assigneeId === userFilter);
 
-    const match = textMatch && userMatch;
+    const dueMatch = issueMatchesDueFilter({
+      dueDate:card.dataset.dueDate || '',
+      status:card.dataset.completed === '1' ? 'Done' : ''
+    }, dueFilter);
+
+    const match = textMatch && userMatch && dueMatch;
     card.hidden = !match;
     if(match) visibleTotal++;
 
@@ -2407,7 +2621,7 @@ function applySearchFilter(){
 
     // When searching or filtering by user, hide levels containing no
     // matching cards, but never recalculate or renumber the levels themselves.
-    col.style.display = (words.length || userFilter) && count === 0 ? 'none' : '';
+    col.style.display = (words.length || userFilter || dueFilter !== 'all') && count === 0 ? 'none' : '';
   });
 
   // If a selected user has become inactive because Completed was switched
@@ -2450,16 +2664,16 @@ function applySearchFilter(){
       saveFilterPreferences();
       render();
     });
-  } else if((words.length || userFilter) && visibleTotal === 0){
+  } else if((words.length || userFilter || dueFilter !== 'all') && visibleTotal === 0){
     const notice = document.createElement('div');
     notice.className = 'no-results';
     notice.innerHTML = '<div class="no-results-title">No results to show.</div>' +
-      '<div class="no-results-message">Please adjust your search term.</div>';
+      '<div class="no-results-message">Please adjust your search or filters.</div>';
     board.appendChild(notice);
   }
 
   updateFilterControls();
-  if(words.length || userFilter){
+  if(words.length || userFilter || dueFilter !== 'all'){
     statusText.textContent = visibleTotal.toLocaleString('en-GB') + ' of ' +
       state.displayIssues.length.toLocaleString('en-GB') + ' tickets match';
   }else{
@@ -2488,6 +2702,7 @@ function highlight(text, term){
 function getRenderedViewMode(){
   const app = document.getElementById('app');
   if(board.classList.contains('milestone-board') || app.classList.contains('milestone-mode')) return 'milestone';
+  if(board.classList.contains('dashboard-board') || app.classList.contains('dashboard-mode')) return 'dashboard';
   if(app.classList.contains('locked')) return 'locked';
   return 'main';
 }
@@ -2912,12 +3127,12 @@ function deleteLocalDependency(source, target){
 function stageIssueChange(key, field, value){
   const issue = state.issues.find(i => i.key === key);
   if(!issue) return;
-  const oldValue = field === 'assignee' ? (issue.assigneeAccountId || null) : issue.priority;
+  const oldValue = field === 'assignee' ? (issue.assigneeAccountId || null) : field === 'priority' ? issue.priority : (issue.dueDate || null);
   if(oldValue === (value || null)) return;
   pushHistory();
   const display = state.displayIssues.find(i => i.key === key);
   if(field === 'assignee'){
-    const opt = [...document.querySelectorAll('.assignee-select')].find(s => s.closest('.card')?.dataset.key === key);
+    const opt = [...document.querySelectorAll('.assignee-select')].find(s => s.closest('.card, .dashboard-ticket')?.dataset.key === key);
     const name = opt && opt.selectedOptions[0] ? opt.selectedOptions[0].textContent : 'Unassigned';
     issue.assigneeAccountId = value || null;
     issue.assignee = name;
@@ -2925,11 +3140,35 @@ function stageIssueChange(key, field, value){
   }else if(field === 'priority'){
     issue.priority = value;
     if(display) display.priority = value;
+  }else if(field === 'dueDate'){
+    issue.dueDate = value || null;
+    if(display) display.dueDate = value || null;
   }
   const existing = state.pendingChanges.find(c => c.action === 'update' && c.key === key);
-  if(existing) existing[field === 'assignee' ? 'assigneeAccountId' : 'priority'] = value || null;
-  else state.pendingChanges.push(Object.assign({action:'update',key}, field === 'assignee' ? {assigneeAccountId:value || null} : {priority:value}));
+  const payload = field === 'assignee' ? {assigneeAccountId:value || null} : field === 'priority' ? {priority:value} : {dueDate:value || null};
+  if(existing) Object.assign(existing,payload);
+  else state.pendingChanges.push(Object.assign({action:'update',key}, payload));
   updateSaveButton();
+}
+
+function stageDueDateChanges(changes){
+  const applicable=(changes||[]).filter(change=>{
+    const issue=state.issues.find(i=>i.key===change.key);
+    return issue && (issue.dueDate||null)!==(change.value||null);
+  });
+  if(!applicable.length) return false;
+  pushHistory();
+  applicable.forEach(change=>{
+    const issue=state.issues.find(i=>i.key===change.key);
+    const display=state.displayIssues.find(i=>i.key===change.key);
+    issue.dueDate=change.value||null;
+    if(display) display.dueDate=change.value||null;
+    const existing=state.pendingChanges.find(c=>c.action==='update' && c.key===change.key);
+    if(existing) existing.dueDate=change.value||null;
+    else state.pendingChanges.push({action:'update',key:change.key,dueDate:change.value||null});
+  });
+  updateSaveButton();
+  return true;
 }
 
 async function saveChanges(){
@@ -3024,9 +3263,10 @@ function relationHtml(i){
     const x = state.issues.find(v => v.key === k);
     const cls = (extraCls || 'relation-key') + (x && isCompletedStatus(x.status) ? ' completed' : '');
     const issueUrl = x ? x.url : (CFG.jiraBaseUrl + '/browse/' + encodeURIComponent(k));
+    const tooltip = x ? ((x.summary || x.key) + ' - ' + (x.assignee || 'Unassigned') + ' (' + (x.priority || 'No priority') + ')') : k;
     const anchor = '<a class="' + cls + '" href="' + esc(issueUrl) +
       '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' +
-      esc(k) + '">' + esc(k) + '</a>';
+      esc(k) + '" title="' + esc(tooltip) + '">' + esc(k) + '</a>';
     return '<span class="relation-box ' + direction + '">' +
       (direction === 'up'
         ? '<span class="relation-arrow">←</span>' + anchor
@@ -3051,6 +3291,121 @@ function relationHtml(i){
 
   return (relationBoxes ? '<div class="relations">' + relationBoxes + '</div>' : '') +
     seeBlockedHtml + editHtml;
+}
+
+function formatDueDate(value){
+  if(!value) return '';
+  const parts=String(value).split('-').map(Number);
+  if(parts.length!==3 || parts.some(Number.isNaN)) return String(value);
+  const d=new Date(Date.UTC(parts[0],parts[1]-1,parts[2]));
+  return new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'}).format(d);
+}
+function localDateKey(value){
+  const d=value instanceof Date ? value : new Date(value);
+  if(Number.isNaN(d.getTime())) return '';
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+function isDueDateOverdue(value){
+  if(!value) return false;
+  return String(value) < localDateKey(new Date());
+}
+function issueMatchesDueFilter(issue, filterValue){
+  const filter=filterValue || 'all';
+  if(filter==='all') return true;
+  const due=String(issue.dueDate || '');
+  if(!due) return false;
+  const today=new Date();
+  const todayKey=localDateKey(today);
+  if(filter==='overdue') return !isCompletedStatus(issue.status) && due < todayKey;
+  if(due < todayKey) return false;
+  let end=new Date(today.getFullYear(),today.getMonth(),today.getDate());
+  if(filter==='next7'){
+    end.setDate(end.getDate()+7);
+  }else if(filter==='nextMonth'){
+    const targetMonth=today.getMonth()+1;
+    const lastDay=new Date(today.getFullYear(),targetMonth+1,0).getDate();
+    end=new Date(today.getFullYear(),targetMonth,Math.min(today.getDate(),lastDay));
+  }else{
+    return true;
+  }
+  return due <= localDateKey(end);
+}
+function dueDateHtml(i){
+  const overdue=!isCompletedStatus(i.status) && isDueDateOverdue(i.dueDate);
+  const label=i.dueDate ? formatDueDate(i.dueDate) : 'Set due date';
+  return '<button type="button" class="due-date' + (overdue ? ' overdue' : (!i.dueDate ? ' due-date-empty' : '')) + '" data-due-date-key="' + esc(i.key) + '" data-stop-propagation="1" title="' + esc(i.dueDate ? 'Change due date' : 'Add due date') + '"><span class="due-date-icon">▣</span> ' + esc(i.dueDate ? 'Due ' + label : label) + '</button>';
+}
+
+function isValidDueDateValue(value){
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
+}
+
+function chainDateRiskPairs(keys=null, dateOverrides=null){
+  const allowed=keys ? new Set(keys) : null;
+  const byKey=new Map(state.issues.map(i=>[i.key,i]));
+  const outgoing=new Map();
+  state.issues.forEach(i=>outgoing.set(i.key,[]));
+  (state.edges||[]).forEach(edge=>{
+    if(!outgoing.has(edge.from)) outgoing.set(edge.from,[]);
+    outgoing.get(edge.from).push(edge.to);
+  });
+  const effectiveDate=key=>{
+    if(dateOverrides && Object.prototype.hasOwnProperty.call(dateOverrides,key)) return dateOverrides[key] || '';
+    return byKey.get(key)?.dueDate || '';
+  };
+  const pairs=[];
+  const seenPairs=new Set();
+  for(const source of state.issues){
+    if(allowed && !allowed.has(source.key)) continue;
+    if(isCompletedStatus(source.status)) continue;
+    const sourceDate=effectiveDate(source.key);
+    if(!isValidDueDateValue(sourceDate)) continue;
+    const queue=[source.key], seen=new Set([source.key]);
+    while(queue.length){
+      const current=queue.shift();
+      for(const targetKey of (outgoing.get(current)||[])){
+        if(seen.has(targetKey)) continue;
+        seen.add(targetKey);
+        queue.push(targetKey);
+        if(allowed && !allowed.has(targetKey)) continue;
+        const target=byKey.get(targetKey);
+        if(!target || isCompletedStatus(target.status)) continue;
+        const targetDate=effectiveDate(targetKey);
+        if(!isValidDueDateValue(targetDate) || targetDate>=sourceDate) continue;
+        const pairId=source.key+'>'+targetKey;
+        if(seenPairs.has(pairId)) continue;
+        seenPairs.add(pairId);
+        pairs.push({source:source.key,target:targetKey,sourceDate,targetDate});
+      }
+    }
+  }
+  return pairs;
+}
+
+function highlightSelectedChainDateRisks(){
+  board.querySelectorAll('.due-date.chain-date-risk').forEach(el=>el.classList.remove('chain-date-risk'));
+  board.querySelectorAll('.card.chain-date-risk-card').forEach(el=>el.classList.remove('chain-date-risk-card'));
+  if(!state.lockedKey) return;
+  const visibleKeys=activeSelectionChain(state.lockedKey);
+  const pairs=chainDateRiskPairs(visibleKeys);
+  if(!pairs.length) return;
+  const details=new Map();
+  pairs.forEach(pair=>{
+    if(!details.has(pair.source)) details.set(pair.source,[]);
+    if(!details.has(pair.target)) details.set(pair.target,[]);
+    details.get(pair.source).push(pair.target+' is due '+formatDueDate(pair.targetDate)+' before this '+formatDueDate(pair.sourceDate)+' date');
+    details.get(pair.target).push('Due '+formatDueDate(pair.targetDate)+' before '+pair.source+' ('+formatDueDate(pair.sourceDate)+')');
+  });
+  details.forEach((messages,key)=>{
+    const card=board.querySelector('.card[data-key="'+CSS.escape(key)+'"]');
+    const due=card?.querySelector('.due-date');
+    if(!card || !due) return;
+    card.classList.add('chain-date-risk-card');
+    due.classList.add('chain-date-risk');
+    const unique=[...new Set(messages)];
+    due.title='Chain date risk: '+unique.join('; ')+'. Click to change due date.';
+    due.setAttribute('aria-label',(due.textContent||'Due date').trim()+'. Chain date risk. '+unique.join('; '));
+  });
 }
 
 // ── Card HTML ─────────────────────────────────────────────────────────────
@@ -3079,7 +3434,8 @@ function cardHtml(i, searchTerm){
 
   const searchIndex = buildSearchIndex(i);
   const isCompleted = isCompletedStatus(i.status);
-  return '<article class="card' + (i.cycle ? ' cycle' : '') + (isExternal ? ' external' : '') + (isCompleted ? ' completed' : '') + '" data-key="' + esc(i.key) + '" data-assignee-account-id="' + esc(i.assigneeAccountId || '') + '" data-search-index="' + esc(searchIndex) + '" data-summary="' + esc(i.summary || '') + '">'
+  const isOverdue = !isCompleted && isDueDateOverdue(i.dueDate);
+  return '<article class="card' + (i.cycle ? ' cycle' : '') + (isExternal ? ' external' : '') + (isCompleted ? ' completed' : '') + (isOverdue ? ' overdue-card' : '') + '" data-key="' + esc(i.key) + '" data-assignee-account-id="' + esc(i.assigneeAccountId || '') + '" data-due-date="' + esc(i.dueDate || '') + '" data-completed="' + (isCompleted ? '1' : '0') + '" data-search-index="' + esc(searchIndex) + '" data-summary="' + esc(i.summary || '') + '">'
     + (isMilestone ? '<div class="milestone-banner">MILESTONE</div>' : '')
     + '<div class="card-top">'
     +   '<div class="card-top-left">'
@@ -3091,10 +3447,180 @@ function cardHtml(i, searchTerm){
     + '</div>'
     + epicHtml
     + '<div class="summary">' + summaryHtml + '</div>'
-    + assigneeSelect
+    + '<div class="card-meta">' + assigneeSelect + dueDateHtml(i) + '</div>'
     + relationHtml(i)
    
     + '</article>';
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+function dashboardRiskInfo(issues){
+  const active=issues.filter(i => !isCompletedStatus(i.status));
+  const overdue=active.filter(i=>isDueDateOverdue(i.dueDate));
+  const unassigned=active.filter(i=>!i.assigneeAccountId);
+  const noDueDate=active.filter(i=>!i.dueDate);
+
+  // Flag a ticket when a downstream ticket is due before an upstream ticket.
+  // Compare every reachable upstream/downstream pair, not just direct links.
+  const byKey=new Map(active.map(i=>[i.key,i]));
+  const downstream=new Map();
+  active.forEach(i=>downstream.set(i.key,(i.blocked||[]).filter(k=>byKey.has(k))));
+  const chainDateRiskKeys=new Set();
+  const chainDateRiskDetails=new Map();
+  active.forEach(source=>{
+    const sourceDate=source.dueDate ? new Date(source.dueDate+'T00:00:00') : null;
+    if(!sourceDate || Number.isNaN(sourceDate.getTime())) return;
+    const queue=[source.key], seen=new Set([source.key]);
+    while(queue.length){
+      const key=queue.shift();
+      for(const next of (downstream.get(key)||[])){
+        if(seen.has(next)) continue;
+        seen.add(next); queue.push(next);
+        const target=byKey.get(next);
+        const targetDate=target?.dueDate ? new Date(target.dueDate+'T00:00:00') : null;
+        if(targetDate && !Number.isNaN(targetDate.getTime()) && targetDate < sourceDate){
+          chainDateRiskKeys.add(target.key);
+          if(!chainDateRiskDetails.has(target.key)) chainDateRiskDetails.set(target.key,[]);
+          chainDateRiskDetails.get(target.key).push({earlier:source.key,date:source.dueDate});
+        }
+      }
+    }
+  });
+  const chainDateRisks=active.filter(i=>chainDateRiskKeys.has(i.key));
+
+  // Detect circular dependency chains using DFS. A ticket is counted once even
+  // if it participates in more than one cycle. The health score uses the
+  // proportion of active tickets affected by each problem area.
+  const circularKeys=new Set();
+  const visitState=new Map();
+  const stack=[];
+  function visit(key){
+    const stateValue=visitState.get(key)||0;
+    if(stateValue===1){
+      const idx=stack.indexOf(key);
+      if(idx>=0) stack.slice(idx).forEach(k=>circularKeys.add(k));
+      circularKeys.add(key);
+      return;
+    }
+    if(stateValue===2) return;
+    visitState.set(key,1);
+    stack.push(key);
+    for(const next of (downstream.get(key)||[])) visit(next);
+    stack.pop();
+    visitState.set(key,2);
+  }
+  active.forEach(i=>visit(i.key));
+  const circularDependencies=active.filter(i=>circularKeys.has(i.key));
+
+  const totalActive=active.length;
+  // Front-load urgent delivery risks so the first occurrence has an immediate,
+  // visible impact, then increase the deduction on a square-root curve as more
+  // tickets are affected. Other hygiene deductions remain proportional.
+  function frontLoadedDeduction(count,total,maxPoints,firstHitPoints){
+    if(!count || !total) return 0;
+    if(total<=1 || count>=total) return maxPoints;
+    const additionalShare=Math.sqrt((count-1)/(total-1));
+    return Math.min(maxPoints,firstHitPoints+(maxPoints-firstHitPoints)*additionalShare);
+  }
+  const overdueDeduction=frontLoadedDeduction(overdue.length,totalActive,55,8);
+  const unassignedDeduction=totalActive ? (unassigned.length/totalActive)*20 : 0;
+  const noDueDateDeduction=totalActive ? (noDueDate.length/totalActive)*15 : 0;
+  const circularDeduction=totalActive ? (circularDependencies.length/totalActive)*7 : 0;
+  const chainDateDeduction=frontLoadedDeduction(chainDateRisks.length,totalActive,10,5);
+  const boardHealthScore=totalActive ? Math.max(0,Math.min(100,100-overdueDeduction-unassignedDeduction-noDueDateDeduction-circularDeduction-chainDateDeduction)) : 100;
+  const boardHealthStatus=boardHealthScore>=90 ? 'green' : boardHealthScore>=70 ? 'amber' : 'red';
+
+  return {
+    active,overdue,unassigned,noDueDate,chainDateRisks,chainDateRiskKeys,chainDateRiskDetails,
+    circularDependencies,circularKeys,
+    boardHealthScore,boardHealthStatus,
+    boardHealthBreakdown:{
+      overdue:{weight:55,count:overdue.length,deduction:overdueDeduction},
+      unassigned:{weight:20,count:unassigned.length,deduction:unassignedDeduction},
+      noDueDate:{weight:15,count:noDueDate.length,deduction:noDueDateDeduction},
+      circular:{weight:7,count:circularDependencies.length,deduction:circularDeduction},
+      chainDates:{weight:10,count:chainDateRisks.length,deduction:chainDateDeduction}
+    }
+  };
+}
+function dashboardAssigneeOptions(i){
+  const assignees=[...new Map(state.issues.filter(x=>x.assigneeAccountId).map(x=>[x.assigneeAccountId,{name:x.assignee||'Unassigned',accountId:x.assigneeAccountId}])).values()]
+    .sort((a,b)=>a.name.localeCompare(b.name));
+  return '<select class="assignee-select dashboard-assignee-select' + (!i.assigneeAccountId?' unassigned':'') + '" data-field="assignee" data-stop-propagation="1" title="Change assignee"><option value="">Unassigned</option>'+
+    assignees.map(a=>'<option value="'+esc(a.accountId)+'"'+(a.accountId===(i.assigneeAccountId||'')?' selected':'')+'>'+esc(a.name)+'</option>').join('')+
+    '</select>';
+}
+function dashboardPriorityHtml(i){
+  const options=PRIORITY_ORDER.filter((p,idx,arr)=>arr.indexOf(p)===idx).map(p=>
+    '<button type="button" class="priority-option'+(p===i.priority?' selected':'')+'" data-priority="'+esc(p)+'" data-stop-propagation="1">'+priorityIconHtml(p)+'<span>'+esc(p)+'</span></button>'
+  ).join('');
+  return '<span class="priority-picker" data-stop-propagation="1" title="Change priority">'+
+    '<button type="button" class="priority-trigger" data-stop-propagation="1" aria-label="Change priority" aria-haspopup="true" aria-expanded="false">'+priorityIconHtml(i.priority)+'</button>'+
+    '<span class="priority-menu" role="menu">'+options+'</span></span>';
+}
+function dashboardTicketHtml(i, risks){
+  const overdue=isDueDateOverdue(i.dueDate);
+  const chainRisk=risks.chainDateRiskKeys?.has(i.key);
+  const riskDetails=risks.chainDateRiskDetails?.get(i.key)||[];
+  const chainTitle=chainRisk ? 'Due before an earlier ticket in its dependency chain: '+riskDetails.map(x=>x.earlier+' ('+formatDueDate(x.date)+')').join(', ') : '';
+  const riskHtml='<div class="dashboard-risks">'+(overdue?'<span class="dashboard-risk overdue">Overdue</span>':'')+(chainRisk?'<span class="dashboard-risk chain-date-risk" title="'+esc(chainTitle)+'">Due-date chain risk</span>':'')+(!i.assigneeAccountId?'<span class="dashboard-risk unassigned">Unassigned</span>':'')+'</div>';
+  return '<article class="dashboard-ticket'+(overdue?' overdue':'')+(chainRisk?' chain-date-risk':'')+'" data-dashboard-key="'+esc(i.key)+'" data-key="'+esc(i.key)+'">'+
+    riskHtml+
+    '<div class="dashboard-ticket-top"><div class="dashboard-ticket-key-wrap">'+dashboardPriorityHtml(i)+'<a class="dashboard-ticket-key" href="'+esc(i.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(i.key)+'">'+esc(i.key)+'</a></div></div>'+ 
+    '<div class="dashboard-ticket-summary">'+esc(i.summary||'')+'</div>'+ 
+    '<div class="dashboard-ticket-controls">'+dashboardAssigneeOptions(i)+dueDateHtml(i)+'</div>'+ 
+  '</article>';
+}
+function dashboardSection(title,items,risks){
+  return '<section class="dashboard-section"><div class="dashboard-section-head"><span class="dashboard-section-title">'+esc(title)+'</span><span class="dashboard-section-count">'+items.length+'</span></div>'+
+    (items.length?'<div class="dashboard-grid">'+items.map(i=>dashboardTicketHtml(i,risks)).join('')+'</div>':'<div class="dashboard-empty">None currently.</div>')+'</section>';
+}
+function dashboardOverviewHtml(){
+  const risks=dashboardRiskInfo(state.displayIssues||[]);
+  const h=risks.boardHealthBreakdown;
+  const score=Math.round(risks.boardHealthScore);
+  const statusLabel=risks.boardHealthStatus==='green'?'Healthy':risks.boardHealthStatus==='amber'?'Needs attention':'At risk';
+  const healthRows=[
+    {label:'Overdue tickets',detail:risks.overdue.length+' affected · max '+h.overdue.weight+' pts',deduction:h.overdue.deduction},
+    {label:'Unassigned tickets',detail:risks.unassigned.length+' affected · max '+h.unassigned.weight+' pts',deduction:h.unassigned.deduction},
+    {label:'Missing due dates',detail:risks.noDueDate.length+' affected · max '+h.noDueDate.weight+' pts',deduction:h.noDueDate.deduction},
+    {label:'Circular dependencies',detail:risks.circularDependencies.length+' affected · max '+h.circular.weight+' pts',deduction:h.circular.deduction},
+    {label:'Chain date risks',detail:risks.chainDateRisks.length+' affected · max '+h.chainDates.weight+' pts',deduction:h.chainDates.deduction}
+  ];
+  const healthDetail=healthRows.map(row=>'<div class="dashboard-health-row"><span class="dashboard-health-row-label">'+esc(row.label)+'</span><span class="dashboard-health-row-detail">'+esc(row.detail)+'</span><strong>'+ (row.deduction>0 ? '−'+row.deduction.toFixed(1)+' pts' : '0 pts') +'</strong></div>').join('');
+  return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Dependency dashboard</div><div class="dashboard-subtitle">Overdue, unassigned and dependency chain date risks.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+ 
+    '<div class="dashboard-stats">'+
+      '<div class="dashboard-stat dashboard-health-stat '+risks.boardHealthStatus+'"><div class="dashboard-health-score-line"><div class="dashboard-stat-value">'+score+'%</div><span class="dashboard-health-status">'+statusLabel+'</span></div><div class="dashboard-stat-label">Board health</div><div class="dashboard-stat-help">100% starts healthy. Overdue and chain-date deductions are front-loaded, so the first affected ticket removes 8 and 5 points respectively; further deductions rise quickly up to 55 and 10 points. Other deductions remain proportional: unassigned (20%), no due date (15%) and circular dependencies (7%).</div><div class="dashboard-health-breakdown">'+healthDetail+'</div></div>'+
+      '<div class="dashboard-stat risk"><div class="dashboard-stat-value">'+risks.overdue.length+'</div><div class="dashboard-stat-label">Overdue</div><div class="dashboard-stat-help">Active tickets whose due date has passed.</div></div>'+ 
+      '<div class="dashboard-stat"><div class="dashboard-stat-value">'+risks.unassigned.length+'</div><div class="dashboard-stat-label">Unassigned</div><div class="dashboard-stat-help">Active tickets with no assignee.</div></div>'+ 
+      '<div class="dashboard-stat"><div class="dashboard-stat-value">'+risks.chainDateRisks.length+'</div><div class="dashboard-stat-label">Chain date risks</div><div class="dashboard-stat-help">A later ticket is due before an earlier ticket in its chain.</div></div>'+ 
+    '</div>'+ 
+    dashboardSection('Overdue tickets',risks.overdue,risks)+
+    dashboardSection('Unassigned tickets',risks.unassigned,risks)+
+    dashboardSection('Dependency chain date risks',risks.chainDateRisks,risks)+
+  '</div>';
+}
+function renderDashboard(){
+  // Keep the persistent dependency-line SVG in the board. Dashboard mode hides
+  // it with CSS; returning to a chain view can then redraw into the same canvas.
+  board.insertAdjacentHTML('beforeend', dashboardOverviewHtml());
+
+  // Dashboard tickets are rendered separately from the normal board, so the
+  // standard event wiring does not run for them. Bind the same Jira-key modal
+  // handler here so the Settings > Jira modal preference works in Dashboard too.
+  attachTicketKeyModalHandlers(board);
+  // Reuse the normal field event wiring so dashboard assignee, due-date and
+  // priority changes enter the same staged Jira save queue as the main board.
+  attachEvents();
+
+  board.querySelectorAll('[data-dashboard-key]').forEach(el=>{
+    el.addEventListener('click',e=>{
+      if(e.target.closest('[data-stop-propagation]')) return;
+      const key=el.dataset.dashboardKey;
+      if(!key) return;
+      state.showDashboard=false; state.showMilestones=false; state.lockedKey=key; state.selectionHistory=[]; state.showBlocked=false; render();
+    });
+  });
 }
 
 // ── Milestone overview ───────────────────────────────────────────────────
@@ -3254,6 +3780,7 @@ function milestoneCardHtml(i){
       (i.status ? '<span class="status-badge" style="' + statusStyle(i.status) + '">' + esc(i.status) + '</span>' : '') +
     '</div>' + epicHtml +
     '<div class="summary">' + esc(i.summary) + '</div>' +
+    '<div class="card-meta">' + dueDateHtml(i) + '</div>' +
   '</article>';
 }
 
@@ -3357,6 +3884,7 @@ function renderMilestoneOverview(flashKey){
       state.filterUser = '';
       state.includeWithRemarkable = true;
       searchEl.value = '';
+      updateSearchClearButton();
       saveFilterPreferences();
       state.showMilestones = false;
       state.lockedKey = key;
@@ -3422,19 +3950,39 @@ function render(){
   const searchSelectionEnd = searchEl ? searchEl.selectionEnd : null;
 
   document.querySelectorAll('.priority-picker.open').forEach(closePriorityPicker);
-  [...board.querySelectorAll('.column, .milestone-overview, .no-active-user, .no-results')].forEach(x => x.remove());
+  // Remove the previous SVG dimensions first: otherwise its old width can be
+  // included in the next board measurement and preserve stale horizontal space.
+  resetDependencyLineCanvas();
+  [...board.querySelectorAll('.column, .milestone-overview, .dashboard, .no-active-user, .no-results')].forEach(x => x.remove());
   if(state.completedDownloadStatus === 'ready' || !state.showCompleted) hideCompletedDownloadNotice();
   board.classList.toggle('milestone-board', state.showMilestones);
+  board.classList.toggle('dashboard-board', state.showDashboard);
   document.getElementById('app').classList.toggle('milestone-mode', state.showMilestones);
-  lines.innerHTML = '';
-
+  document.getElementById('app').classList.toggle('dashboard-mode', state.showDashboard);
   // Rebuild display data honoring the completed toggle
   computeDisplayData();
+  console.debug('Dependency graph render', {issues:state.displayIssues.length, edges:state.displayEdges.length, selected:state.lockedKey});
 
   // Sync filter controls
   populateFilterUsers();
   updateFilterControls();
-  toggleMilestonesBtn.classList.toggle('active', state.showMilestones);
+  document.querySelectorAll('.view-switch').forEach(btn => btn.classList.toggle('active', btn.dataset.view === (state.showDashboard ? 'dashboard' : state.showMilestones ? 'milestone' : 'default')));
+
+  if(state.showDashboard){
+    state.lockedKey = null;
+    state.selectionHistory = [];
+    state.showBlocked = false;
+    document.getElementById('app').classList.remove('locked');
+    searchWrap.style.visibility = 'hidden';
+    if(filterMenu) filterMenu.classList.remove('open');
+    if(filtersBtn) filtersBtn.style.visibility = 'hidden';
+    if(clearFiltersBtn) clearFiltersBtn.style.visibility = 'hidden';
+    deselectBtn.classList.remove('visible');
+    if(milestoneBackBtn) milestoneBackBtn.classList.remove('visible');
+    renderDashboard();
+    statusText.textContent = 'Dashboard';
+    return;
+  }
 
   // Milestone overview is a separate horizontal board mode. It clears selection
   // and intentionally does not render the normal dependency columns.
@@ -3580,11 +4128,21 @@ function render(){
     board.appendChild(col);
   }
 
+  // The dashboard changes the board display model and can leave the first
+  // post-transition layout pass with stale card geometry. Redraw after the
+  // layout has settled at several points so returning Dashboard -> Chain
+  // cannot permanently leave the SVG paths missing.
   requestAnimationFrame(() => {
     spaceLongRoutes();
     requestAnimationFrame(() => {
       drawLines();
       attachEvents();
+      requestAnimationFrame(() => {
+        drawLines();
+        requestAnimationFrame(drawLines);
+      });
+      setTimeout(drawLines, 60);
+      setTimeout(drawLines, 180);
       scheduleMiniMapUpdate();
     });
   });
@@ -3592,6 +4150,7 @@ function render(){
   // Restore search focus/caret after a genuine board rebuild (refresh, toggle,
   // selection change, etc.). Typing itself no longer rebuilds the board.
   if(searchEl && searchEl.value !== searchValue) searchEl.value = searchValue;
+  updateSearchClearButton();
   if(searchWasFocused){
     searchEl.focus({preventScroll:true});
     if(searchSelectionStart != null && searchSelectionEnd != null){
@@ -3612,7 +4171,9 @@ function render(){
 
 // ── Board mini-map ────────────────────────────────────────────────────────
 let minimapFrame = 0;
+let minimapScrollFrame = 0;
 let minimapDrag = null;
+let minimapMetrics = null;
 
 function scheduleMiniMapUpdate(){
   if(minimapFrame) return;
@@ -3622,6 +4183,35 @@ function scheduleMiniMapUpdate(){
   });
 }
 
+// Scrolling only changes the minimap viewport rectangle. Rebuilding every
+// minimap card/column during a scroll frame is unnecessarily expensive.
+function scheduleMiniMapScrollUpdate(){
+  if(minimapScrollFrame) return;
+  minimapScrollFrame = requestAnimationFrame(() => {
+    minimapScrollFrame = 0;
+    updateMiniMapViewport();
+  });
+}
+
+function updateMiniMapViewport(){
+  if(!boardMinimap || !boardMinimapViewport || !minimapMetrics) return;
+  const app = document.getElementById('app');
+  if(!app || !boardMinimap.classList.contains('visible')) return;
+
+  const {boardWidth, boardHeight, scale, offsetX, offsetY} = minimapMetrics;
+  const maxLeft = Math.max(0, boardWidth - app.clientWidth);
+  const maxTop = Math.max(0, boardHeight - app.clientHeight);
+  const viewW = Math.min(app.clientWidth, boardWidth);
+  const viewH = Math.min(app.clientHeight, boardHeight);
+
+  boardMinimapViewport.style.width = Math.max(viewW * scale, 8) + 'px';
+  boardMinimapViewport.style.height = Math.max(viewH * scale, 8) + 'px';
+  boardMinimapViewport.style.left =
+    (offsetX + Math.min(app.scrollLeft, maxLeft) * scale) + 'px';
+  boardMinimapViewport.style.top =
+    (offsetY + Math.min(app.scrollTop, maxTop) * scale) + 'px';
+}
+
 function updateMiniMap(){
   if(!boardMinimap || !boardMinimapStage || !boardMinimapContent || !boardMinimapViewport) return;
 
@@ -3629,6 +4219,7 @@ function updateMiniMap(){
   // normal home board or in milestone view.
   if(state.showMiniMap === false || !state.lockedKey || state.showMilestones ||
      board.classList.contains('milestone-board')){
+    minimapMetrics = null;
     boardMinimap.classList.remove('visible');
     return;
   }
@@ -3636,12 +4227,12 @@ function updateMiniMap(){
   const app = document.getElementById('app');
   if(!app) return;
 
-  const boardRect = board.getBoundingClientRect();
   const boardWidth = Math.max(board.scrollWidth, board.clientWidth);
   const boardHeight = Math.max(board.scrollHeight, board.clientHeight);
   const canScroll = boardWidth > app.clientWidth + 2 || boardHeight > app.clientHeight + 2;
 
   if(!canScroll){
+    minimapMetrics = null;
     boardMinimap.classList.remove('visible');
     return;
   }
@@ -3657,6 +4248,8 @@ function updateMiniMap(){
   const mapH = boardHeight * scale;
   const offsetX = (stageW - mapW) / 2;
   const offsetY = (stageH - mapH) / 2;
+
+  minimapMetrics = {boardWidth, boardHeight, scale, offsetX, offsetY};
 
   boardMinimapContent.style.width = boardWidth + 'px';
   boardMinimapContent.style.height = boardHeight + 'px';
@@ -3699,7 +4292,9 @@ function updateMiniMap(){
     const key = card.dataset.key;
     const issue = state.displayIssues.find(i => i.key === key) || state.issues.find(i => i.key === key);
     const isMilestone = !!issue && (issue.labels || []).some(label => String(label).toLowerCase() === 'milestone');
+    const isOverdue = !!issue && isDueDateOverdue(issue.dueDate);
     if(isMilestone) el.classList.add('milestone');
+    if(isOverdue) el.classList.add('overdue');
     if(state.lockedKey && key === state.lockedKey) el.classList.add('selected');
     if(state.hoverLockKey && key === state.hoverLockKey) el.classList.add('highlight-locked');
     if(card.classList.contains('hover-dimmed')) el.classList.add('dimmed');
@@ -3804,8 +4399,8 @@ boardMinimap?.addEventListener('pointerdown', miniMapPointerDown);
 boardMinimap?.addEventListener('pointermove', miniMapPointerMove);
 boardMinimap?.addEventListener('pointerup', miniMapPointerUp);
 boardMinimap?.addEventListener('pointercancel', miniMapPointerUp);
-document.getElementById('app')?.addEventListener('scroll', scheduleMiniMapUpdate, {passive:true});
-board?.addEventListener('scroll', scheduleMiniMapUpdate, true);
+document.getElementById('app')?.addEventListener('scroll', scheduleMiniMapScrollUpdate, {passive:true});
+board?.addEventListener('scroll', scheduleMiniMapScrollUpdate, true);
 window.addEventListener('resize', scheduleMiniMapUpdate);
 
 // ── Geometry ──────────────────────────────────────────────────────────────
@@ -3830,19 +4425,75 @@ function spaceLongRoutes(){
   }
 }
 
-function drawLines(){
-  lines.innerHTML = '';
+function resetDependencyLineCanvas(){
+  // An absolutely-positioned SVG can still contribute to the scrollable
+  // overflow area. Reset it before measuring a newly selected chain so an old,
+  // wider line canvas cannot leave blank space to the right.
+  lines.replaceChildren();
+  lines.removeAttribute('width');
+  lines.removeAttribute('height');
+  lines.removeAttribute('viewBox');
+  lines.style.left = '0px';
+  lines.style.top = '0px';
+  lines.style.right = 'auto';
+  lines.style.bottom = 'auto';
+  lines.style.width = '0px';
+  lines.style.height = '0px';
+}
 
-  // Dependency lines only exist while an item is selected.
-  if(!state.lockedKey) return;
-
+function dependencyCanvasSize(){
   const br = board.getBoundingClientRect();
-  // Use the board's actual rendered dimensions rather than scrollWidth/
-  // scrollHeight. The latter can include the SVG itself, creating a feedback
-  // loop where an old line canvas makes the chain permanently larger.
-  const W = board.clientWidth, H = board.clientHeight;
+  const boardStyle = getComputedStyle(board);
+  const padRight = parseFloat(boardStyle.paddingRight) || 0;
+  const padBottom = parseFloat(boardStyle.paddingBottom) || 0;
+  const content = [...board.querySelectorAll(':scope > .column')];
+  let right = br.left + board.clientWidth;
+  let bottom = br.top + board.clientHeight;
+  for(const element of content){
+    const rect = element.getBoundingClientRect();
+    right = Math.max(right, rect.right + padRight);
+    bottom = Math.max(bottom, rect.bottom + padBottom);
+  }
+  return {
+    width: Math.max(board.clientWidth, Math.ceil(right - br.left)),
+    height: Math.max(board.clientHeight, Math.ceil(bottom - br.top)),
+  };
+}
+
+function clampBoardScroll(){
+  const app = document.getElementById('app');
+  if(!app) return;
+  const maxLeft = Math.max(0, app.scrollWidth - app.clientWidth);
+  const maxTop = Math.max(0, app.scrollHeight - app.clientHeight);
+  if(app.scrollLeft > maxLeft) app.scrollLeft = maxLeft;
+  if(app.scrollTop > maxTop) app.scrollTop = maxTop;
+}
+
+function drawLines(){
+  resetDependencyLineCanvas();
+  if(!state.lockedKey) {
+    clampBoardScroll();
+    return;
+  }
+
+  // Measure only the rendered columns. Measuring board.scrollWidth while the
+  // previous SVG is still sized can create a self-sustaining overflow width.
+  const br = board.getBoundingClientRect();
+  const canvas = dependencyCanvasSize();
+  const W = canvas.width;
+  const H = canvas.height;
   if(!W || !H) return;
-  lines.setAttribute('width', W); lines.setAttribute('height', H);
+
+  // Set an explicit pixel canvas. The SVG has inset:0 in CSS, and percentage
+  // sizing can resolve against a transient layout size during view changes.
+  lines.style.left = '0px';
+  lines.style.top = '0px';
+  lines.style.right = 'auto';
+  lines.style.bottom = 'auto';
+  lines.style.width = W + 'px';
+  lines.style.height = H + 'px';
+  lines.setAttribute('width', W);
+  lines.setAttribute('height', H);
   lines.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
 
   const ns = 'http://www.w3.org/2000/svg';
@@ -3856,9 +4507,23 @@ function drawLines(){
   const colOf = el => { const c = el.closest('.column'); return c ? colEls.indexOf(c) : -1; };
 
   const lockedChain = activeSelectionChain(state.lockedKey);
-  const edges = state.displayEdges.filter(e =>
+  let edges = (state.displayEdges || []).filter(e =>
     lockedChain.has(e.from) && lockedChain.has(e.to)
   );
+
+  // displayEdges can briefly be empty during a refresh/rebuild. Fall back to
+  // the blocker relationships already present on the rendered issues so the
+  // selected dependency chain still gets its lines.
+  if(!edges.length){
+    const derived = [];
+    for(const issue of state.displayIssues || []){
+      if(!lockedChain.has(issue.key)) continue;
+      for(const blocker of (issue.blockers || [])){
+        if(lockedChain.has(blocker)) derived.push({from:blocker,to:issue.key});
+      }
+    }
+    edges = derived;
+  }
   if(!edges.length) return;
 
   const cards = new Map();
@@ -3873,9 +4538,8 @@ function drawLines(){
     return {x:r.right - br.left, y:r.top + 30 - br.top};
   };
 
-  // Each dependency is a complete individual path:
-  // horizontal spoke → vertical leg → horizontal arrow.
-  // No shared vertical bus is used.
+  // Route the vertical leg through the whitespace gap immediately after the
+  // source column. This keeps the line out of cards in the columns.
   edges.forEach(e => {
     const source = cards.get(e.from);
     const target = cards.get(e.to);
@@ -3888,9 +4552,11 @@ function drawLines(){
     const s = exit_(source);
     const t = entry(target);
     const nextCol = colEls[fromCol + 1];
-    const routeX = nextCol
-      ? ((source.getBoundingClientRect().right + nextCol.getBoundingClientRect().left) / 2) - br.left
-      : s.x + 18;
+    if(!nextCol) return;
+
+    const sr = source.getBoundingClientRect();
+    const nr = nextCol.getBoundingClientRect();
+    const routeX = ((sr.right + nr.left) / 2) - br.left;
 
     const d = 'M ' + s.x + ' ' + s.y
       + ' L ' + routeX + ' ' + s.y
@@ -3905,10 +4571,9 @@ function drawLines(){
     path.setAttribute('marker-end', 'url(#arrow)');
     lines.appendChild(path);
   });
-
+  clampBoardScroll();
 }
 
-// ── Dependency creation modal ─────────────────────────────────────────────
 const dependencyModal = document.getElementById('dependency-modal');
 const depA = document.getElementById('dep-issue-a');
 const depBSearch = document.getElementById('dep-issue-b-search');
@@ -4203,7 +4868,7 @@ function attachTicketKeyModalHandlers(root=document){
       const hrefKey=decodeURIComponent((new URL(href,window.location.href).pathname.split('/').filter(Boolean).pop() || ''));
       const key=(link.dataset.issueKey || hrefKey || link.textContent.trim()).toUpperCase();
       const issue=state.issues.find(i => i.key === key);
-      const card=link.closest('.card');
+      const card=link.closest('.card, .dashboard-ticket');
       const summary=issue?.summary || (card ? (card.querySelector('.summary')?.textContent.trim() || '') : '') || link.title || '';
       openTicketPreviewModal(key,href,summary);
     });
@@ -4218,6 +4883,14 @@ document.addEventListener('keydown', e => {
 });
 
 document.querySelectorAll('[data-action="escape"]').forEach(btn => {
+  if(btn.getAttribute('role') === 'button'){
+    btn.addEventListener('keydown', e => {
+      if(e.key === 'Enter' || e.key === ' '){
+        e.preventDefault();
+        btn.click();
+      }
+    });
+  }
   btn.addEventListener('click', () => {
     clearHoverLock();
     closeTicketPreviewModal();
@@ -4229,7 +4902,7 @@ document.querySelectorAll('[data-action="escape"]').forEach(btn => {
       state.scrollPositions[mode] = {appLeft:0, appTop:0, columns:{}};
     });
 
-    if(state.showMilestones || state.showBlocked || state.lockedKey){
+    if(state.showMilestones || state.showDashboard || state.showBlocked || state.lockedKey){
       // Home returns to the normal board view, but it must not change filters.
       // If a card was selected, restore the filters that were active before the
       // selection temporarily hid them for the dependency-chain view.
@@ -4238,9 +4911,9 @@ document.querySelectorAll('[data-action="escape"]').forEach(btn => {
         : null;
       if(homeFilterSnapshot) restoreFilterSnapshot(homeFilterSnapshot);
 
-      // Home from any alternate view must return to the normal default board,
-      // not simply reset the horizontal scroll position of the current view.
-      state.showMilestones = false;
+      // Home always returns to the configured starting board view.
+      state.showMilestones = state.startingView === 'milestone';
+      state.showDashboard = state.startingView === 'dashboard';
       state.showBlocked = false;
       state.lockedKey = null;
       state.selectionHistory = [];
@@ -4276,6 +4949,172 @@ document.querySelectorAll('[data-action="escape"]').forEach(btn => {
     });
   });
 });
+
+function openDueDateModal(key){
+  const issue=state.issues.find(i=>i.key===key);
+  if(!issue || !dueDateModal) return;
+  dueDateKey.textContent=key + (issue.summary ? ' · ' + issue.summary : '');
+  dueDateInput.value=issue.dueDate || '';
+  dueDateModal.dataset.key=key;
+  dueDateModal.classList.add('open');
+  requestAnimationFrame(()=>{ dueDateInput.focus(); try{ dueDateInput.showPicker?.(); }catch(_){} });
+}
+function closeDueDateModal(){ if(dueDateModal) dueDateModal.classList.remove('open'); }
+
+function reachableChainIssues(startKey, direction){
+  const byKey=new Map(state.issues.map(i=>[i.key,i]));
+  const adjacent=new Map();
+  state.issues.forEach(i=>adjacent.set(i.key,[]));
+  for(const edge of state.edges){
+    const from=direction==='downstream' ? edge.from : edge.to;
+    const to=direction==='downstream' ? edge.to : edge.from;
+    if(!adjacent.has(from)) adjacent.set(from,[]);
+    adjacent.get(from).push(to);
+  }
+  const result=[], queue=[startKey], seen=new Set([startKey]);
+  while(queue.length){
+    const current=queue.shift();
+    for(const next of (adjacent.get(current)||[])){
+      if(seen.has(next)) continue;
+      seen.add(next);
+      queue.push(next);
+      const issue=byKey.get(next);
+      if(issue) result.push(issue);
+    }
+  }
+  return result;
+}
+
+function dueDateChainRisks(key, proposedDate, overrides=null){
+  if(!isValidDueDateValue(proposedDate)) return {downstream:[],upstream:[]};
+  const effectiveDate=issue=>{
+    if(overrides && Object.prototype.hasOwnProperty.call(overrides,issue.key)) return overrides[issue.key] || '';
+    return issue.dueDate || '';
+  };
+  const dated=items=>items.map(i=>Object.assign({},i,{riskDueDate:effectiveDate(i)})).filter(i=>isValidDueDateValue(i.riskDueDate));
+  const sortRisks=items=>items.sort((a,b)=>(a.riskDueDate||'').localeCompare(b.riskDueDate||'') || a.key.localeCompare(b.key));
+  return {
+    downstream:sortRisks(dated(reachableChainIssues(key,'downstream')).filter(i=>i.riskDueDate < proposedDate)),
+    upstream:sortRisks(dated(reachableChainIssues(key,'upstream')).filter(i=>i.riskDueDate > proposedDate))
+  };
+}
+
+function chainDateIssueLink(issue){
+  const url=issue?.url || (CFG.jiraBaseUrl ? CFG.jiraBaseUrl+'/browse/'+encodeURIComponent(issue.key) : '#');
+  return '<a class="chain-date-warning-key" href="'+esc(url)+'" target="_blank" rel="noopener noreferrer" data-issue-key="'+esc(issue.key)+'">'+esc(issue.key)+'</a>';
+}
+
+function chainDateDateInput(key, value){
+  return '<input class="chain-date-warning-date" type="date" value="'+esc(value||'')+'" data-chain-risk-date-key="'+esc(key)+'" aria-label="Due date for '+esc(key)+'">';
+}
+
+function chainDateRiskTable(items){
+  return '<table class="chain-date-warning-table"><thead><tr><th>Key</th><th>Summary</th><th>Due date</th></tr></thead><tbody>'+
+    items.map(i=>'<tr><td>'+chainDateIssueLink(i)+'</td><td>'+esc(i.summary||'')+'</td><td>'+chainDateDateInput(i.key,i.riskDueDate||i.dueDate||'')+'</td></tr>').join('')+
+    '</tbody></table>';
+}
+
+function renderChainDateWarning(){
+  if(!pendingDueDateChange || !chainDateWarningContent) return;
+  const drafts=pendingDueDateChange.drafts || {};
+  const changed=Object.keys(drafts).map(key=>{
+    const issue=state.issues.find(i=>i.key===key);
+    return issue ? {issue,value:drafts[key]||''} : null;
+  }).filter(Boolean).filter(item=>(item.issue.dueDate||'')!==item.value);
+
+  const changesHtml=changed.length
+    ? '<section class="chain-date-warning-changes"><h3 class="chain-date-warning-changes-title">Proposed date changes</h3><table class="chain-date-warning-table"><thead><tr><th>Key</th><th>Current</th><th>Proposed</th><th></th></tr></thead><tbody>'+
+      changed.map(item=>'<tr><td>'+chainDateIssueLink(item.issue)+'</td><td class="chain-date-warning-current">'+esc(item.issue.dueDate?formatDueDate(item.issue.dueDate):'No date')+'</td><td>'+chainDateDateInput(item.issue.key,item.value)+'</td><td><button type="button" class="chain-date-warning-revert" data-chain-risk-revert="'+esc(item.issue.key)+'">Revert</button></td></tr>').join('')+
+      '</tbody></table></section>'
+    : '<div class="chain-date-warning-empty">No date changes are currently proposed.</div>';
+
+  const sections=[];
+  changed.forEach(item=>{
+    if(!isValidDueDateValue(item.value)) return;
+    const risks=dueDateChainRisks(item.issue.key,item.value,drafts);
+    if(!risks.downstream.length && !risks.upstream.length) return;
+    const groups=[];
+    if(risks.downstream.length){
+      groups.push('<div class="chain-date-warning-subsection"><p class="chain-date-warning-message">This date is later than a due date later in the chain.</p>'+chainDateRiskTable(risks.downstream)+'</div>');
+    }
+    if(risks.upstream.length){
+      groups.push('<div class="chain-date-warning-subsection"><p class="chain-date-warning-message">This date is earlier than a date earlier in the chain.</p>'+chainDateRiskTable(risks.upstream)+'</div>');
+    }
+    sections.push('<section class="chain-date-warning-section"><h3 class="chain-date-warning-section-title">('+esc(item.issue.key)+') - Chain date risk</h3>'+groups.join('')+'</section>');
+  });
+
+  const risksHtml=sections.length
+    ? sections.join('')
+    : (changed.length ? '<div class="chain-date-warning-resolved">These proposed dates no longer create a chain date risk.</div>' : '');
+  chainDateWarningContent.innerHTML=changesHtml+risksHtml;
+  const confirm=document.getElementById('chain-date-warning-confirm');
+  if(confirm) confirm.disabled=!changed.length;
+
+  chainDateWarningContent.querySelectorAll('[data-chain-risk-date-key]').forEach(input=>{
+    input.addEventListener('change',()=>{
+      const key=input.dataset.chainRiskDateKey;
+      const issue=state.issues.find(i=>i.key===key);
+      if(!issue) return;
+      const value=input.value||'';
+      if((issue.dueDate||'')===value) delete pendingDueDateChange.drafts[key];
+      else pendingDueDateChange.drafts[key]=value;
+      renderChainDateWarning();
+    });
+  });
+  chainDateWarningContent.querySelectorAll('[data-chain-risk-revert]').forEach(button=>{
+    button.addEventListener('click',()=>{
+      delete pendingDueDateChange.drafts[button.dataset.chainRiskRevert];
+      renderChainDateWarning();
+    });
+  });
+  attachTicketKeyModalHandlers(chainDateWarningContent);
+}
+
+function openChainDateWarning(key, value, risks){
+  if(!chainDateWarningModal || !chainDateWarningContent) return false;
+  if(!risks || (!risks.downstream.length && !risks.upstream.length)) return false;
+  pendingDueDateChange={primaryKey:key,drafts:{[key]:value||''}};
+  renderChainDateWarning();
+  chainDateWarningModal.classList.add('open');
+  requestAnimationFrame(()=>document.getElementById('chain-date-warning-confirm')?.focus());
+  return true;
+}
+
+function closeChainDateWarning(){
+  pendingDueDateChange=null;
+  chainDateWarningModal?.classList.remove('open');
+}
+
+function confirmChainDateChange(){
+  const change=pendingDueDateChange;
+  if(!change) return;
+  const changes=Object.entries(change.drafts||{}).map(([key,value])=>({key,value:value||null}));
+  pendingDueDateChange=null;
+  chainDateWarningModal?.classList.remove('open');
+  if(stageDueDateChanges(changes)) render();
+}
+
+function saveDueDateModal(clear=false){
+  const key=dueDateModal?.dataset.key;
+  if(!key) return;
+  const value=clear ? null : (dueDateInput.value || null);
+  const issue=state.issues.find(i=>i.key===key);
+  if(!issue || (issue.dueDate||null)===(value||null)){
+    closeDueDateModal();
+    return;
+  }
+  if(value){
+    const risks=dueDateChainRisks(key,value);
+    if(risks.downstream.length || risks.upstream.length){
+      closeDueDateModal();
+      openChainDateWarning(key,value,risks);
+      return;
+    }
+  }
+  stageIssueChange(key,'dueDate',value);
+  closeDueDateModal();
+  render();
+}
 
 function attachEvents(){
   // ── Card click (select / deselect) ──
@@ -4334,6 +5173,7 @@ function attachEvents(){
       if(!key) return;
 
       state.showMilestones = true;
+      state.showDashboard = false;
       clearHoverLock();
       state.lockedKey = null;
       state.selectionHistory = [];
@@ -4353,12 +5193,20 @@ function attachEvents(){
   board.querySelectorAll('select[data-field]').forEach(select => {
     select.addEventListener('change', e => {
       e.stopPropagation();
-      const card = select.closest('.card');
+      const card = select.closest('.card, .dashboard-ticket');
       if(!card) return;
       if(select.dataset.field === 'assignee') select.classList.toggle('unassigned', !select.value);
       stageIssueChange(card.dataset.key, select.dataset.field, select.value);
     });
     select.addEventListener('click', e => e.stopPropagation());
+  });
+
+  // ── Due date picker ──
+  board.querySelectorAll('[data-due-date-key]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.preventDefault(); e.stopPropagation();
+      openDueDateModal(btn.dataset.dueDateKey);
+    });
   });
 
   // ── Custom priority picker with Jira icons ──
@@ -4399,7 +5247,7 @@ function attachEvents(){
     picker.querySelectorAll('.priority-option').forEach(option => {
       option.addEventListener('click', e => {
         e.stopPropagation();
-        const card = picker.closest('.card');
+        const card = picker.closest('.card, .dashboard-ticket');
         if(!card) return;
         const value = option.dataset.priority;
         stageIssueChange(card.dataset.key, 'priority', value);
@@ -4447,6 +5295,7 @@ function attachEvents(){
   // and SVG together. Do not rebuild the SVG on scroll: replacing all paths
   // during scrolling causes visible flicker and briefly resets hover styling.
 
+  highlightSelectedChainDateRisks();
   updateSaveButton();
   attachTicketKeyModalHandlers();
   updateHoverLockButtons();
@@ -4457,13 +5306,17 @@ async function fetchGraph(mode, loadGeneration){
   const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(String(loadGeneration || '')), {cache:'no-store'});
   const d = await r.json();
   if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+  console.log('Jira graph loaded', {issues:(d.issues || []).length, edges:(d.edges || []).length, withDueDates:(d.issues || []).filter(i => i.dueDate).length});
   return d;
 }
 
 let completedDownloadPollTimer = null;
-async function pollCompletedDownload(loadGeneration){
+async function pollCompletedDownload(loadGeneration = state.loadGeneration){
   if(completedDownloadPollTimer) clearInterval(completedDownloadPollTimer);
-  const generation=String(loadGeneration || '');
+  // Always poll the background job belonging to the currently displayed Jira
+  // load. This also makes calls from the Show completed toggle safe.
+  loadGeneration = Number(loadGeneration);
+  const generation=String(loadGeneration);
   const poll=async()=>{
     // A newer Jira load owns the UI now. Do not let this poll touch its state.
     if(loadGeneration !== state.loadGeneration){
@@ -4494,6 +5347,10 @@ async function pollCompletedDownload(loadGeneration){
         state.levels=data.levels || 0;
         state.cleanSnapshot=cloneCleanSnapshot();
         state.completedDownloadStatus='ready';
+        // Replace the active-only board immediately with the completed graph.
+        // render() also recalculates filters/levels and displays completed cards
+        // when Show completed is enabled.
+        hideCompletedDownloadNotice();
         render();
         if(completedDownloadPollTimer) clearInterval(completedDownloadPollTimer);
         completedDownloadPollTimer=null;
@@ -4534,6 +5391,11 @@ async function load(resetSelection){
     state.pendingChanges=[]; state.history=[]; state.redoHistory=[];
     if(resetSelection){
       state.lockedKey=null; state.selectionHistory=[]; state.showBlocked=false;
+      if(startupViewPending){
+        state.showDashboard = state.startingView === 'dashboard';
+        state.showMilestones = state.startingView === 'milestone';
+        startupViewPending=false;
+      }
     }
     render(); updateSaveButton();
     if(startupMessagePromise) await startupMessagePromise;
@@ -4563,9 +5425,16 @@ function goBackFromSelection(){
     state.lockedKey = previous.key || null;
     restoreFilterSnapshot(previous.filters);
     state.showBlocked = false;
+    // Treat the previous ticket as a newly focused chain. Reusing the old
+    // locked-view scroll offset can otherwise strand the viewport in overflow
+    // created by a wider chain.
+    state.revealSelectedKey = state.lockedKey;
+    state.scrollPositions.locked.appLeft = 0;
   }else{
     state.lockedKey = null;
     state.showBlocked = false;
+    state.revealSelectedKey = null;
+    state.scrollPositions.locked.appLeft = 0;
   }
   render();
 }
@@ -4583,7 +5452,7 @@ toggleCompletedBtn.addEventListener('click', () => {
   if(state.showCompleted && state.completedDownloadStatus !== 'ready'){
     showCompletedDownloadNotice('Completed tickets are still downloading. The active tickets remain available while this finishes.');
     render();
-    pollCompletedDownload();
+    pollCompletedDownload(state.loadGeneration);
     return;
   }
   hideCompletedDownloadNotice();
@@ -4591,6 +5460,11 @@ toggleCompletedBtn.addEventListener('click', () => {
 });
 filterUser.addEventListener('change', () => {
   state.filterUser = filterUser.value;
+  saveFilterPreferences();
+  render();
+});
+filterDue.addEventListener('change', () => {
+  state.filterDue = filterDue.value;
   saveFilterPreferences();
   render();
 });
@@ -4621,14 +5495,17 @@ milestoneBackBtn.addEventListener('click', () => {
   render();
 });
 
-toggleMilestonesBtn.addEventListener('click', () => {
-  state.showMilestones = !state.showMilestones;
-  state.lockedKey = null;
-  state.selectionHistory = [];
-  state.showBlocked = false;
-  state.returnMilestoneKey = null;
-  if(state.showMilestones) document.getElementById('app').scrollLeft = 0;
-  render();
+document.querySelectorAll('.view-switch').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const view=btn.dataset.view;
+    state.showDashboard=view==='dashboard';
+    state.showMilestones=view==='milestone';
+    state.lockedKey=null;
+    state.selectionHistory=[];
+    state.showBlocked=false;
+    state.returnMilestoneKey=null;
+    render();
+  });
 });
 
 searchEl.addEventListener('keydown', e => {
@@ -4639,11 +5516,27 @@ searchEl.addEventListener('keydown', e => {
     e.stopPropagation();
   }
 });
+function updateSearchClearButton(){
+  if(!searchClearBtn) return;
+  const hasText = !!searchEl.value;
+  searchClearBtn.classList.toggle('visible', hasText);
+  searchClearBtn.disabled = !hasText;
+}
+
 searchEl.addEventListener('input', () => {
   // Never rebuild the board while typing. Filter the existing cards directly so
   // the input value and the search state cannot get out of sync.
   state.searchTerm = searchEl.value;
+  updateSearchClearButton();
   applySearchFilter();
+});
+searchClearBtn.addEventListener('click', () => {
+  // Clear only the text query. User, due-date and Remarkable filters remain.
+  searchEl.value = '';
+  state.searchTerm = '';
+  updateSearchClearButton();
+  applySearchFilter();
+  searchEl.focus({preventScroll:true});
 });
 document.addEventListener('keydown', e => {
   const mod = e.ctrlKey || e.metaKey;
@@ -4680,6 +5573,16 @@ credentialSave.addEventListener('click', saveCredential);
 credentialRemove.addEventListener('click', removeCredential);
 credentialCancel.addEventListener('click', closeCredentialModal);
 settingsBtn.addEventListener('click', () => openSettings());
+document.getElementById('due-date-close')?.addEventListener('click', closeDueDateModal);
+document.getElementById('due-date-cancel')?.addEventListener('click', closeDueDateModal);
+document.getElementById('due-date-clear')?.addEventListener('click', () => saveDueDateModal(true));
+document.getElementById('due-date-save')?.addEventListener('click', () => saveDueDateModal(false));
+dueDateModal?.addEventListener('click', e => { if(e.target === dueDateModal) closeDueDateModal(); });
+dueDateInput?.addEventListener('keydown', e => { if(e.key === 'Enter'){ e.preventDefault(); saveDueDateModal(false); } if(e.key === 'Escape') closeDueDateModal(); });
+document.getElementById('chain-date-warning-cancel')?.addEventListener('click', closeChainDateWarning);
+document.getElementById('chain-date-warning-confirm')?.addEventListener('click', confirmChainDateChange);
+chainDateWarningModal?.addEventListener('click', e => { if(e.target === chainDateWarningModal) closeChainDateWarning(); });
+chainDateWarningModal?.addEventListener('keydown', e => { if(e.key === 'Escape'){ e.preventDefault(); closeChainDateWarning(); } });
 customJqlIndicator?.addEventListener('click', e => {
   e.preventDefault();
   if(!getCustomJql()) return;
@@ -4697,6 +5600,7 @@ document.getElementById('discard').addEventListener('click', discardChanges);
 settingsUseJiraModal.addEventListener('click', () => {
   setUseJiraModal(!getUseJiraModal());
 });
+settingsStartingView?.addEventListener('change', () => setStartingView(settingsStartingView.value));
 settingsShowMiniMap?.addEventListener('click', () => {
   setMiniMapSetting(!(state.showMiniMap !== false));
 });
