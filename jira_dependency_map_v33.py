@@ -1997,6 +1997,31 @@ const state = {
   }
 };
 
+// ── Shareable selected-card URL ───────────────────────────────────────────
+// URLs use the compact form ?opd-523 and optionally ?opd-523&showblocked.
+function readSharedViewUrl(){
+  const parts=window.location.search.replace(/^\?/,'').split('&').map(part=>decodeURIComponent(part).trim()).filter(Boolean);
+  const keyPart=parts.find(part=>/^[A-Za-z][A-Za-z0-9_]*-\d+$/.test(part));
+  return {
+    key:keyPart ? keyPart.toUpperCase() : null,
+    showBlocked:parts.some(part=>part.toLowerCase()==='showblocked')
+  };
+}
+let pendingSharedView=readSharedViewUrl();
+
+function syncSharedViewUrl(){
+  const selectedKey=(!state.showDashboard && !state.showMilestones && state.lockedKey)
+    ? String(state.lockedKey).toLowerCase()
+    : '';
+  const query=selectedKey
+    ? '?' + encodeURIComponent(selectedKey) + (state.showBlocked ? '&showblocked' : '')
+    : '';
+  const nextUrl=window.location.pathname + query + window.location.hash;
+  if(nextUrl !== window.location.pathname + window.location.search + window.location.hash){
+    window.history.replaceState(null,'',nextUrl);
+  }
+}
+
 // ── Filter preferences ────────────────────────────────────────────────────
 let preferencesReady=false;
 let startupViewPending=true;
@@ -3972,6 +3997,7 @@ function render(){
     state.lockedKey = null;
     state.selectionHistory = [];
     state.showBlocked = false;
+    syncSharedViewUrl();
     document.getElementById('app').classList.remove('locked');
     searchWrap.style.visibility = 'hidden';
     if(filterMenu) filterMenu.classList.remove('open');
@@ -3990,6 +4016,7 @@ function render(){
     state.lockedKey = null;
     state.selectionHistory = [];
     state.showBlocked = false;
+    syncSharedViewUrl();
     document.getElementById('app').classList.remove('locked');
     searchWrap.style.visibility = 'hidden';
     if(filterMenu) filterMenu.classList.remove('open');
@@ -4009,6 +4036,7 @@ function render(){
     state.selectionHistory = [];
     state.showBlocked = false;
   }
+  syncSharedViewUrl();
 
   const locked = !!state.lockedKey;
   document.getElementById('app').classList.toggle('locked', locked);
@@ -5391,6 +5419,18 @@ async function load(resetSelection){
     state.pendingChanges=[]; state.history=[]; state.redoHistory=[];
     if(resetSelection){
       state.lockedKey=null; state.selectionHistory=[]; state.showBlocked=false;
+      if(pendingSharedView && pendingSharedView.key){
+        const sharedIssue=state.issues.find(i => String(i.key).toUpperCase() === pendingSharedView.key);
+        if(sharedIssue){
+          state.showDashboard=false;
+          state.showMilestones=false;
+          state.lockedKey=sharedIssue.key;
+          state.showBlocked=!!pendingSharedView.showBlocked;
+          state.revealSelectedKey=sharedIssue.key;
+          startupViewPending=false;
+        }
+        pendingSharedView=null;
+      }
       if(startupViewPending){
         state.showDashboard = state.startingView === 'dashboard';
         state.showMilestones = state.startingView === 'milestone';
