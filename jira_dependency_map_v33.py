@@ -1397,6 +1397,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 #loading.show{opacity:1;pointer-events:auto}
 /* dependency-status is earlier in the DOM than #loading, so it cannot be hidden with a following-sibling selector. */
 #dependency-status.loading-hidden{display:none !important}
+#dependency-status.view-hidden{display:none !important}
 #loading::before{
   content:"";position:absolute;width:520px;height:520px;border-radius:50%;
   background:radial-gradient(circle,rgba(99,102,241,.08),transparent 68%);
@@ -1557,7 +1558,10 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dashboard-title{font-size:20px;font-weight:850;color:#172033}
 .dashboard-subtitle{font-size:12px;color:#64748b;margin-top:3px}
 .dashboard-updated{font-size:11px;color:#94a3b8}
-.dashboard-stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:18px}
+.dashboard-stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:18px}
+.dashboard-summary-link{cursor:pointer;transition:transform .15s,box-shadow .15s,border-color .15s}
+.dashboard-summary-link:hover{transform:translateY(-1px);box-shadow:0 3px 10px rgba(15,23,42,.08);border-color:#cbd5e1}
+.dashboard-summary-link:focus-visible{outline:2px solid #6366f1;outline-offset:2px}
 .dashboard-stat{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:13px 14px;min-width:0}
 .dashboard-stat-value{font-size:23px;line-height:1;font-weight:850;color:#172033}
 .dashboard-stat-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;font-weight:800;color:#64748b;margin-top:7px}
@@ -1565,6 +1569,22 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dashboard-stat.risk{border-color:#fecaca;background:#fffafa}
 .dashboard-stat.risk .dashboard-stat-value{color:#b91c1c}
  .dashboard-health-stat{min-width:0;grid-column:span 2}
+.dashboard-stat.dashboard-attention-stat{grid-column:span 2}
+.dashboard-attention-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin-top:7px}
+.dashboard-attention-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 7px;border:1px solid #e2e8f0;background:#f8fafc;border-radius:6px;font-size:10px;color:#334155;cursor:pointer;text-align:left;width:100%}
+.dashboard-attention-item:hover{background:#fff;border-color:#cbd5e1}
+.dashboard-attention-item strong{font-size:10px;color:#172033}
+.dashboard-upcoming-stack{display:flex;flex-direction:column;gap:10px;min-width:0}
+.dashboard-upcoming-stack .dashboard-stat{width:100%}
+.dashboard-upcoming-tabs{display:flex;gap:5px;margin:0 0 9px}
+.dashboard-upcoming-tab{border:1px solid #cbd5e1;background:#f8fafc;color:#475569;border-radius:7px;padding:6px 12px;font:inherit;font-size:11px;font-weight:800;cursor:pointer}
+.dashboard-upcoming-tab:hover{background:#fff}
+.dashboard-upcoming-tab.active{background:#172033;color:#fff;border-color:#172033}
+.dashboard-upcoming-panel[hidden]{display:none!important}
+.dashboard-top-workload{display:flex;flex-direction:column;gap:4px;margin-top:7px}
+.dashboard-top-workload-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10px}
+.dashboard-top-workload-row strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dashboard-top-workload-count{font-weight:850;color:#6366f1;white-space:nowrap}
 .dashboard-health-stat.green{border-color:#bbf7d0;background:#f7fff9}
 .dashboard-health-stat.amber{border-color:#fde68a;background:#fffdf5}
 .dashboard-health-stat.red{border-color:#fecaca;background:#fff8f8}
@@ -1580,10 +1600,47 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dashboard-health-row strong{font-size:10px;white-space:nowrap;color:#64748b}
 .dashboard-health-stat.red .dashboard-health-row strong{color:#b91c1c}
 .dashboard-health-stat.amber .dashboard-health-row strong{color:#92400e}
-.dashboard-section{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:14px}
+.dashboard-nav{position:sticky;top:0;z-index:20;display:flex;gap:6px;flex-wrap:wrap;padding:8px 0 10px;background:var(--bg);border-bottom:1px solid #e2e8f0;margin-bottom:12px}
+.dashboard-nav button{border:1px solid #cbd5e1;background:#fff;color:#475569;border-radius:999px;padding:6px 11px;font:inherit;font-size:11px;font-weight:800;cursor:pointer}
+.dashboard-nav button:hover,.dashboard-nav button.active{background:#172033;color:#fff;border-color:#172033}
+.dashboard-section-group{scroll-margin-top:48px;margin-bottom:18px}
+.dashboard-group-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:18px 2px 9px}
+.dashboard-group-head h2{font-size:15px;line-height:1.2;color:#172033;margin:0}
+.dashboard-group-head span{font-size:11px;color:#64748b}
+.dashboard-section{scroll-margin-top:52px;background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:10px}
+.dashboard-section-heading{display:flex;align-items:baseline;gap:9px;min-width:0}
+.dashboard-section-note{font-size:10px;color:#94a3b8;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dashboard-summary-section{padding-bottom:12px}
+.dashboard-compact-list{display:flex;flex-direction:column;gap:5px}
+.dashboard-compact-row{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;text-align:left;border:1px solid #e2e8f0;background:#f8fafc;border-radius:7px;padding:8px 10px;color:#334155;cursor:pointer;font:inherit}
+.dashboard-compact-row:hover{background:#fff;border-color:#cbd5e1;box-shadow:0 2px 7px rgba(15,23,42,.06)}
+.dashboard-compact-main{display:flex;align-items:center;gap:8px;min-width:0}
+.dashboard-compact-main>span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dashboard-compact-main strong{font-size:11px;flex:0 0 auto}
+.dashboard-compact-badges{display:flex;gap:5px;align-items:center;flex:0 0 auto}
+.dashboard-impact{font-size:11px;font-weight:800;color:#6366f1;white-space:nowrap}
+.dashboard-workload-list{display:flex;flex-direction:column;gap:4px}
+.dashboard-workload-row{display:grid;grid-template-columns:minmax(150px,210px) 1fr 42px;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:6px 4px;text-align:left;cursor:pointer;color:#334155;border-radius:6px}
+.dashboard-workload-row:hover{background:#f8fafc}
+.dashboard-workload-name{display:flex;align-items:center;gap:8px;min-width:0}
+.dashboard-workload-name strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+.dashboard-workload-name span{font-size:10px;color:#b91c1c;white-space:nowrap}
+.dashboard-workload-bar{height:7px;background:#e2e8f0;border-radius:999px;overflow:hidden}
+.dashboard-workload-bar span{display:block;height:100%;background:#6366f1;border-radius:999px}
+.dashboard-workload-count{text-align:right;font-size:12px}
+.dashboard-inline-stat{display:flex;align-items:baseline;gap:8px;padding:6px 2px;color:#64748b}
+.dashboard-inline-stat strong{font-size:24px;color:#172033}
+.dashboard-inline-stat span{font-size:12px}
 .dashboard-section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:11px}
 .dashboard-section-title{font-size:12px;font-weight:850;color:#172033}
 .dashboard-section-count{font-size:10px;color:#64748b}
+.dashboard-two-column{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}
+.dashboard-two-column .dashboard-section-group{min-width:0}
+.dashboard-top-cards .dashboard-section-group,.dashboard-bottom-cards .dashboard-section-group{margin-bottom:18px}
+.dashboard-ticket-wrap[hidden]{display:none}
+.dashboard-pagination{display:flex;justify-content:center;gap:7px;margin-top:10px}
+.dashboard-pagination button{border:1px solid #cbd5e1;background:#fff;color:#475569;border-radius:7px;padding:6px 10px;font:inherit;font-size:10px;font-weight:800;cursor:pointer}
+.dashboard-pagination button:hover{background:#f8fafc;border-color:#94a3b8}
 .dashboard-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:9px}
 .dashboard-ticket{border:1px solid #e2e8f0;border-radius:8px;padding:9px 10px;background:#f8fafc;cursor:pointer}
 .dashboard-ticket:hover{background:#fff;border-color:#cbd5e1;box-shadow:0 2px 7px rgba(15,23,42,.07)}
@@ -1599,6 +1656,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dashboard-risk.blocked{background:#ffedd5;color:#c2410c}
 .dashboard-empty{font-size:12px;color:#64748b;padding:10px 2px}
 @media(max-width:1000px){.dashboard-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-health-stat{grid-column:1 / -1}}
+@media(max-width:1000px){.dashboard-two-column{grid-template-columns:1fr}}
 @media(max-width:700px){.dashboard-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-grid{grid-template-columns:1fr}}
 
 /* ── Settings ───────────────────────────────────────────────────────────── */
@@ -1746,6 +1804,8 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .required-update-status{min-height:18px;margin-top:12px;color:#64748b;font-size:12px;line-height:1.45}
 .required-update-status.error{color:#b91c1c}
 
+@media (max-width:1100px){.dashboard-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.dashboard-health-stat{grid-column:span 2}}
+@media (max-width:700px){.dashboard-stats{grid-template-columns:1fr}.dashboard-health-stat{grid-column:span 1}.dashboard-two-column{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -2080,6 +2140,7 @@ const state = {
   displayIssues:[], displayEdges:[], displayLevels:0,
   hoverKey:null, hoverLockKey:null,
   returnMilestoneKey:null,
+  dashboardReturnSection:null,
   // Preserve each view's independent scroll position across board rebuilds.
   scrollPositions:{
     main:{appLeft:0,appTop:0,columns:{}},
@@ -3801,56 +3862,315 @@ function dashboardTicketHtml(i, risks){
     '<div class="dashboard-ticket-controls">'+dashboardAssigneeOptions(i)+dueDateHtml(i)+'</div>'+ 
   '</article>';
 }
-function dashboardSection(title,items,risks){
-  return '<section class="dashboard-section"><div class="dashboard-section-head"><span class="dashboard-section-title">'+esc(title)+'</span><span class="dashboard-section-count">'+items.length+'</span></div>'+
-    (items.length?'<div class="dashboard-grid">'+items.map(i=>dashboardTicketHtml(i,risks)).join('')+'</div>':'<div class="dashboard-empty">None currently.</div>')+'</section>';
+function dashboardSortItems(items){
+  return [...items].sort((a,b)=>{
+    const ap=PRIORITY_ORDER.indexOf(String(a.priority||''));
+    const bp=PRIORITY_ORDER.indexOf(String(b.priority||''));
+    const priorityA=ap<0?PRIORITY_ORDER.length:ap;
+    const priorityB=bp<0?PRIORITY_ORDER.length:bp;
+    if(priorityA!==priorityB) return priorityA-priorityB;
+    const ad=a.dueDate?String(a.dueDate):'9999-12-31';
+    const bd=b.dueDate?String(b.dueDate):'9999-12-31';
+    if(ad!==bd) return ad.localeCompare(bd);
+    return String(a.key||'').localeCompare(String(b.key||''));
+  });
+}
+function dashboardSection(title,items,risks,options={}){
+  const id=options.id?' id="'+esc(options.id)+'"':'';
+  const note=options.note?'<span class="dashboard-section-note">'+esc(options.note)+'</span>':'';
+  const sorted=dashboardSortItems(items);
+  const visibleCount=Math.min(10,sorted.length);
+  const returnSection=options.returnSection||options.id||'';
+  const cards=sorted.map((i,index)=>'<div class="dashboard-ticket-wrap" data-dashboard-ticket-index="'+index+'" data-dashboard-return-section="'+esc(returnSection)+'"'+(index>=visibleCount?' hidden':'')+'>'+dashboardTicketHtml(i,risks)+'</div>').join('');
+  const remaining=Math.max(0,sorted.length-visibleCount);
+  const controls=remaining>0
+    ? '<div class="dashboard-pagination"><button type="button" class="dashboard-show-more" data-dashboard-show-more>Show more (+'+Math.min(10,remaining)+')</button><button type="button" class="dashboard-show-all" data-dashboard-show-all>Show all ('+sorted.length+')</button></div>'
+    : '';
+  return '<section class="dashboard-section"'+id+'><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">'+esc(title)+'</span>'+note+'</div><span class="dashboard-section-count">'+items.length+'</span></div>'+
+    (items.length?'<div class="dashboard-grid">'+cards+'</div>'+controls:'<div class="dashboard-empty">None currently.</div>')+'</section>';
+}
+function dashboardSummarySection(title,html,id,note){
+  return '<section class="dashboard-section dashboard-summary-section"'+(id?' id="'+esc(id)+'"':'')+'><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">'+esc(title)+'</span>'+(note?'<span class="dashboard-section-note">'+esc(note)+'</span>':'')+'</div></div>'+html+'</section>';
+}
+function dashboardRiskBadge(label,cls,title){
+  return '<span class="dashboard-risk '+(cls||'')+'"'+(title?' title="'+esc(title)+'"':'')+'>'+esc(label)+'</span>';
+}
+function dashboardDueSoon(issues,days=7){
+  const today=new Date(); today.setHours(0,0,0,0);
+  const end=new Date(today); end.setDate(end.getDate()+days);
+  return issues.filter(i=>{
+    if(isCompletedStatus(i.status)||!i.dueDate) return false;
+    const d=new Date(i.dueDate+'T00:00:00');
+    return !Number.isNaN(d.getTime()) && d>=today && d<=end;
+  }).sort((a,b)=>String(a.dueDate).localeCompare(String(b.dueDate)));
+}
+function dashboardHighPriorityRisk(issues,risks){
+  const high=new Set(['Highest','Critical']);
+  return issues.filter(i=>{
+    if(isCompletedStatus(i.status)||!high.has(String(i.priority||''))) return false;
+    const dueSoon=dashboardDueSoon([i]).length>0;
+    return risks.overdue.includes(i)||risks.chainDateRiskKeys.has(i.key)||dueSoon;
+  });
+}
+function dashboardDependencyBottlenecks(issues){
+  const active=issues.filter(i=>!isCompletedStatus(i.status));
+  const byKey=new Map(active.map(i=>[i.key,i]));
+  const downstream=new Map(active.map(i=>[i.key,(i.blocked||[]).filter(k=>byKey.has(k))]));
+  const impact=new Map();
+  active.forEach(i=>{
+    const seen=new Set([i.key]); const queue=[i.key];
+    while(queue.length){
+      const key=queue.shift();
+      for(const next of (downstream.get(key)||[])){
+        if(seen.has(next)) continue;
+        seen.add(next); queue.push(next);
+      }
+    }
+    impact.set(i.key,Math.max(0,seen.size-1));
+  });
+  return active.filter(i=>(impact.get(i.key)||0)>0).sort((a,b)=>(impact.get(b.key)||0)-(impact.get(a.key)||0)).slice(0,10).map(i=>({issue:i,impact:impact.get(i.key)||0}));
+}
+function dashboardUnblocking(issues){
+  return dashboardDependencyBottlenecks(issues).filter(x=>x.issue.assigneeAccountId || x.issue.dueDate || x.issue.priority);
+}
+function dashboardWorkload(issues){
+  const active=issues.filter(i=>!isCompletedStatus(i.status));
+  const groups=new Map();
+  active.forEach(i=>{
+    const key=i.assigneeAccountId||'__unassigned__';
+    if(!groups.has(key)) groups.set(key,{name:i.assignee||'Unassigned',accountId:i.assigneeAccountId||'',count:0,overdue:0,highRisk:0});
+    const g=groups.get(key); g.count++;
+    if(isDueDateOverdue(i.dueDate)) g.overdue++;
+    if(['Highest','Critical'].includes(String(i.priority||'')) && (isDueDateOverdue(i.dueDate)||!i.dueDate)) g.highRisk++;
+  });
+  return [...groups.values()].sort((a,b)=>b.count-a.count || a.name.localeCompare(b.name));
+}
+function dashboardMilestones(issues){
+  const active=issues.filter(i=>!isCompletedStatus(i.status));
+  const milestones=active.filter(i=>(i.labels||[]).some(l=>String(l).toLowerCase()==='milestone'));
+  return milestones.map(m=>{
+    const due=m.dueDate?new Date(m.dueDate+'T00:00:00'):null;
+    const blocked=(m.blocked||[]).map(k=>issues.find(i=>i.key===k)).filter(Boolean).filter(i=>!isCompletedStatus(i.status)).length;
+    const overdue=isDueDateOverdue(m.dueDate);
+    return {issue:m,blocked,overdue,due:due&&!Number.isNaN(due.getTime())?due:null};
+  }).sort((a,b)=>Number(b.overdue)-Number(a.overdue) || (a.due?.getTime()||Infinity)-(b.due?.getTime()||Infinity));
+}
+function dashboardPriorityDistribution(issues){
+  const active=issues.filter(i=>!isCompletedStatus(i.status));
+  const groups=new Map();
+  active.forEach(i=>{const p=String(i.priority||'Unspecified'); groups.set(p,(groups.get(p)||0)+1);});
+  return [...groups.entries()].sort((a,b)=>b[1]-a[1]);
+}
+function dashboardCompletedHtml(items){
+  if(!items.length) return '<div class="dashboard-empty">No completed tickets are available in the current dataset.</div>';
+  return '<div class="dashboard-compact-list">'+items.map(i=>'<a class="dashboard-compact-row" href="'+esc(i.url)+'" target="_blank" rel="noopener noreferrer"><span class="dashboard-compact-main"><strong>'+esc(i.key)+'</strong><span>'+esc(i.summary||'')+'</span></span><span class="dashboard-impact">Completed</span></a>').join('')+'</div>';
+}
+function dashboardPriorityRiskHtml(items){
+  if(!items.length) return '<div class="dashboard-empty">None currently.</div>';
+  return '<div class="dashboard-compact-list">'+items.map(i=>'<button type="button" class="dashboard-compact-row" data-dashboard-key="'+esc(i.key)+'"><span class="dashboard-compact-main">'+priorityIconHtml(i.priority)+'<strong>'+esc(i.key)+'</strong><span>'+esc(i.summary||'')+'</span></span><span class="dashboard-compact-badges">'+(isDueDateOverdue(i.dueDate)?dashboardRiskBadge('Overdue','overdue'):'')+(dashboardDueSoon([i]).length?dashboardRiskBadge('Due soon','soon'):'')+(dashboardRiskBadge('High priority','high'))+'</span></button>').join('')+'</div>';
+}
+function dashboardBottleneckHtml(items){
+  if(!items.length) return '<div class="dashboard-empty">No active ticket is currently blocking other active work.</div>';
+  return '<div class="dashboard-compact-list">'+items.map(x=>'<button type="button" class="dashboard-compact-row" data-dashboard-unblocking="'+esc(x.issue.key)+'"><span class="dashboard-compact-main"><strong>'+esc(x.issue.key)+'</strong><span>'+esc(x.issue.summary||'')+'</span></span><span class="dashboard-impact">'+x.impact+' downstream '+(x.impact===1?'ticket':'tickets')+'</span></button>').join('')+'</div>';
+}
+function dashboardWorkloadHtml(items){
+  if(!items.length) return '<div class="dashboard-empty">No active tickets.</div>';
+  const max=Math.max(1,...items.map(x=>x.count));
+  return '<div class="dashboard-workload-list">'+items.map(x=>'<button type="button" class="dashboard-workload-row" data-dashboard-assignee="'+esc(x.accountId)+'"><span class="dashboard-workload-name"><strong>'+esc(x.name)+'</strong>'+(x.overdue?'<span>'+x.overdue+' overdue</span>':'')+'</span><span class="dashboard-workload-bar"><span style="width:'+Math.max(4,Math.round(x.count/max*100))+'%"></span></span><strong class="dashboard-workload-count">'+x.count+'</strong></button>').join('')+'</div>';
+}
+function dashboardMilestoneHtml(items){
+  if(!items.length) return '<div class="dashboard-empty">No active milestones found.</div>';
+  return '<div class="dashboard-compact-list">'+items.map(x=>'<button type="button" class="dashboard-compact-row" data-dashboard-milestone="'+esc(x.issue.key)+'"><span class="dashboard-compact-main"><strong>'+esc(x.issue.key)+'</strong><span>'+esc(x.issue.summary||'')+'</span></span><span class="dashboard-compact-badges">'+(x.overdue?dashboardRiskBadge('Overdue','overdue'):'')+(x.blocked?dashboardRiskBadge(x.blocked+' blocked','high'):'')+(x.issue.dueDate?dashboardRiskBadge(formatDueDate(x.issue.dueDate),'soon'):'')+'</span></button>').join('')+'</div>';
 }
 function dashboardOverviewHtml(){
   const risks=dashboardRiskInfo(state.displayIssues||[]);
   const h=risks.boardHealthBreakdown;
   const score=Math.round(risks.boardHealthScore);
   const statusLabel=risks.boardHealthStatus==='green'?'Healthy':risks.boardHealthStatus==='amber'?'Needs attention':'At risk';
-  const healthRows=[
+  const dueSoon=dashboardDueSoon(risks.active,7);
+  const dueMonth=dashboardDueSoon(risks.active,31);
+  const highPriorityRisk=dashboardHighPriorityRisk(risks.active,risks);
+  const bottlenecks=dashboardDependencyBottlenecks(risks.active);
+  const workload=dashboardWorkload(risks.active);
+  const topWorkload=workload.filter(x=>x.accountId).slice(0,6);
+  const milestones=dashboardMilestones(risks.active);
+  const blockedTickets=risks.active.filter(i=>(i.blockers||[]).length);
+  const priorityDistribution=dashboardPriorityDistribution(risks.active);
+  const completed=(state.issues||[]).filter(i=>isCompletedStatus(i.status)).sort((a,b)=>String(b.updated||'').localeCompare(String(a.updated||''))).slice(0,8);
+  const attentionItems=[
+    ['high-priority-risk','High-priority risk',highPriorityRisk.length],
+    ['overdue','Overdue tickets',risks.overdue.length],
+    ['chain-risks','Dependency chain date risks',risks.chainDateRisks.length],
+    ['unassigned','Unassigned tickets',risks.unassigned.length],
+    ['missing-due','Missing due dates',risks.noDueDate.length],
+    ['circular','Circular dependencies',risks.circularDependencies.length],
+    ['blocked-tickets','Blocked tickets',blockedTickets.length]
+  ];
+  const attentionTotal=attentionItems.reduce((sum,x)=>sum+x[2],0);
+  const attentionHtml=attentionItems.map(x=>'<button type="button" class="dashboard-attention-item" data-dashboard-nav="'+x[0]+'"><span>'+esc(x[1])+'</span><strong>'+x[2]+'</strong></button>').join('');
+  const topWorkloadHtml=topWorkload.length
+    ? topWorkload.map((x,idx)=>'<div class="dashboard-top-workload-row"><strong>'+((idx+1)+'. ') + esc(x.name)+'</strong><span class="dashboard-top-workload-count">'+x.count+'</span></div>').join('')
+    : '<div class="dashboard-empty">No assigned active tickets.</div>';
+  const hRows=[
     {label:'Overdue tickets',detail:risks.overdue.length+' affected · max '+h.overdue.weight+' pts',deduction:h.overdue.deduction},
     {label:'Unassigned tickets',detail:risks.unassigned.length+' affected · max '+h.unassigned.weight+' pts',deduction:h.unassigned.deduction},
     {label:'Missing due dates',detail:risks.noDueDate.length+' affected · max '+h.noDueDate.weight+' pts',deduction:h.noDueDate.deduction},
     {label:'Circular dependencies',detail:risks.circularDependencies.length+' affected · max '+h.circular.weight+' pts',deduction:h.circular.deduction},
     {label:'Chain date risks',detail:risks.chainDateRisks.length+' affected · max '+h.chainDates.weight+' pts',deduction:h.chainDates.deduction}
   ];
-  const healthDetail=healthRows.map(row=>'<div class="dashboard-health-row"><span class="dashboard-health-row-label">'+esc(row.label)+'</span><span class="dashboard-health-row-detail">'+esc(row.detail)+'</span><strong>'+ (row.deduction>0 ? '−'+row.deduction.toFixed(1)+' pts' : '0 pts') +'</strong></div>').join('');
-  return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Dependency dashboard</div><div class="dashboard-subtitle">Overdue, unassigned and dependency chain date risks.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+ 
-    '<div class="dashboard-stats">'+
-      '<div class="dashboard-stat dashboard-health-stat '+risks.boardHealthStatus+'"><div class="dashboard-health-score-line"><div class="dashboard-stat-value">'+score+'%</div><span class="dashboard-health-status">'+statusLabel+'</span></div><div class="dashboard-stat-label">Board health</div><div class="dashboard-stat-help">100% starts healthy. Overdue and chain-date deductions are front-loaded, so the first affected ticket removes 8 and 5 points respectively; further deductions rise quickly up to 55 and 10 points. Other deductions remain proportional: unassigned (20%), no due date (15%) and circular dependencies (7%).</div><div class="dashboard-health-breakdown">'+healthDetail+'</div></div>'+
-      '<div class="dashboard-stat risk"><div class="dashboard-stat-value">'+risks.overdue.length+'</div><div class="dashboard-stat-label">Overdue</div><div class="dashboard-stat-help">Active tickets whose due date has passed.</div></div>'+ 
-      '<div class="dashboard-stat"><div class="dashboard-stat-value">'+risks.unassigned.length+'</div><div class="dashboard-stat-label">Unassigned</div><div class="dashboard-stat-help">Active tickets with no assignee.</div></div>'+ 
-      '<div class="dashboard-stat"><div class="dashboard-stat-value">'+risks.chainDateRisks.length+'</div><div class="dashboard-stat-label">Chain date risks</div><div class="dashboard-stat-help">A later ticket is due before an earlier ticket in its chain.</div></div>'+ 
+  const healthDetail=hRows.map(row=>'<div class="dashboard-health-row"><span class="dashboard-health-row-label">'+esc(row.label)+'</span><span class="dashboard-health-row-detail">'+esc(row.detail)+'</span><strong>'+(row.deduction>0?'−'+row.deduction.toFixed(1)+' pts':'0 pts')+'</strong></div>').join('');
+  const nav=[['overview','Overview'],['milestones','Milestones'],['unblocking','Unblocking opportunities'],['upcoming','Upcoming'],['workload','Workload'],['priority-distribution','Priority distribution'],['attention','Needs attention']];
+  return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Dependency dashboard</div><div class="dashboard-subtitle">What is at risk, what is causing it, and what should be acted on first.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+ 
+    '<nav class="dashboard-nav" aria-label="Dashboard sections">'+nav.map(x=>'<button type="button" data-dashboard-nav="'+x[0]+'">'+x[1]+'</button>').join('')+'</nav>'+ 
+    '<section class="dashboard-section dashboard-overview" id="overview"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">Overview</span><span class="dashboard-section-note">Board health and immediate signals</span></div></div>'+ 
+      '<div class="dashboard-stats">'+
+        '<div class="dashboard-stat dashboard-summary-link dashboard-health-stat '+risks.boardHealthStatus+'" data-dashboard-nav="attention" role="button" tabindex="0"><div class="dashboard-health-score-line"><div class="dashboard-stat-value">'+score+'%</div><span class="dashboard-health-status">'+statusLabel+'</span></div><div class="dashboard-stat-label">Board health</div><div class="dashboard-stat-help">Health combines overdue, unassigned, missing due dates, circular dependencies and chain-date risks.</div><div class="dashboard-health-breakdown">'+healthDetail+'</div></div>'+ 
+        '<div class="dashboard-stat dashboard-summary-link dashboard-attention-stat risk"><div class="dashboard-stat-value">'+attentionTotal+'</div><div class="dashboard-stat-label">Needs attention</div><div class="dashboard-stat-help">Each risk area links directly to its section below.</div><div class="dashboard-attention-summary">'+attentionHtml+'</div></div>'+ 
+        '<div class="dashboard-upcoming-stack">'+
+          '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="7"><div class="dashboard-stat-value">'+dueSoon.length+'</div><div class="dashboard-stat-label">Due next 7 days</div><div class="dashboard-stat-help">Upcoming active work that needs attention soon.</div></div>'+ 
+          '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="month"><div class="dashboard-stat-value">'+dueMonth.length+'</div><div class="dashboard-stat-label">Due next month</div><div class="dashboard-stat-help">Active work due within the next 31 days.</div></div>'+ 
+        '</div>'+ 
+        '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="workload"><div class="dashboard-stat-value">'+topWorkload.length+' assignees</div><div class="dashboard-stat-label">Top workload</div><div class="dashboard-stat-help">Highest workload assignees by active ticket count.</div><div class="dashboard-top-workload">'+topWorkloadHtml+'</div></div>'+ 
+      '</div></section>'+ 
+    '<div class="dashboard-two-column dashboard-top-cards">'+
+      '<div class="dashboard-section-group" id="milestones"><div class="dashboard-group-head"><h2>Milestones</h2><span>Milestone health and delivery pressure</span></div>'+ 
+        dashboardSummarySection('Milestone risk',dashboardMilestoneHtml(milestones),'milestone-risk','Active milestones with due dates, overdue status or blocked work')+
+        dashboardSummarySection('Recently completed',dashboardCompletedHtml(completed),'recently-completed','Most recently updated completed tickets in the current dataset')+
+      '</div>'+ 
+      '<div class="dashboard-section-group" id="unblocking"><div class="dashboard-group-head"><h2>Unblocking opportunities</h2><span>Focus on work with the greatest downstream impact</span></div>'+ 
+        dashboardSummarySection('Biggest dependency bottlenecks',dashboardBottleneckHtml(bottlenecks),'bottlenecks','Top active tickets by number of downstream active tickets affected')+
+      '</div>'+ 
     '</div>'+ 
-    dashboardSection('Overdue tickets',risks.overdue,risks)+
-    dashboardSection('Unassigned tickets',risks.unassigned,risks)+
-    dashboardSection('Dependency chain date risks',risks.chainDateRisks,risks)+
+    '<div class="dashboard-section-group" id="upcoming"><div class="dashboard-group-head"><h2>Upcoming</h2><span>What needs attention next</span></div>'+ 
+      '<div class="dashboard-upcoming-tabs" role="tablist" aria-label="Upcoming timeframe">'+
+        '<button type="button" class="dashboard-upcoming-tab active" data-dashboard-upcoming-tab-button="7" role="tab" aria-selected="true">7 days</button>'+ 
+        '<button type="button" class="dashboard-upcoming-tab" data-dashboard-upcoming-tab-button="month" role="tab" aria-selected="false">Month</button>'+ 
+      '</div>'+ 
+      '<div class="dashboard-upcoming-panel" data-upcoming-panel="7">'+dashboardSection('Due in the next 7 days',dueSoon,risks,{id:'due-soon',note:'Includes today through the next seven days'})+'</div>'+ 
+      '<div class="dashboard-upcoming-panel" data-upcoming-panel="month" hidden>'+dashboardSection('Due in the next 31 days',dueMonth,risks,{id:'due-month',note:'Includes today through the next 31 days'})+'</div>'+ 
+    '</div>'+ 
+    '<div class="dashboard-two-column dashboard-bottom-cards">'+
+      '<div class="dashboard-section-group" id="workload"><div class="dashboard-group-head"><h2>Workload</h2><span>Active tickets by assignee</span></div>'+ 
+        dashboardSummarySection('Workload by assignee',dashboardWorkloadHtml(workload),'workload-by-assignee','Select a person to filter the main board')+
+      '</div>'+ 
+      '<div class="dashboard-section-group" id="priority-distribution"><div class="dashboard-group-head"><h2>Priority distribution</h2><span>Active tickets by Jira priority</span></div>'+ 
+        dashboardSummarySection('Priority distribution','<div class="dashboard-compact-list">'+priorityDistribution.map(x=>'<div class="dashboard-compact-row" style="cursor:default"><span class="dashboard-compact-main"><strong>'+esc(x[0])+'</strong></span><span class="dashboard-impact">'+x[1]+'</span></div>').join('')+'</div>','priority-distribution-content','Active tickets by Jira priority')+
+      '</div>'+ 
+    '</div>'+ 
+    '<div class="dashboard-section-group" id="attention"><div class="dashboard-group-head"><h2>Needs attention</h2><span>Risks that should be reviewed first</span></div>'+ 
+      dashboardSection('High-priority risk',highPriorityRisk,risks,{id:'high-priority-risk',returnSection:'high-priority-risk',note:'Highest and Critical work that is overdue, due soon or has a chain-date risk'})+
+      dashboardSection('Overdue tickets',risks.overdue,risks,{id:'overdue',returnSection:'overdue',note:'Past their due date'})+
+      dashboardSection('Dependency chain date risks',risks.chainDateRisks,risks,{id:'chain-risks',returnSection:'chain-risks',note:'A downstream ticket is due before an earlier ticket in its chain'})+
+      dashboardSection('Unassigned tickets',risks.unassigned,risks,{id:'unassigned',returnSection:'unassigned',note:'Active work with no assignee'})+
+      dashboardSection('Missing due dates',risks.noDueDate,risks,{id:'missing-due',returnSection:'missing-due',note:'Active work without a due date'})+
+      dashboardSection('Circular dependencies',risks.circularDependencies,risks,{id:'circular',returnSection:'circular',note:'Dependency loops that need resolving'})+
+      dashboardSection('Blocked tickets',blockedTickets,risks,{id:'blocked-tickets',returnSection:'blocked-tickets',note:'Active tickets waiting on one or more blockers'})+
+    '</div>'+ 
   '</div>';
 }
 function renderDashboard(){
-  // Keep the persistent dependency-line SVG in the board. Dashboard mode hides
-  // it with CSS; returning to a chain view can then redraw into the same canvas.
   board.insertAdjacentHTML('beforeend', dashboardOverviewHtml());
-
-  // Dashboard tickets are rendered separately from the normal board, so the
-  // standard event wiring does not run for them. Bind the same Jira-key modal
-  // handler here so the Settings > Jira modal preference works in Dashboard too.
   attachTicketKeyModalHandlers(board);
-  // Reuse the normal field event wiring so dashboard assignee, due-date and
-  // priority changes enter the same staged Jira save queue as the main board.
   attachEvents();
 
+  function setUpcomingTab(tab){
+    const value=tab==='month'?'month':'7';
+    board.querySelectorAll('[data-dashboard-upcoming-tab-button]').forEach(btn=>{
+      const active=btn.dataset.dashboardUpcomingTabButton===value;
+      btn.classList.toggle('active',active);
+      btn.setAttribute('aria-selected',active?'true':'false');
+    });
+    board.querySelectorAll('[data-upcoming-panel]').forEach(panel=>{
+      panel.hidden=panel.dataset.upcomingPanel!==value;
+    });
+  }
+  board.querySelectorAll('[data-dashboard-upcoming-tab-button]').forEach(btn=>{
+    btn.addEventListener('click',()=>setUpcomingTab(btn.dataset.dashboardUpcomingTabButton));
+  });
+  board.querySelectorAll('[data-dashboard-nav]').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      if(btn.dataset.dashboardUpcomingTab) setUpcomingTab(btn.dataset.dashboardUpcomingTab);
+      const target=document.getElementById(btn.dataset.dashboardNav);
+      if(target) target.scrollIntoView({behavior:'smooth',block:'start'});
+    });
+  });
+  board.querySelectorAll('[data-dashboard-show-more]').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const section=btn.closest('.dashboard-section');
+      if(!section) return;
+      const hidden=[...section.querySelectorAll('[data-dashboard-ticket-index][hidden]')].slice(0,10);
+      hidden.forEach(el=>el.hidden=false);
+      updateDashboardPagination(section);
+    });
+  });
+  board.querySelectorAll('[data-dashboard-show-all]').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const section=btn.closest('.dashboard-section');
+      if(!section) return;
+      section.querySelectorAll('[data-dashboard-ticket-index][hidden]').forEach(el=>el.hidden=false);
+      updateDashboardPagination(section);
+    });
+  });
+  board.querySelectorAll('[data-dashboard-assignee]').forEach(btn=>{
+    btn.addEventListener('click',e=>{
+      e.stopPropagation();
+      const accountId=btn.dataset.dashboardAssignee||'';
+      state.filterUser=accountId;
+      persistPreference('filterUser',state.filterUser);
+      state.showDashboard=false;
+      render();
+    });
+  });
+  board.querySelectorAll('[data-dashboard-milestone]').forEach(el=>{
+    el.addEventListener('click',e=>{
+      if(e.target.closest('[data-stop-propagation]')) return;
+      const key=el.dataset.dashboardMilestone;
+      if(!key) return;
+      state.showDashboard=false;
+      state.showMilestones=true;
+      state.lockedKey=null;
+      state.selectionHistory=[];
+      state.showBlocked=false;
+      state.returnMilestoneKey=null;
+      state.dashboardReturnSection=null;
+      state.milestoneFlashKey=key;
+      render();
+    });
+  });
+  board.querySelectorAll('[data-dashboard-unblocking]').forEach(el=>{
+    el.addEventListener('click',e=>{
+      if(e.target.closest('[data-stop-propagation]')) return;
+      const key=el.dataset.dashboardUnblocking;
+      if(!key) return;
+      state.showDashboard=false;
+      state.showMilestones=false;
+      state.lockedKey=key;
+      state.selectionHistory=[];
+      state.showBlocked=false;
+      state.returnMilestoneKey=null;
+      state.dashboardReturnSection='unblocking';
+      render();
+    });
+  });
   board.querySelectorAll('[data-dashboard-key]').forEach(el=>{
     el.addEventListener('click',e=>{
       if(e.target.closest('[data-stop-propagation]')) return;
       const key=el.dataset.dashboardKey;
       if(!key) return;
-      state.showDashboard=false; state.showMilestones=false; state.lockedKey=key; state.selectionHistory=[]; state.showBlocked=false; render();
+      const wrap=el.closest('[data-dashboard-return-section]');
+      state.showDashboard=false; state.showMilestones=false; state.lockedKey=key; state.selectionHistory=[]; state.showBlocked=false; state.dashboardReturnSection=wrap?.dataset.dashboardReturnSection||null; state.revealSelectedKey=key; render();
     });
   });
+}
+function updateDashboardPagination(section){
+  if(!section) return;
+  const items=section.querySelectorAll('[data-dashboard-ticket-index]');
+  const hidden=section.querySelectorAll('[data-dashboard-ticket-index][hidden]');
+  const more=section.querySelector('[data-dashboard-show-more]');
+  const all=section.querySelector('[data-dashboard-show-all]');
+  const remaining=hidden.length;
+  if(more){ more.textContent='Show more (+'+Math.min(10,remaining)+')'; more.hidden=remaining===0; }
+  if(all){ all.textContent='Show all ('+items.length+')'; all.hidden=remaining===0; }
 }
 
 // ── Milestone overview ───────────────────────────────────────────────────
@@ -4200,6 +4520,7 @@ function render(){
   board.classList.toggle('dashboard-board', state.showDashboard);
   document.getElementById('app').classList.toggle('milestone-mode', state.showMilestones);
   document.getElementById('app').classList.toggle('dashboard-mode', state.showDashboard);
+  dependencyStatus.classList.toggle('view-hidden', state.showDashboard || state.showMilestones);
   // Rebuild display data honoring the completed toggle
   computeDisplayData();
   console.debug('Dependency graph render', {issues:state.displayIssues.length, edges:state.displayEdges.length, selected:state.lockedKey});
@@ -4220,7 +4541,7 @@ function render(){
     if(filtersBtn) filtersBtn.style.visibility = 'hidden';
     if(clearFiltersBtn) clearFiltersBtn.style.visibility = 'hidden';
     deselectBtn.classList.remove('visible');
-    if(milestoneBackBtn) milestoneBackBtn.classList.remove('visible');
+    if(milestoneBackBtn){ milestoneBackBtn.classList.remove('visible'); milestoneBackBtn.innerHTML=''; }
     renderDashboard();
     statusText.textContent = 'Dashboard';
     return;
@@ -4268,10 +4589,21 @@ function render(){
   deselectBtn.classList.toggle('visible', locked);
   if(milestoneBackBtn){
     const backMilestone = state.returnMilestoneKey ? state.displayIssues.find(i => i.key === state.returnMilestoneKey) : null;
-    milestoneBackBtn.classList.toggle('visible', !!backMilestone);
-    milestoneBackBtn.innerHTML = backMilestone
-      ? '&#8592; Back to ' + esc(backMilestone.key + ' - ' + (backMilestone.summary || 'Milestone'))
-      : '';
+    const dashboardBackLabels = {
+      'unblocking':'Unblocking opportunities',
+      'high-priority-risk':'High-priority risk',
+      'overdue':'Overdue tickets',
+      'chain-risks':'Dependency chain date risks',
+      'unassigned':'Unassigned tickets',
+      'missing-due':'Missing due dates',
+      'circular':'Circular dependencies',
+      'blocked-tickets':'Blocked tickets'
+    };
+    const dashboardBack = !!state.dashboardReturnSection && !!dashboardBackLabels[state.dashboardReturnSection];
+    milestoneBackBtn.classList.toggle('visible', !!backMilestone || dashboardBack);
+    milestoneBackBtn.innerHTML = dashboardBack
+      ? '&#8592; Back to ' + esc(dashboardBackLabels[state.dashboardReturnSection])
+      : (backMilestone ? '&#8592; Back to ' + esc(backMilestone.key + ' - ' + (backMilestone.summary || 'Milestone')) : '');
   }
 
   // Search is applied after the cards are rendered. In selected mode the
@@ -5168,6 +5500,7 @@ document.querySelectorAll('[data-action="escape"]').forEach(btn => {
       state.lockedKey = null;
       state.selectionHistory = [];
       state.returnMilestoneKey = null;
+      state.dashboardReturnSection = null;
       state.milestoneFlashKey = null;
       state.revealSelectedKey = null;
       render();
@@ -5744,6 +6077,23 @@ document.addEventListener('click', () => {
 });
 
 milestoneBackBtn.addEventListener('click', () => {
+  if(state.dashboardReturnSection){
+    const sectionId=state.dashboardReturnSection;
+    state.dashboardReturnSection=null;
+    state.returnMilestoneKey=null;
+    state.showMilestones=false;
+    state.showDashboard=true;
+    state.lockedKey=null;
+    state.selectionHistory=[];
+    state.showBlocked=false;
+    state.milestoneFlashKey=null;
+    render();
+    requestAnimationFrame(()=>{
+      const target=document.getElementById(sectionId);
+      if(target) target.scrollIntoView({behavior:'smooth',block:'start'});
+    });
+    return;
+  }
   const key = state.returnMilestoneKey;
   if(!key) return;
   const previous = state.selectionHistory.length ? state.selectionHistory[0] : null;
@@ -5766,6 +6116,7 @@ document.querySelectorAll('.view-switch').forEach(btn => {
     state.selectionHistory=[];
     state.showBlocked=false;
     state.returnMilestoneKey=null;
+    state.dashboardReturnSection=null;
     render();
   });
 });
