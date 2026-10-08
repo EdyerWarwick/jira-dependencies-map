@@ -66,7 +66,7 @@ def _normalise_preferences(data):
         out.update({k:data[k] for k in DEFAULT_PREFERENCES if k in data})
     out["showCompleted"]=out["showCompleted"] is True
     out["filterUser"]=str(out["filterUser"] or "")
-    out["filterDue"]=out["filterDue"] if out["filterDue"] in {"all","next7","nextMonth","overdue"} else "all"
+    out["filterDue"]=out["filterDue"] if out["filterDue"] in {"all","next7","nextMonth","overdue","noDueDate"} else "all"
     out["includeWithRemarkable"]=out["includeWithRemarkable"] is not False
     out["customJql"]=str(out["customJql"] or "").strip()
     out["useJiraModal"]=out["useJiraModal"] is True
@@ -1964,6 +1964,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
             <option value="next7">Due in the next 7 days</option>
             <option value="nextMonth">Due in the next month</option>
             <option value="overdue">Overdue</option>
+            <option value="noDueDate">No due date set</option>
           </select>
         </label>
         <label class="filter-option">
@@ -2127,7 +2128,7 @@ async function loadPreferences(){
     if(!r.ok) throw new Error(saved.error || 'Unable to load preferences.');
     state.showCompleted=saved.showCompleted===true;
     state.filterUser=typeof saved.filterUser==='string' ? saved.filterUser : '';
-    state.filterDue=['all','next7','nextMonth','overdue'].includes(saved.filterDue) ? saved.filterDue : 'all';
+    state.filterDue=['all','next7','nextMonth','overdue','noDueDate'].includes(saved.filterDue) ? saved.filterDue : 'all';
     state.includeWithRemarkable=saved.includeWithRemarkable!==false;
     state.customJql=typeof saved.customJql==='string' ? saved.customJql.trim() : '';
     state.useJiraModal=saved.useJiraModal===true;
@@ -2168,7 +2169,7 @@ function restoreFilterSnapshot(snap){
   state.searchTerm = s.searchTerm || '';
   state.showCompleted = !!s.showCompleted;
   state.filterUser = s.filterUser || '';
-  state.filterDue = ['all','next7','nextMonth','overdue'].includes(s.filterDue) ? s.filterDue : 'all';
+  state.filterDue = ['all','next7','nextMonth','overdue','noDueDate'].includes(s.filterDue) ? s.filterDue : 'all';
   state.includeWithRemarkable = s.includeWithRemarkable !== false;
   if(searchEl) searchEl.value = state.searchTerm;
   saveFilterPreferences();
@@ -3541,6 +3542,7 @@ function issueMatchesDueFilter(issue, filterValue){
   const filter=filterValue || 'all';
   if(filter==='all') return true;
   const due=String(issue.dueDate || '');
+  if(filter==='noDueDate') return !due;
   if(!due) return false;
   const today=new Date();
   const todayKey=localDateKey(today);
