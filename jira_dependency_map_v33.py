@@ -33,6 +33,15 @@ STARTUP_MESSAGES_URL="https://sitebuilder.warwick.ac.uk/sitebuilder2/api/dataent
 # by jira_dependency_map_launcher.py, never by the running application.
 APP_VERSION="1.0.0"
 GITHUB_REPO=os.environ.get("JIRA_DEP_MAP_GITHUB_REPO","EdyerWarwick/jira-dependencies-map")
+_update_restart_lock=threading.Lock()
+_update_restart_started=False
+
+def _launcher_path():
+    """Return the stable launcher path supplied by the managed installation."""
+    value=str(os.environ.get("JIRA_DEP_MAP_LAUNCHER") or "").strip().strip('"')
+    if value and os.path.isfile(value):
+        return os.path.abspath(value)
+    return None
 
 # Credentials are stored in the current Windows user's Credential Manager.
 # Nothing sensitive is embedded in this source file or sent to the browser.
@@ -727,6 +736,7 @@ def api_app_version():
         "current":APP_VERSION,
         "latest":APP_VERSION,
         "updateAvailable":False,
+        "canInstall":bool(getattr(sys,"frozen",False) and _launcher_path()),
         "releaseUrl":f"https://github.com/{GITHUB_REPO}/releases/latest"
     }
     try:
@@ -791,6 +801,45 @@ def api_credentials_remove():
         return jsonify({"ok":True,"restarting":True})
     except Exception as e:
         return jsonify({"error":f"Could not remove credential: {e}"}),500
+
+@app.route("/api/install-update",methods=["POST"])
+def api_install_update():
+    """Restart through the stable launcher so it can install the latest release."""
+    global _update_restart_started
+
+    launcher=_launcher_path()
+    if not getattr(sys,"frozen",False) or not launcher:
+        return jsonify({
+            "error":"Automatic updates are only available when the app is run from the installed launcher."
+        }),409
+
+    with _update_restart_lock:
+        if _update_restart_started:
+            return jsonify({"ok":True,"restarting":True,"pid":os.getpid()})
+        try:
+            env=os.environ.copy()
+            # The launcher passes this to the replacement app so it reuses the
+            # existing browser tab instead of opening another one.
+            env["JIRA_DEP_MAP_RESTART"]="1"
+            subprocess.Popen(
+                [launcher],
+                cwd=os.path.dirname(launcher) or None,
+                env=env,
+                close_fds=True,
+                creationflags=getattr(subprocess,"CREATE_NEW_PROCESS_GROUP",0) if os.name=="nt" else 0
+            )
+            _update_restart_started=True
+        except Exception as e:
+            return jsonify({"error":f"Could not start the updater: {e}"}),500
+
+    def stop_current_app():
+        # Give Flask enough time to send the response before releasing port 5001.
+        time.sleep(0.8)
+        os._exit(0)
+
+    threading.Thread(target=stop_current_app,daemon=True).start()
+    return jsonify({"ok":True,"restarting":True,"pid":os.getpid()})
+
 
 @app.route("/api/update-health")
 def api_update_health():
@@ -1110,6 +1159,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   padding-bottom:20px;
 }
 #app.milestone-mode{overflow-x:auto;overflow-y:auto}
+#app.milestone-mode #board-minimap{display:none!important}
 #app.dashboard-mode{overflow-x:hidden;overflow-y:auto}
 #app.dashboard-mode #board{min-width:0;display:block;overflow:visible}
 
@@ -1667,9 +1717,49 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .credential-help{font-size:11px;color:#64748b;margin:-2px 0 10px;line-height:1.4}
 .credential-help a{color:#0057b8;text-decoration:underline}
 .credential-status{font-size:10px;color:#64748b;margin-top:8px;min-height:14px}
+
+
+/* ── Required application update ───────────────────────────────────────── */
+#required-update-modal{
+  position:fixed;inset:0;z-index:50000;display:none;align-items:center;justify-content:center;
+  padding:24px;background:rgba(15,23,42,.74);backdrop-filter:blur(4px);
+}
+#required-update-modal.open{display:flex}
+.required-update-card{
+  width:min(440px,100%);background:#fff;border:1px solid #cbd5e1;border-radius:14px;
+  box-shadow:0 24px 70px rgba(15,23,42,.42);padding:26px;text-align:center;
+}
+.required-update-icon{
+  width:52px;height:52px;margin:0 auto 15px;border-radius:50%;display:flex;
+  align-items:center;justify-content:center;background:#eef2ff;color:#4f46e5;
+  font-size:27px;font-weight:900;
+}
+.required-update-title{font-size:22px;line-height:1.2;color:#172033;margin-bottom:9px}
+.required-update-message{color:#64748b;line-height:1.55;margin-bottom:19px}
+.required-update-button{
+  width:100%;border:0;border-radius:8px;background:#4f46e5;color:#fff;
+  padding:11px 16px;font:inherit;font-weight:800;cursor:pointer;
+}
+.required-update-button:hover{background:#4338ca}
+.required-update-button:focus-visible{outline:3px solid rgba(99,102,241,.3);outline-offset:3px}
+.required-update-button:disabled{opacity:.65;cursor:wait}
+.required-update-status{min-height:18px;margin-top:12px;color:#64748b;font-size:12px;line-height:1.45}
+.required-update-status.error{color:#b91c1c}
+
 </style>
 </head>
 <body>
+
+<div id="required-update-modal" role="alertdialog" aria-modal="true" aria-labelledby="required-update-title">
+  <div class="required-update-card">
+    <div class="required-update-icon" aria-hidden="true">↻</div>
+    <h2 class="required-update-title" id="required-update-title">New version available!</h2>
+    <p class="required-update-message" id="required-update-message">A new version is ready to install.</p>
+    <button class="required-update-button" id="required-update-button" type="button">Update now</button>
+    <div class="required-update-status" id="required-update-status" role="status" aria-live="polite"></div>
+  </div>
+</div>
+
 
 <div id="due-date-modal" role="dialog" aria-modal="true" aria-labelledby="due-date-title">
   <div class="due-date-card">
@@ -2497,6 +2587,119 @@ async function removeCredential(){
   }
 }
 updateCustomJqlIndicator();
+
+// ── Required application update ───────────────────────────────────────────
+let updateRestarting = false;
+let requiredUpdateVersion = '';
+
+function updateVersionTuple(value){
+  return String(value || '').replace(/^[vV]/,'').split('.').map(part => {
+    const match = String(part).match(/^\d+/);
+    return match ? Number(match[0]) : 0;
+  });
+}
+
+function updateVersionAtLeast(actual, expected){
+  const a = updateVersionTuple(actual);
+  const b = updateVersionTuple(expected);
+  const length = Math.max(a.length,b.length);
+  for(let i=0;i<length;i++){
+    const left = a[i] || 0;
+    const right = b[i] || 0;
+    if(left !== right) return left > right;
+  }
+  return true;
+}
+
+function setRequiredUpdateStatus(message, isError=false){
+  const status = document.getElementById('required-update-status');
+  status.textContent = message || '';
+  status.classList.toggle('error', !!isError);
+}
+
+async function waitForUpdatedApplication(previousPid, expectedVersion){
+  const deadline = Date.now() + 180000;
+  while(Date.now() < deadline){
+    await new Promise(resolve => setTimeout(resolve,1000));
+    try{
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(),2500);
+      const response = await fetch('/api/update-health?ts=' + Date.now(),{
+        cache:'no-store',
+        signal:controller.signal
+      });
+      clearTimeout(timer);
+      const data = await response.json().catch(()=>({}));
+      if(
+        response.ok &&
+        data.ok === true &&
+        Number(data.pid) !== Number(previousPid) &&
+        updateVersionAtLeast(data.version,expectedVersion)
+      ){
+        setRequiredUpdateStatus('Update installed. Reloading…');
+        window.location.reload();
+        return;
+      }
+    }catch(e){
+      // The old server disappearing is expected while the launcher updates it.
+    }
+  }
+  const button = document.getElementById('required-update-button');
+  button.disabled = false;
+  button.textContent = 'Try update again';
+  updateRestarting = false;
+  setRequiredUpdateStatus('The update is taking longer than expected. Try again or restart the app from the Start menu.',true);
+}
+
+async function installRequiredUpdate(){
+  if(updateRestarting) return;
+  updateRestarting = true;
+  const button = document.getElementById('required-update-button');
+  button.disabled = true;
+  button.textContent = 'Restarting…';
+  setRequiredUpdateStatus('Closing the app and downloading the new version…');
+
+  try{
+    const response = await fetch('/api/install-update',{
+      method:'POST',
+      cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body:'{}'
+    });
+    const data = await response.json().catch(()=>({}));
+    if(!response.ok || !data.ok) throw new Error(data.error || 'The updater could not be started.');
+    waitForUpdatedApplication(data.pid,requiredUpdateVersion);
+  }catch(e){
+    updateRestarting = false;
+    button.disabled = false;
+    button.textContent = 'Try update again';
+    setRequiredUpdateStatus(e.message || 'The updater could not be started.',true);
+  }
+}
+
+async function checkForRequiredUpdate(){
+  try{
+    const response = await fetch('/api/app-version?ts=' + Date.now(),{cache:'no-store'});
+    const data = await response.json().catch(()=>({}));
+    if(!response.ok) return false;
+    if(data.updateAvailable && data.canInstall){
+      requiredUpdateVersion = String(data.latest || '');
+      const current = data.current ? 'v' + data.current : 'this version';
+      const latest = data.latest ? 'v' + data.latest : 'a newer version';
+      document.getElementById('required-update-message').textContent =
+        'Jira Dependency Map ' + latest + ' is available. You are using ' + current + '.';
+      const modal = document.getElementById('required-update-modal');
+      modal.classList.add('open');
+      document.getElementById('required-update-button').focus();
+      return true;
+    }
+  }catch(e){
+    console.warn('Automatic update check failed:',e);
+  }
+  return false;
+}
+
+document.getElementById('required-update-button').addEventListener('click',installRequiredUpdate);
 
 async function initialiseApp(){
   try{
@@ -3888,8 +4091,19 @@ function renderMilestoneOverview(flashKey){
   wrapper.innerHTML = milestoneOverviewHtml(milestones);
   board.appendChild(wrapper.firstElementChild);
 
-  // Milestone elements are rendered after the normal board event wiring.
+  // Milestone elements are rendered separately from the normal board event
+  // wiring, so attach the controls they contain here as well.
   attachTicketKeyModalHandlers(board);
+
+  // The milestone overview has its own renderer, so the normal attachEvents()
+  // due-date handler does not run for these buttons. Wire them explicitly.
+  board.querySelectorAll('[data-due-date-key]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      openDueDateModal(btn.dataset.dueDateKey);
+    });
+  });
 
   board.querySelectorAll('[data-milestone-chain]').forEach(el => {
     el.addEventListener('click', e => {
@@ -4013,6 +4227,9 @@ function render(){
   // Milestone overview is a separate horizontal board mode. It clears selection
   // and intentionally does not render the normal dependency columns.
   if(state.showMilestones){
+    // Milestone view must never retain the minimap from the previous chain
+    // view. Hide it immediately rather than waiting for a queued RAF update.
+    hideMiniMap();
     state.lockedKey = null;
     state.selectionHistory = [];
     state.showBlocked = false;
@@ -4221,6 +4438,11 @@ function scheduleMiniMapScrollUpdate(){
   });
 }
 
+function hideMiniMap(){
+  minimapMetrics = null;
+  if(boardMinimap) boardMinimap.classList.remove('visible');
+}
+
 function updateMiniMapViewport(){
   if(!boardMinimap || !boardMinimapViewport || !minimapMetrics) return;
   const app = document.getElementById('app');
@@ -4247,8 +4469,7 @@ function updateMiniMap(){
   // normal home board or in milestone view.
   if(state.showMiniMap === false || !state.lockedKey || state.showMilestones ||
      board.classList.contains('milestone-board')){
-    minimapMetrics = null;
-    boardMinimap.classList.remove('visible');
+    hideMiniMap();
     return;
   }
 
@@ -4260,8 +4481,7 @@ function updateMiniMap(){
   const canScroll = boardWidth > app.clientWidth + 2 || boardHeight > app.clientHeight + 2;
 
   if(!canScroll){
-    minimapMetrics = null;
-    boardMinimap.classList.remove('visible');
+    hideMiniMap();
     return;
   }
 
@@ -5672,7 +5892,7 @@ credentialEmail.addEventListener('keydown', e => {
 });
 
 window.addEventListener('beforeunload', e => {
-  if(state.pendingChanges.length){
+  if(state.pendingChanges.length && !updateRestarting){
     e.preventDefault();
     e.returnValue = '';
   }
@@ -5684,7 +5904,9 @@ window.addEventListener('resize', () => { requestAnimationFrame(drawLines); sche
 // every scroll frame only causes flicker.
 
 updateJiraModalSetting();
-initialiseApp();
+checkForRequiredUpdate().then(updateRequired => {
+  if(!updateRequired) initialiseApp();
+});
 </script>
 </body>
 </html>"""
