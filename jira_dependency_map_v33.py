@@ -161,6 +161,15 @@ def _get_latest_stable_release():
 
 app=Flask(__name__)
 
+@app.after_request
+def _disable_browser_caching(response):
+    """Dependency-map API data is live Jira data; never cache API responses."""
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"]="no-store, no-cache, max-age=0, must-revalidate"
+        response.headers["Pragma"]="no-cache"
+        response.headers["Expires"]="0"
+    return response
+
 if os.name == "nt":
     _advapi32=ctypes.WinDLL("advapi32", use_last_error=True)
     _CredWriteW=_advapi32.CredWriteW
@@ -277,6 +286,8 @@ def jira_error(resp):
 
 def _jira_search(jql, fields, label):
     """Run a paginated Jira JQL search and return all matching issues."""
+    # Give every Jira search request a unique URL as well as no-cache headers.
+    # This prevents an intermediary/proxy from reusing an older search response.
     url=f"{JIRA_BASE_URL}/rest/api/3/search/jql"
     all_issues=[]; token=None; page=0; batch_size=JIRA_BATCH_SIZE
     _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=0,fetched=0,total=None,detail="Connecting to Jira…")
@@ -284,12 +295,14 @@ def _jira_search(jql, fields, label):
         page+=1
         body={"jql":jql,"maxResults":batch_size,"fields":fields}
         if token: body["nextPageToken"]=token
+        # Cache-bust each Jira page so a manual refresh always requests fresh data.
+        request_url=f"{url}?_refresh={int(time.time()*1000)}_{page}"
         _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=page,fetched=len(all_issues),detail=f"Requesting batch {page}…")
         print(f"  -> Jira {label} page {page} (have {len(all_issues):,} so far; batch size {batch_size:,})")
         started=time.time()
         request_headers=get_jira_headers()
-        request_headers.update({"Cache-Control":"no-cache","Pragma":"no-cache"})
-        resp=JIRA_HTTP_SESSION.post(url,headers=request_headers,json=body,timeout=60)
+        request_headers.update({"Cache-Control":"no-store, no-cache, max-age=0","Pragma":"no-cache","Expires":"0"})
+        resp=JIRA_HTTP_SESSION.post(request_url,headers=request_headers,json=body,timeout=60)
         # Some Jira configurations enforce a smaller maxResults limit. Fall back once.
         if resp.status_code==400 and batch_size!=100:
             print(f"  <- Jira rejected batch size {batch_size}; retrying with 100")
@@ -1024,6 +1037,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 }
 .btn-toggle-completed.active .toggle-track{background:#6366f1}
 .btn-toggle-completed.active .toggle-track::after{transform:translateX(12px)}
+#toggle-completed.dashboard-hidden{display:none!important}
 .btn-toggle-milestones{padding-left:11px;padding-right:11px}
 .btn-toggle-milestones.active{background:rgba(56,189,248,.16);border-color:rgba(56,189,248,.45);color:#bae6fd}
 #board.milestone-board{display:block;width:max-content;min-width:100%;padding-bottom:10px;}
@@ -1618,6 +1632,14 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dashboard-compact-main>span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dashboard-compact-main strong{font-size:11px;flex:0 0 auto}
 .dashboard-compact-badges{display:flex;gap:5px;align-items:center;flex:0 0 auto}
+.dashboard-milestone-risk-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(270px,330px);gap:16px}
+.dashboard-milestone-risk-main{min-width:0}
+.dashboard-milestone-risk-metrics{display:grid;grid-template-columns:94px 88px minmax(82px,1fr);align-items:center;gap:10px;justify-items:start;font-size:11px;font-weight:800;white-space:nowrap}
+.dashboard-milestone-risk-blocked{color:#9a6700}
+.dashboard-milestone-risk-blocks{color:#4338ca}
+.dashboard-milestone-risk-date{color:#475569;font-weight:700}
+.dashboard-milestone-risk-date.due-date.overdue{color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;border-radius:5px;padding:3px 6px;font-weight:800}
+@media(max-width:700px){.dashboard-milestone-risk-row{grid-template-columns:minmax(0,1fr)}.dashboard-milestone-risk-metrics{grid-template-columns:94px 88px minmax(82px,1fr);padding-left:0}}
 .dashboard-impact{font-size:11px;font-weight:800;color:#6366f1;white-space:nowrap}
 .dashboard-workload-list{display:flex;flex-direction:column;gap:4px}
 .dashboard-workload-row{display:grid;grid-template-columns:minmax(150px,210px) 1fr 42px;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:6px 4px;text-align:left;cursor:pointer;color:#334155;border-radius:6px}
@@ -3947,12 +3969,34 @@ function dashboardWorkload(issues){
 }
 function dashboardMilestones(issues){
   const active=issues.filter(i=>!isCompletedStatus(i.status));
+  const byKey=new Map(issues.map(i=>[i.key,i]));
+  const countChain=(startKey,field)=>{
+    // Match the milestone view: count only active tickets actually present in
+    // this board's dataset. Relationship arrays can still reference completed
+    // or otherwise excluded tickets, so never count/traverse those keys.
+    const seen=new Set(), queue=[startKey];
+    while(queue.length){
+      const key=queue.shift(), issue=byKey.get(key);
+      if(!issue || isCompletedStatus(issue.status)) continue;
+      (issue[field]||[]).forEach(next=>{
+        if(next===startKey || seen.has(next)) return;
+        const nextIssue=byKey.get(next);
+        if(!nextIssue || isCompletedStatus(nextIssue.status)) return;
+        seen.add(next);
+        queue.push(next);
+      });
+    }
+    seen.delete(startKey);
+    return seen.size;
+  };
   const milestones=active.filter(i=>(i.labels||[]).some(l=>String(l).toLowerCase()==='milestone'));
   return milestones.map(m=>{
     const due=m.dueDate?new Date(m.dueDate+'T00:00:00'):null;
-    const blocked=(m.blocked||[]).map(k=>issues.find(i=>i.key===k)).filter(Boolean).filter(i=>!isCompletedStatus(i.status)).length;
+    // Count every unique ticket in the full dependency chain, not only direct links.
+    const blockers=countChain(m.key,'blockers');
+    const blocked=countChain(m.key,'blocked');
     const overdue=isDueDateOverdue(m.dueDate);
-    return {issue:m,blocked,overdue,due:due&&!Number.isNaN(due.getTime())?due:null};
+    return {issue:m,blockers,blocked,overdue,due:due&&!Number.isNaN(due.getTime())?due:null};
   }).sort((a,b)=>Number(b.overdue)-Number(a.overdue) || (a.due?.getTime()||Infinity)-(b.due?.getTime()||Infinity));
 }
 function dashboardPriorityDistribution(issues){
@@ -3980,7 +4024,7 @@ function dashboardWorkloadHtml(items){
 }
 function dashboardMilestoneHtml(items){
   if(!items.length) return '<div class="dashboard-empty">No active milestones found.</div>';
-  return '<div class="dashboard-compact-list">'+items.map(x=>'<button type="button" class="dashboard-compact-row" data-dashboard-milestone="'+esc(x.issue.key)+'"><span class="dashboard-compact-main"><strong>'+esc(x.issue.key)+'</strong><span>'+esc(x.issue.summary||'')+'</span></span><span class="dashboard-compact-badges">'+(x.overdue?dashboardRiskBadge('Overdue','overdue'):'')+(x.blocked?dashboardRiskBadge(x.blocked+' blocked','high'):'')+(x.issue.dueDate?dashboardRiskBadge(formatDueDate(x.issue.dueDate),'soon'):'')+'</span></button>').join('')+'</div>';
+  return '<div class="dashboard-compact-list dashboard-milestone-risk-list">'+items.map(x=>'<button type="button" class="dashboard-compact-row dashboard-milestone-risk-row" data-dashboard-milestone="'+esc(x.issue.key)+'"><span class="dashboard-compact-main dashboard-milestone-risk-main"><strong>'+esc(x.issue.key)+'</strong><span>'+esc(x.issue.summary||'')+'</span></span><span class="dashboard-milestone-risk-metrics"><span class="dashboard-milestone-risk-blocked">'+(x.blockers===0?'—':x.blockers+' blockers')+'</span><span class="dashboard-milestone-risk-blocks">'+(x.blocked===0?'—':x.blocked+' blocked')+'</span>'+(x.issue.dueDate?'<span class="dashboard-milestone-risk-date'+(x.overdue?' due-date overdue':'')+'">'+esc(formatDueDate(x.issue.dueDate))+'</span>':'<span class="dashboard-milestone-risk-date">No date</span>')+'</span></button>').join('')+'</div>';
 }
 function dashboardOverviewHtml(){
   const risks=dashboardRiskInfo(state.displayIssues||[]);
@@ -3993,6 +4037,7 @@ function dashboardOverviewHtml(){
   const bottlenecks=dashboardDependencyBottlenecks(risks.active);
   const workload=dashboardWorkload(risks.active);
   const topWorkload=workload.filter(x=>x.accountId).slice(0,6);
+  const assignedPeopleCount=new Set(risks.active.filter(i=>i.assigneeAccountId).map(i=>i.assigneeAccountId)).size;
   const milestones=dashboardMilestones(risks.active);
   const blockedTickets=risks.active.filter(i=>(i.blockers||[]).length);
   const priorityDistribution=dashboardPriorityDistribution(risks.active);
@@ -4030,7 +4075,7 @@ function dashboardOverviewHtml(){
           '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="7"><div class="dashboard-stat-value">'+dueSoon.length+'</div><div class="dashboard-stat-label">Due next 7 days</div><div class="dashboard-stat-help">Upcoming active work that needs attention soon.</div></div>'+ 
           '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="month"><div class="dashboard-stat-value">'+dueMonth.length+'</div><div class="dashboard-stat-label">Due next month</div><div class="dashboard-stat-help">Active work due within the next 31 days.</div></div>'+ 
         '</div>'+ 
-        '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="workload"><div class="dashboard-stat-value">'+topWorkload.length+' assignees</div><div class="dashboard-stat-label">Top workload</div><div class="dashboard-stat-help">Highest workload assignees by active ticket count.</div><div class="dashboard-top-workload">'+topWorkloadHtml+'</div></div>'+ 
+        '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="workload"><div class="dashboard-stat-value">'+assignedPeopleCount+' assignees</div><div class="dashboard-stat-label">Top workload</div><div class="dashboard-stat-help">Highest workload assignees by active ticket count.</div><div class="dashboard-top-workload">'+topWorkloadHtml+'</div></div>'+ 
       '</div></section>'+ 
     '<div class="dashboard-two-column dashboard-top-cards">'+
       '<div class="dashboard-section-group" id="milestones"><div class="dashboard-group-head"><h2>Milestones</h2><span>Milestone health and delivery pressure</span></div>'+ 
@@ -4520,6 +4565,7 @@ function render(){
   board.classList.toggle('dashboard-board', state.showDashboard);
   document.getElementById('app').classList.toggle('milestone-mode', state.showMilestones);
   document.getElementById('app').classList.toggle('dashboard-mode', state.showDashboard);
+  if(toggleCompletedBtn) toggleCompletedBtn.classList.toggle('dashboard-hidden', state.showDashboard);
   dependencyStatus.classList.toggle('view-hidden', state.showDashboard || state.showMilestones);
   // Rebuild display data honoring the completed toggle
   computeDisplayData();
@@ -5886,7 +5932,8 @@ function attachEvents(){
 
 // ── Load data ─────────────────────────────────────────────────────────────
 async function fetchGraph(mode, loadGeneration){
-  const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(String(loadGeneration || '')), {cache:'no-store'});
+  const refreshToken = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+  const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(String(loadGeneration || '')) + '&refresh=' + encodeURIComponent(refreshToken), {cache:'no-store'});
   const d = await r.json();
   if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
   console.log('Jira graph loaded', {issues:(d.issues || []).length, edges:(d.edges || []).length, withDueDates:(d.issues || []).filter(i => i.dueDate).length});
