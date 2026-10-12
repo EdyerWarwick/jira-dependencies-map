@@ -162,6 +162,15 @@ def _get_latest_stable_release():
 
 app=Flask(__name__)
 
+@app.after_request
+def _disable_browser_caching(response):
+    """Dependency-map API data is live Jira data; never cache API responses."""
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"]="no-store, no-cache, max-age=0, must-revalidate"
+        response.headers["Pragma"]="no-cache"
+        response.headers["Expires"]="0"
+    return response
+
 if os.name == "nt":
     _advapi32=ctypes.WinDLL("advapi32", use_last_error=True)
     _CredWriteW=_advapi32.CredWriteW
@@ -278,6 +287,8 @@ def jira_error(resp):
 
 def _jira_search(jql, fields, label):
     """Run a paginated Jira JQL search and return all matching issues."""
+    # Give every Jira search request a unique URL as well as no-cache headers.
+    # This prevents an intermediary/proxy from reusing an older search response.
     url=f"{JIRA_BASE_URL}/rest/api/3/search/jql"
     all_issues=[]; token=None; page=0; batch_size=JIRA_BATCH_SIZE
     _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=0,fetched=0,total=None,detail="Connecting to Jira…")
@@ -285,12 +296,14 @@ def _jira_search(jql, fields, label):
         page+=1
         body={"jql":jql,"maxResults":batch_size,"fields":fields}
         if token: body["nextPageToken"]=token
+        # Cache-bust each Jira page so a manual refresh always requests fresh data.
+        request_url=f"{url}?_refresh={int(time.time()*1000)}_{page}"
         _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=page,fetched=len(all_issues),detail=f"Requesting batch {page}…")
         print(f"  -> Jira {label} page {page} (have {len(all_issues):,} so far; batch size {batch_size:,})")
         started=time.time()
         request_headers=get_jira_headers()
-        request_headers.update({"Cache-Control":"no-cache","Pragma":"no-cache"})
-        resp=JIRA_HTTP_SESSION.post(url,headers=request_headers,json=body,timeout=60)
+        request_headers.update({"Cache-Control":"no-store, no-cache, max-age=0","Pragma":"no-cache","Expires":"0"})
+        resp=JIRA_HTTP_SESSION.post(request_url,headers=request_headers,json=body,timeout=60)
         # Some Jira configurations enforce a smaller maxResults limit. Fall back once.
         if resp.status_code==400 and batch_size!=100:
             print(f"  <- Jira rejected batch size {batch_size}; retrying with 100")
@@ -742,12 +755,10 @@ def api_faqs():
         items=data.get("items",[]) if isinstance(data,dict) else []
         faqs=[]
         for item in items if isinstance(items,list) else []:
-            if not isinstance(item,dict):
-                continue
+            if not isinstance(item,dict): continue
             title=str(item.get("title") or "").strip()
             body=str(item.get("parsedContentBody") or "").strip()
-            if title or body:
-                faqs.append({"title":title,"parsedContentBody":body})
+            if title or body: faqs.append({"title":title,"parsedContentBody":body})
         return jsonify({"items":faqs})
     except Exception as e:
         print(f"[FAQs] ERROR: {type(e).__name__}: {e}",flush=True)
@@ -1031,29 +1042,6 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .btn-settings:hover{color:#fff}
 #deselect{display:none;border-color:rgba(99,102,241,.5);background:rgba(99,102,241,.18);color:#c7d2fe}
 #deselect.visible{display:inline-flex}
-/* ── FAQs modal ─────────────────────────────────────────────────────────── */
-#faqs-modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.52);backdrop-filter:blur(2px);z-index:250;align-items:center;justify-content:center;padding:16px}
-#faqs-modal.open{display:flex}
-.faqs-card{width:min(540px,calc(100vw - 32px));height:min(700px,calc(100vh - 32px));max-height:calc(100vh - 32px);display:flex;flex-direction:column;overflow:hidden;background:#fff;border-radius:14px;box-shadow:0 24px 70px rgba(15,23,42,.28);padding:22px}
-.faqs-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-shrink:0}
-.faqs-head h2{font-size:18px;color:#172033}
-#faqs-search{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;font:inherit;margin-bottom:12px;flex-shrink:0}
-#faqs-list{overflow:auto;min-height:0;flex:1;border-top:1px solid #e2e8f0}
-.faq-item{border-bottom:1px solid #e2e8f0}
-.faq-question{width:100%;display:flex;justify-content:space-between;align-items:center;gap:12px;text-align:left;border:0;background:#fff;color:#172033;padding:13px 2px;font:inherit;font-weight:700;cursor:pointer}
-.faq-question-text{display:block;flex:1;min-width:0}
-.faq-question:hover{color:#4f46e5}
-.faq-question::after{content:"＋";font-size:18px;color:#64748b;flex-shrink:0}
-.faq-item.open .faq-question::after{content:"−"}
-.faq-answer{display:none;padding:0 2px 14px;color:#334155;line-height:1.6;overflow-wrap:anywhere}
-.faq-item.open .faq-answer{display:block}
-.faq-answer p{margin:0 0 9px}.faq-answer p:last-child{margin-bottom:0}.faq-answer ul,.faq-answer ol{padding-left:22px}
-.faq-answer a{color:#4f46e5;text-decoration:underline}
-.faq-answer mark{background:#fde68a;color:#172033;border-radius:2px;padding:0 1px}
-.faq-empty{padding:20px 2px;color:#64748b;text-align:center}
-.faqs-footer{padding-top:14px;margin-top:12px;border-top:1px solid #e2e8f0;display:flex;justify-content:flex-end;flex-shrink:0}
-.faqs-ask{border:0;border-radius:8px;background:#4f46e5;color:#fff;padding:10px 15px;font:inherit;font-weight:700;cursor:pointer}
-.faqs-ask:hover{background:#4338ca}
 /* ── Completed toggle ────────────────────────────────────────────────────── */
 .btn-toggle-completed{gap:7px;padding-left:10px}
 .toggle-track{
@@ -1070,6 +1058,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 }
 .btn-toggle-completed.active .toggle-track{background:#6366f1}
 .btn-toggle-completed.active .toggle-track::after{transform:translateX(12px)}
+#toggle-completed.dashboard-hidden{display:none!important}
 .btn-toggle-milestones{padding-left:11px;padding-right:11px}
 .btn-toggle-milestones.active{background:rgba(56,189,248,.16);border-color:rgba(56,189,248,.45);color:#bae6fd}
 #board.milestone-board{display:block;width:max-content;min-width:100%;padding-bottom:10px;}
@@ -1173,6 +1162,21 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 }
 .ticket-preview-close:hover{background:#334155;border-color:#475569;color:#fff}
 .ticket-preview-modal iframe{display:block;flex:1 1 auto;width:100%;min-height:0;border:0;background:#fff}
+#faqs-modal{display:none;position:fixed;inset:0;z-index:10079;background:rgba(15,23,42,.22);align-items:center;justify-content:center;padding:24px}
+#faqs-modal.open{display:flex}
+.faqs-dialog{width:min(760px,calc(100vw - 48px));height:min(760px,calc(100vh - 48px));display:flex;flex-direction:column;overflow:hidden;background:#fff;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 24px 70px rgba(15,23,42,.28)}
+.faqs-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:#f8fafc;border-bottom:1px solid #e2e8f0;flex:0 0 auto}
+.faqs-header h2{font-size:14px;color:#0f172a}.faqs-search-wrap{padding:12px 14px;border-bottom:1px solid #e2e8f0;flex:0 0 auto}
+#faqs-search{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:7px;font:inherit;outline-color:#6366f1}
+#faqs-list{flex:1 1 auto;overflow:auto;padding:12px 14px;min-height:0}
+.faq-item{border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;overflow:hidden}
+.faq-question{list-style:none;display:block;cursor:pointer;padding:13px 38px 13px 14px;font-weight:750;color:#172033;position:relative}
+.faq-question::-webkit-details-marker{display:none}.faq-question:after{content:'+';position:absolute;right:14px;top:10px;font-size:20px;color:#64748b}.faq-item[open] .faq-question:after{content:'−'}
+.faq-answer{padding:0 14px 14px;color:#334155;line-height:1.55}.faq-answer p{margin:0 0 9px}.faq-answer p:last-child{margin-bottom:0}.faq-answer ul,.faq-answer ol{padding-left:22px;margin:6px 0}.faq-answer a{color:#4338ca;text-decoration:underline}
+.faqs-footer{flex:0 0 auto;display:flex;justify-content:flex-end;padding:10px 14px;border-top:1px solid #e2e8f0;background:#f8fafc}
+.faqs-ask{border:0;background:#4338ca;color:#fff;border-radius:7px;padding:10px 15px;font-weight:750;cursor:pointer}.faqs-ask:hover{background:#3730a3}
+.faqs-empty{padding:20px;color:#64748b;text-align:center}mark.faq-highlight{background:#fef08a;color:inherit;padding:0;border-radius:2px}
+@media(max-width:700px){#faqs-modal{padding:8px}.faqs-dialog{width:calc(100vw - 16px);height:calc(100vh - 16px)}}
 
 /* ── Error bar ───────────────────────────────────────────────────────────── */
 #error{
@@ -1664,6 +1668,14 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dashboard-compact-main>span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dashboard-compact-main strong{font-size:11px;flex:0 0 auto}
 .dashboard-compact-badges{display:flex;gap:5px;align-items:center;flex:0 0 auto}
+.dashboard-milestone-risk-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(270px,330px);gap:16px}
+.dashboard-milestone-risk-main{min-width:0}
+.dashboard-milestone-risk-metrics{display:grid;grid-template-columns:94px 88px minmax(82px,1fr);align-items:center;gap:10px;justify-items:start;font-size:11px;font-weight:800;white-space:nowrap}
+.dashboard-milestone-risk-blocked{color:#9a6700}
+.dashboard-milestone-risk-blocks{color:#4338ca}
+.dashboard-milestone-risk-date{color:#475569;font-weight:700}
+.dashboard-milestone-risk-date.due-date.overdue{color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;border-radius:5px;padding:3px 6px;font-weight:800}
+@media(max-width:700px){.dashboard-milestone-risk-row{grid-template-columns:minmax(0,1fr)}.dashboard-milestone-risk-metrics{grid-template-columns:94px 88px minmax(82px,1fr);padding-left:0}}
 .dashboard-impact{font-size:11px;font-weight:800;color:#6366f1;white-space:nowrap}
 .dashboard-workload-list{display:flex;flex-direction:column;gap:4px}
 .dashboard-workload-row{display:grid;grid-template-columns:minmax(150px,210px) 1fr 42px;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:6px 4px;text-align:left;cursor:pointer;color:#334155;border-radius:6px}
@@ -2105,7 +2117,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
       <button class="view-switch" data-view="milestone" type="button">Milestones</button>
     </div>
     <button class="btn btn-settings" id="settings" title="Settings" aria-label="Settings">&#9881;</button>
-    <button class="btn btn-settings" id="faqs-open" title="FAQs" aria-label="FAQs">?</button>
+    <button class="btn btn-settings" id="faqs-open" title="FAQs" aria-label="FAQs" style="font-size:15px;font-weight:800">?</button>
     <button class="btn btn-refresh" id="refresh" title="Refresh from Jira">&#x21BB;</button>
   </div>
 </header>
@@ -2113,14 +2125,13 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 <button class="milestone-back" id="milestone-back" type="button"></button>
 <div id="error"></div>
 <div id="faqs-modal" role="dialog" aria-modal="true" aria-labelledby="faqs-title">
-  <div class="faqs-card">
-    <div class="faqs-head"><h2 id="faqs-title">Frequently asked questions</h2><button class="modal-close" id="faqs-close" type="button" aria-label="Close FAQs">×</button></div>
-    <input id="faqs-search" type="search" placeholder="Search FAQs…" aria-label="Search FAQs" autocomplete="off">
-    <div id="faqs-list" aria-live="polite"><div class="faq-empty">Loading FAQs…</div></div>
+  <div class="faqs-dialog">
+    <div class="faqs-header"><h2 id="faqs-title">Frequently asked questions</h2><button class="ticket-preview-close" id="faqs-close" type="button" aria-label="Close FAQs">Close ×</button></div>
+    <div class="faqs-search-wrap"><label class="sr-only" for="faqs-search">Search FAQs</label><input id="faqs-search" type="search" placeholder="Search questions and answers…" autocomplete="off"></div>
+    <div id="faqs-list" aria-live="polite"><div class="faqs-empty">Loading FAQs…</div></div>
     <div class="faqs-footer"><a class="faqs-ask" href="mailto:edward.dyer@warwick.ac.uk?subject=Jira%20Dependency%20Map%20Question">Ask a question</a></div>
   </div>
 </div>
-
 <div id="dependency-modal" role="dialog" aria-modal="true" aria-labelledby="dependency-modal-title">
   <div class="modal-card">
     <div class="modal-head"><h2 id="dependency-modal-title">Edit dependencies</h2><button class="modal-close" id="dependency-modal-close" type="button" aria-label="Close">×</button></div>
@@ -2191,8 +2202,6 @@ const state = {
   loadGeneration:0,
   showMilestones:false,         // toggle: OFF by default; milestone overview
   showDashboard:false,
-  // Remember the last full-board context when switching to Dashboard/Milestones.
-  fullBoardReturn:null,
   startingView:'default',
   showMiniMap:true, customJql:'', useJiraModal:false,
   displayIssues:[], displayEdges:[], displayLevels:0,
@@ -2218,6 +2227,7 @@ function readSharedViewUrl(){
   };
 }
 let pendingSharedView=readSharedViewUrl();
+let savedFullBoardView=null;
 
 function syncSharedViewUrl(){
   const selectedKey=(!state.showDashboard && !state.showMilestones && state.lockedKey)
@@ -2414,13 +2424,6 @@ const settingsMessagesView = document.getElementById('settings-messages-view');
 const settingsSeeStartupMessages = document.getElementById('settings-see-startup-messages');
 const settingsBack = document.getElementById('settings-back');
 const settingsMessagesList = document.getElementById('settings-messages-list');
-const faqsOpen = document.getElementById('faqs-open');
-const faqsModal = document.getElementById('faqs-modal');
-const faqsClose = document.getElementById('faqs-close');
-const faqsSearch = document.getElementById('faqs-search');
-const faqsList = document.getElementById('faqs-list');
-let faqItems = [];
-
 const startupMessage = document.getElementById('startup-message');
 const dueDateModal = document.getElementById('due-date-modal');
 const dueDateInput = document.getElementById('due-date-input');
@@ -2544,80 +2547,6 @@ function setMiniMapSetting(enabled){
   updateMiniMapSetting();
   scheduleMiniMapUpdate();
 }
-function escapeFaqText(value){
-  return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-}
-function highlightFaqText(root, query){
-  if(!query) return;
-  const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);
-  const nodes=[]; while(walker.nextNode()) nodes.push(walker.currentNode);
-  const needle=query.toLocaleLowerCase();
-  nodes.forEach(node=>{
-    const text=node.nodeValue || '';
-    if(!text.toLocaleLowerCase().includes(needle) || !node.parentNode) return;
-    const frag=document.createDocumentFragment(); let cursor=0; let lower=text.toLocaleLowerCase(); let index;
-    while((index=lower.indexOf(needle,cursor))!==-1){
-      frag.appendChild(document.createTextNode(text.slice(cursor,index)));
-      const mark=document.createElement('mark'); mark.textContent=text.slice(index,index+query.length); frag.appendChild(mark);
-      cursor=index+query.length;
-    }
-    frag.appendChild(document.createTextNode(text.slice(cursor)));
-    node.parentNode.replaceChild(frag,node);
-  });
-}
-function renderFaqs(){
-  const query=faqsSearch.value.trim();
-  const q=query.toLocaleLowerCase();
-  const filtered=faqItems.filter(item=>(item.title+' '+item.parsedContentBody.replace(/<[^>]*>/g,' ')).toLocaleLowerCase().includes(q));
-  faqsList.innerHTML='';
-  if(!filtered.length){
-    const empty=document.createElement('div'); empty.className='faq-empty';
-    empty.textContent=query ? 'No FAQs match your search.' : 'No FAQs are currently available.';
-    faqsList.appendChild(empty); return;
-  }
-  filtered.forEach(item=>{
-    const wrapper=document.createElement('section'); wrapper.className='faq-item';
-    const button=document.createElement('button'); button.type='button'; button.className='faq-question';
-    button.setAttribute('aria-expanded',query ? 'true':'false');
-    const questionText=document.createElement('span'); questionText.className='faq-question-text'; questionText.textContent=item.title || 'Untitled question';
-    button.appendChild(questionText);
-    const answer=document.createElement('div'); answer.className='faq-answer';
-    // The body is the Sitebuilder parsedContentBody HTML, as used by startup messages.
-    answer.innerHTML=item.parsedContentBody || '';
-    if(query){
-      wrapper.classList.add('open');
-      highlightFaqText(button,query); highlightFaqText(answer,query);
-    }
-    button.addEventListener('click',()=>{
-      const open=wrapper.classList.toggle('open');
-      button.setAttribute('aria-expanded',open?'true':'false');
-    });
-    wrapper.append(button,answer); faqsList.appendChild(wrapper);
-  });
-}
-async function openFaqs(){
-  faqsModal.classList.add('open');
-  faqsSearch.value='';
-  faqsList.innerHTML='<div class="faq-empty">Loading FAQs…</div>';
-  faqsSearch.focus();
-  try{
-    const r=await fetch('/api/faqs?ts='+Date.now(),{cache:'no-store'});
-    const data=await r.json();
-    if(!r.ok || !Array.isArray(data.items)) throw new Error(data.error || 'Unable to load FAQs');
-    faqItems=data.items;
-    renderFaqs();
-  }catch(e){
-    console.error('[FAQs] Load failed:',e);
-    faqsList.innerHTML='<div class="faq-empty">FAQs could not be loaded. Please try again later.</div>';
-  }
-}
-function closeFaqs(){faqsModal.classList.remove('open');}
-faqsOpen.addEventListener('click',openFaqs);
-faqsClose.addEventListener('click',closeFaqs);
-faqsModal.addEventListener('click',e=>{if(e.target===faqsModal) closeFaqs();});
-faqsSearch.addEventListener('input',renderFaqs);
-document.addEventListener('keydown',e=>{if(e.key==='Escape' && faqsModal.classList.contains('open')) closeFaqs();});
-
 function renderStartupMessages(items){
   settingsMessagesList.innerHTML = '';
   if(!items.length){
@@ -2673,6 +2602,57 @@ async function showAllStartupMessages(){
     settingsMessagesList.innerHTML = '<div class="settings-message-empty">Startup messages could not be loaded.</div>';
   }
 }
+const faqsModal=document.getElementById('faqs-modal');
+const faqsList=document.getElementById('faqs-list');
+const faqsSearch=document.getElementById('faqs-search');
+let cachedFaqs=null;
+function highlightFaqText(root, query){
+  // Restore the original text before applying the current query, then merge
+  // adjacent text nodes. This avoids progressively fragmenting the DOM as the
+  // user types and supports matches that span inline markup such as <strong>.
+  root.querySelectorAll('mark.faq-highlight').forEach(mark=>mark.replaceWith(document.createTextNode(mark.textContent||'')));
+  root.normalize();
+  if(!query) return;
+  const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{acceptNode(node){return node.parentElement && !node.parentElement.closest('script,style,mark') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;}});
+  const nodes=[];let fullText='';
+  while(walker.nextNode()){const node=walker.currentNode;nodes.push({node,start:fullText.length,end:fullText.length+(node.nodeValue||'').length});fullText+=node.nodeValue||'';}
+  if(!fullText) return;
+  const escaped=query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  let regex;try{regex=new RegExp(escaped,'ig')}catch(_){return}
+  const matches=[];let match;while((match=regex.exec(fullText))!==null){matches.push({start:match.index,end:match.index+match[0].length});if(!match[0].length)regex.lastIndex++;}
+  if(!matches.length)return;
+  nodes.forEach(({node,start,end})=>{
+    const value=node.nodeValue||'';const overlaps=matches.filter(m=>m.start<end&&m.end>start);if(!overlaps.length)return;
+    const frag=document.createDocumentFragment();let cursor=0;
+    overlaps.forEach(m=>{const a=Math.max(0,m.start-start),b=Math.min(value.length,m.end-start);if(a>cursor)frag.append(document.createTextNode(value.slice(cursor,a)));if(b>a){const mark=document.createElement('mark');mark.className='faq-highlight';mark.textContent=value.slice(a,b);frag.append(mark);cursor=b;}});
+    if(cursor<value.length)frag.append(document.createTextNode(value.slice(cursor)));
+    node.replaceWith(frag);
+  });
+}
+function filterFaqs(){
+  const query=faqsSearch.value.trim();let visible=0;
+  [...faqsList.querySelectorAll('.faq-item')].forEach(item=>{
+    const text=(item.dataset.searchText||'').toLocaleLowerCase();const match=!query||text.includes(query.toLocaleLowerCase());
+    item.hidden=!match;if(!match)return;visible++;item.open=!!query;
+    highlightFaqText(item.querySelector('.faq-question'),query);
+    highlightFaqText(item.querySelector('.faq-answer'),query);
+  });
+  let empty=faqsList.querySelector('.faqs-no-results');
+  if(!visible&&query){if(!empty){empty=document.createElement('div');empty.className='faqs-empty faqs-no-results';faqsList.appendChild(empty);}empty.textContent='No FAQs match your search.';}else if(empty)empty.remove();
+}
+function renderFaqs(items){
+  faqsList.innerHTML='';
+  if(!items.length){faqsList.innerHTML='<div class="faqs-empty">No FAQs are currently available.</div>';return;}
+  items.forEach(item=>{const details=document.createElement('details');details.className='faq-item';const question=document.createElement('summary');question.className='faq-question';question.textContent=item.title||'Untitled question';const answer=document.createElement('div');answer.className='faq-answer';answer.innerHTML=item.parsedContentBody||'';details.dataset.searchText=(question.textContent+' '+answer.textContent).toLocaleLowerCase();details.append(question,answer);faqsList.appendChild(details);});
+  filterFaqs();
+}
+async function openFaqs(){faqsModal.classList.add('open');faqsSearch.value='';faqsList.innerHTML='<div class="faqs-empty">Loading FAQs…</div>';faqsSearch.focus();try{if(!cachedFaqs){const r=await fetch('/api/faqs?ts='+Date.now(),{cache:'no-store'});const data=await r.json();if(!r.ok||!Array.isArray(data.items))throw new Error(data.error||'Unable to load FAQs');cachedFaqs=data.items;}renderFaqs(cachedFaqs);}catch(e){faqsList.innerHTML='<div class="faqs-empty">FAQs could not be loaded. Please try again later.</div>';console.error('[FAQs] Load failed:',e);}}
+document.getElementById('faqs-open').addEventListener('click',openFaqs);
+document.getElementById('faqs-close').addEventListener('click',()=>faqsModal.classList.remove('open'));
+faqsModal.addEventListener('click',e=>{if(e.target===faqsModal)faqsModal.classList.remove('open');});
+faqsSearch.addEventListener('input',filterFaqs);
+document.addEventListener('keydown',e=>{if(e.key==='Escape')faqsModal.classList.remove('open');});
+
 function closeSettings(){ settingsModal.classList.remove('open'); showSettingsMain(); }
 async function openSettings(openJql = false){
   updateJiraModalSetting();
@@ -4086,12 +4066,34 @@ function dashboardWorkload(issues){
 }
 function dashboardMilestones(issues){
   const active=issues.filter(i=>!isCompletedStatus(i.status));
+  const byKey=new Map(issues.map(i=>[i.key,i]));
+  const countChain=(startKey,field)=>{
+    // Match the milestone view: count only active tickets actually present in
+    // this board's dataset. Relationship arrays can still reference completed
+    // or otherwise excluded tickets, so never count/traverse those keys.
+    const seen=new Set(), queue=[startKey];
+    while(queue.length){
+      const key=queue.shift(), issue=byKey.get(key);
+      if(!issue || isCompletedStatus(issue.status)) continue;
+      (issue[field]||[]).forEach(next=>{
+        if(next===startKey || seen.has(next)) return;
+        const nextIssue=byKey.get(next);
+        if(!nextIssue || isCompletedStatus(nextIssue.status)) return;
+        seen.add(next);
+        queue.push(next);
+      });
+    }
+    seen.delete(startKey);
+    return seen.size;
+  };
   const milestones=active.filter(i=>(i.labels||[]).some(l=>String(l).toLowerCase()==='milestone'));
   return milestones.map(m=>{
     const due=m.dueDate?new Date(m.dueDate+'T00:00:00'):null;
-    const blocked=(m.blocked||[]).map(k=>issues.find(i=>i.key===k)).filter(Boolean).filter(i=>!isCompletedStatus(i.status)).length;
+    // Count every unique ticket in the full dependency chain, not only direct links.
+    const blockers=countChain(m.key,'blockers');
+    const blocked=countChain(m.key,'blocked');
     const overdue=isDueDateOverdue(m.dueDate);
-    return {issue:m,blocked,overdue,due:due&&!Number.isNaN(due.getTime())?due:null};
+    return {issue:m,blockers,blocked,overdue,due:due&&!Number.isNaN(due.getTime())?due:null};
   }).sort((a,b)=>Number(b.overdue)-Number(a.overdue) || (a.due?.getTime()||Infinity)-(b.due?.getTime()||Infinity));
 }
 function dashboardPriorityDistribution(issues){
@@ -4119,7 +4121,7 @@ function dashboardWorkloadHtml(items){
 }
 function dashboardMilestoneHtml(items){
   if(!items.length) return '<div class="dashboard-empty">No active milestones found.</div>';
-  return '<div class="dashboard-compact-list">'+items.map(x=>'<button type="button" class="dashboard-compact-row" data-dashboard-milestone="'+esc(x.issue.key)+'"><span class="dashboard-compact-main"><strong>'+esc(x.issue.key)+'</strong><span>'+esc(x.issue.summary||'')+'</span></span><span class="dashboard-compact-badges">'+(x.overdue?dashboardRiskBadge('Overdue','overdue'):'')+(x.blocked?dashboardRiskBadge(x.blocked+' blocked','high'):'')+(x.issue.dueDate?dashboardRiskBadge(formatDueDate(x.issue.dueDate),'soon'):'')+'</span></button>').join('')+'</div>';
+  return '<div class="dashboard-compact-list dashboard-milestone-risk-list">'+items.map(x=>'<button type="button" class="dashboard-compact-row dashboard-milestone-risk-row" data-dashboard-milestone="'+esc(x.issue.key)+'"><span class="dashboard-compact-main dashboard-milestone-risk-main"><strong>'+esc(x.issue.key)+'</strong><span>'+esc(x.issue.summary||'')+'</span></span><span class="dashboard-milestone-risk-metrics"><span class="dashboard-milestone-risk-blocked">'+(x.blockers===0?'—':x.blockers+' blockers')+'</span><span class="dashboard-milestone-risk-blocks">'+(x.blocked===0?'—':x.blocked+' blocked')+'</span>'+(x.issue.dueDate?'<span class="dashboard-milestone-risk-date'+(x.overdue?' due-date overdue':'')+'">'+esc(formatDueDate(x.issue.dueDate))+'</span>':'<span class="dashboard-milestone-risk-date">No date</span>')+'</span></button>').join('')+'</div>';
 }
 function dashboardOverviewHtml(){
   const risks=dashboardRiskInfo(state.displayIssues||[]);
@@ -4132,6 +4134,7 @@ function dashboardOverviewHtml(){
   const bottlenecks=dashboardDependencyBottlenecks(risks.active);
   const workload=dashboardWorkload(risks.active);
   const topWorkload=workload.filter(x=>x.accountId).slice(0,6);
+  const assignedPeopleCount=new Set(risks.active.filter(i=>i.assigneeAccountId).map(i=>i.assigneeAccountId)).size;
   const milestones=dashboardMilestones(risks.active);
   const blockedTickets=risks.active.filter(i=>(i.blockers||[]).length);
   const priorityDistribution=dashboardPriorityDistribution(risks.active);
@@ -4169,7 +4172,7 @@ function dashboardOverviewHtml(){
           '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="7"><div class="dashboard-stat-value">'+dueSoon.length+'</div><div class="dashboard-stat-label">Due next 7 days</div><div class="dashboard-stat-help">Upcoming active work that needs attention soon.</div></div>'+ 
           '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="month"><div class="dashboard-stat-value">'+dueMonth.length+'</div><div class="dashboard-stat-label">Due next month</div><div class="dashboard-stat-help">Active work due within the next 31 days.</div></div>'+ 
         '</div>'+ 
-        '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="workload"><div class="dashboard-stat-value">'+topWorkload.length+' assignees</div><div class="dashboard-stat-label">Top workload</div><div class="dashboard-stat-help">Highest workload assignees by active ticket count.</div><div class="dashboard-top-workload">'+topWorkloadHtml+'</div></div>'+ 
+        '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="workload"><div class="dashboard-stat-value">'+assignedPeopleCount+' assignees</div><div class="dashboard-stat-label">Top workload</div><div class="dashboard-stat-help">Highest workload assignees by active ticket count.</div><div class="dashboard-top-workload">'+topWorkloadHtml+'</div></div>'+ 
       '</div></section>'+ 
     '<div class="dashboard-two-column dashboard-top-cards">'+
       '<div class="dashboard-section-group" id="milestones"><div class="dashboard-group-head"><h2>Milestones</h2><span>Milestone health and delivery pressure</span></div>'+ 
@@ -4659,8 +4662,7 @@ function render(){
   board.classList.toggle('dashboard-board', state.showDashboard);
   document.getElementById('app').classList.toggle('milestone-mode', state.showMilestones);
   document.getElementById('app').classList.toggle('dashboard-mode', state.showDashboard);
-  // Completed is available on the full board and Milestones, but hidden on Dashboard only.
-  if(toggleCompletedBtn) toggleCompletedBtn.style.display = state.showDashboard ? 'none' : '';
+  if(toggleCompletedBtn) toggleCompletedBtn.classList.toggle('dashboard-hidden', state.showDashboard);
   dependencyStatus.classList.toggle('view-hidden', state.showDashboard || state.showMilestones);
   // Rebuild display data honoring the completed toggle
   computeDisplayData();
@@ -6027,7 +6029,8 @@ function attachEvents(){
 
 // ── Load data ─────────────────────────────────────────────────────────────
 async function fetchGraph(mode, loadGeneration){
-  const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(String(loadGeneration || '')), {cache:'no-store'});
+  const refreshToken = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+  const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(String(loadGeneration || '')) + '&refresh=' + encodeURIComponent(refreshToken), {cache:'no-store'});
   const d = await r.json();
   if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
   console.log('Jira graph loaded', {issues:(d.issues || []).length, edges:(d.edges || []).length, withDueDates:(d.issues || []).filter(i => i.dueDate).length});
@@ -6251,46 +6254,17 @@ milestoneBackBtn.addEventListener('click', () => {
 document.querySelectorAll('.view-switch').forEach(btn => {
   btn.addEventListener('click', () => {
     const view=btn.dataset.view;
-    const currentlyFullBoard=!state.showDashboard && !state.showMilestones;
-
-    // Clicking the already-active Full board tab must not clear a selected chain
-    // or reset the current board context.
-    if(view==='default' && currentlyFullBoard) return;
-
-    if(view==='default'){
-      const saved=state.fullBoardReturn;
-      state.showDashboard=false;
-      state.showMilestones=false;
-      if(saved){
-        state.lockedKey=saved.lockedKey;
-        state.selectionHistory=saved.selectionHistory;
-        state.showBlocked=saved.showBlocked;
-        state.filterUser=saved.filterUser;
-        state.filterDue=saved.filterDue;
-        state.includeWithRemarkable=saved.includeWithRemarkable;
-        if(searchEl) searchEl.value=saved.searchValue || '';
-        state.fullBoardReturn=null;
-      }else{
-        state.lockedKey=null;
-        state.selectionHistory=[];
-        state.showBlocked=false;
-      }
+    const currentView=state.showDashboard?'dashboard':state.showMilestones?'milestone':'default';
+    if(currentView==='default' && view!=='default'){
+      savedFullBoardView={lockedKey:state.lockedKey,selectionHistory:JSON.parse(JSON.stringify(state.selectionHistory||[])),showBlocked:state.showBlocked,filterUser:state.filterUser,filterDue:state.filterDue,includeWithRemarkable:state.includeWithRemarkable,searchTerm:state.searchTerm,scrollPositions:JSON.parse(JSON.stringify(state.scrollPositions||{}))};
+    }
+    state.showDashboard=view==='dashboard';
+    state.showMilestones=view==='milestone';
+    if(view==='default' && savedFullBoardView){
+      Object.assign(state,savedFullBoardView);
+      savedFullBoardView=null;
+      if(searchEl && typeof state.searchTerm==='string') searchEl.value=state.searchTerm;
     }else{
-      // Save the full-board context only when leaving it. Switching between
-      // Dashboard and Milestones should not overwrite the saved board view.
-      if(currentlyFullBoard){
-        state.fullBoardReturn={
-          lockedKey:state.lockedKey,
-          selectionHistory:state.selectionHistory.map(entry=>({...entry,filters:entry.filters?{...entry.filters}:entry.filters})),
-          showBlocked:state.showBlocked,
-          filterUser:state.filterUser,
-          filterDue:state.filterDue,
-          includeWithRemarkable:state.includeWithRemarkable,
-          searchValue:searchEl ? searchEl.value : ''
-        };
-      }
-      state.showDashboard=view==='dashboard';
-      state.showMilestones=view==='milestone';
       state.lockedKey=null;
       state.selectionHistory=[];
       state.showBlocked=false;
