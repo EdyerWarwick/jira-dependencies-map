@@ -57,7 +57,7 @@ PREFERENCES_DIR=os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduse
 PREFERENCES_FILE=os.path.join(PREFERENCES_DIR,"preferences.txt")
 DEFAULT_PREFERENCES={
     "showCompleted":False,"filterUser":"","filterDue":"all","includeWithRemarkable":True,
-    "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default",
+    "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default","personalUserAccountId":"","personalUserName":"",
 }
 _preferences_lock=threading.Lock()
 
@@ -73,6 +73,8 @@ def _normalise_preferences(data):
     out["useJiraModal"]=out["useJiraModal"] is True
     out["showMiniMap"]=out["showMiniMap"] is not False
     out["startingView"]=out["startingView"] if out["startingView"] in {"default","dashboard","milestone"} else "default"
+    out["personalUserAccountId"]=str(out["personalUserAccountId"] or "")
+    out["personalUserName"]=str(out["personalUserName"] or "").strip()
     return out
 
 def _read_preferences():
@@ -712,7 +714,15 @@ def api_issues():
 def api_credential_status():
     try:
         credential=_credential_read()
-        return jsonify({"configured":bool(credential),"email":credential["email"] if credential else ""})
+        account_id=""
+        if credential:
+            try:
+                me=req.get(f"{JIRA_BASE_URL}/rest/api/3/myself",headers=get_jira_headers(),timeout=10)
+                if me.ok: account_id=str(me.json().get("accountId") or "")
+            except Exception: pass
+        email=credential["email"] if credential else ""
+        display_name="Edward Dyer" if email.lower()=="edward.dyer@warwick.ac.uk" else ""
+        return jsonify({"configured":bool(credential),"email":email,"accountId":account_id,"displayName":display_name})
     except Exception as e:
         return jsonify({"configured":False,"error":str(e)}),500
 
@@ -1678,7 +1688,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 @media(max-width:700px){.dashboard-milestone-risk-row{grid-template-columns:minmax(0,1fr)}.dashboard-milestone-risk-metrics{grid-template-columns:94px 88px minmax(82px,1fr);padding-left:0}}
 .dashboard-impact{font-size:11px;font-weight:800;color:#6366f1;white-space:nowrap}
 .dashboard-workload-list{display:flex;flex-direction:column;gap:4px}
-.dashboard-workload-row{display:grid;grid-template-columns:minmax(150px,210px) 1fr 42px;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:6px 4px;text-align:left;cursor:pointer;color:#334155;border-radius:6px}
+.dashboard-workload-row{display:grid;grid-template-columns:minmax(150px,210px) 1fr 42px;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:6px 4px;text-align:left;color:#334155;border-radius:6px}
 .dashboard-workload-row:hover{background:#f8fafc}
 .dashboard-workload-name{display:flex;align-items:center;gap:8px;min-width:0}
 .dashboard-workload-name strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
@@ -1686,6 +1696,19 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dashboard-workload-bar{height:7px;background:#e2e8f0;border-radius:999px;overflow:hidden}
 .dashboard-workload-bar span{display:block;height:100%;background:#6366f1;border-radius:999px}
 .dashboard-workload-count{text-align:right;font-size:12px}
+.dashboard-personal-view{margin:14px 0 22px;padding:14px;background:#fff;border:1px solid #dbe2ea;border-radius:10px}
+.dashboard-personal-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.dashboard-personal-metric{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;min-width:0}
+.dashboard-personal-metric>div:first-child{display:flex;flex-direction:column;gap:3px;min-width:0}
+.dashboard-personal-label{font-size:12px;color:#475569;font-weight:700}
+.dashboard-personal-metric strong{font-size:25px;color:#172033}
+.dashboard-personal-help{font-size:10px;color:#64748b}
+.dashboard-personal-actions{display:flex;flex-direction:column;align-items:flex-start;gap:6px;flex-shrink:0}
+.dashboard-show-personal{border:1px solid #c7d2fe;background:#eef2ff;color:#3730a3;border-radius:6px;padding:6px 8px;font-size:11px;font-weight:750;cursor:pointer;white-space:nowrap}
+.dashboard-show-personal:hover{background:#e0e7ff}
+.personal-overwrite-note{font-weight:700;color:#64748b}.personal-user-change{display:flex;align-items:center;gap:8px;margin-left:auto}.personal-user-change label{font-size:12px;color:#475569;font-weight:700}.personal-user-mapping{max-width:240px;min-width:170px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#172033;font-size:12px}.dashboard-personal-actions{justify-content:center}
+@media(max-width:1100px){.dashboard-personal-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:700px){.dashboard-personal-grid{grid-template-columns:1fr}.dashboard-personal-metric{align-items:flex-start}}
 .dashboard-inline-stat{display:flex;align-items:baseline;gap:8px;padding:6px 2px;color:#64748b}
 .dashboard-inline-stat strong{font-size:24px;color:#172033}
 .dashboard-inline-stat span{font-size:12px}
@@ -2080,7 +2103,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
           <select class="filter-user-select" id="filter-due" aria-label="Filter by due date">
             <option value="all">Show all</option>
             <option value="next7">Due in the next 7 days</option>
-            <option value="nextMonth">Due in the next month</option>
+            <option value="nextMonth">Due in the next 31 days</option>
             <option value="overdue">Overdue</option>
             <option value="noDueDate">No due date set</option>
           </select>
@@ -2203,7 +2226,7 @@ const state = {
   showMilestones:false,         // toggle: OFF by default; milestone overview
   showDashboard:false,
   startingView:'default',
-  showMiniMap:true, customJql:'', useJiraModal:false,
+  showMiniMap:true, customJql:'', useJiraModal:false, currentUserName:'', currentUserAccountId:'', personalUserOverride:false, personalTicketFilter:'',
   displayIssues:[], displayEdges:[], displayLevels:0,
   hoverKey:null, hoverLockKey:null,
   returnMilestoneKey:null,
@@ -2215,6 +2238,14 @@ const state = {
     milestone:{appLeft:0,appTop:0,columns:{}}
   }
 };
+fetch('/api/credential-status',{cache:'no-store'}).then(r=>r.json()).then(data=>{
+  // Credential discovery is a helpful default only. A saved manual mapping always wins.
+  if(data && data.configured && !state.personalUserOverride){
+    state.currentUserName=data.displayName || (String(data.email||'').toLowerCase()==='edward.dyer@warwick.ac.uk'?'Edward Dyer':'');
+    state.currentUserAccountId=data.accountId||'';
+    if(state.showDashboard) render();
+  }
+}).catch(()=>{});
 
 // ── Shareable selected-card URL ───────────────────────────────────────────
 // URLs use the compact form ?opd-523 and optionally ?opd-523&showblocked.
@@ -2263,6 +2294,11 @@ async function loadPreferences(){
     state.useJiraModal=saved.useJiraModal===true;
     state.showMiniMap=saved.showMiniMap!==false;
     state.startingView=['default','dashboard','milestone'].includes(saved.startingView) ? saved.startingView : 'default';
+    if(saved.personalUserAccountId || saved.personalUserName){
+      state.currentUserAccountId=saved.personalUserAccountId||'';
+      state.currentUserName=saved.personalUserName||'';
+      state.personalUserOverride=true;
+    }
   }catch(e){
     console.warn('Could not load persistent preferences; using defaults.',e);
   }finally{
@@ -2281,7 +2317,8 @@ async function savePreferences(updates){
         showCompleted:!!state.showCompleted, filterUser:state.filterUser||'', filterDue:state.filterDue||'all',
         includeWithRemarkable:state.includeWithRemarkable!==false,
         customJql:state.customJql||'', useJiraModal:!!state.useJiraModal,
-        showMiniMap:state.showMiniMap!==false, startingView:state.startingView || 'default'
+        showMiniMap:state.showMiniMap!==false, startingView:state.startingView || 'default',
+        personalUserAccountId:state.currentUserAccountId||'', personalUserName:state.currentUserName||''
       }),cache:'no-store'
     });
   }catch(e){ console.warn('Could not save persistent preferences.',e); }
@@ -2304,6 +2341,7 @@ function restoreFilterSnapshot(snap){
   saveFilterPreferences();
 }
 function clearAllFilters(){
+  state.personalTicketFilter='';
   state.searchTerm = '';
   state.showCompleted = false;
   state.filterUser = '';
@@ -3011,8 +3049,16 @@ function applySearchFilter(){
       dueDate:card.dataset.dueDate || '',
       status:card.dataset.completed === '1' ? 'Done' : ''
     }, dueFilter);
+    let personalMatch = true;
+    if(state.personalTicketFilter === 'unblocked' || state.personalTicketFilter === 'blocked-by-others'){
+      const issue=(state.displayIssues||[]).find(i=>i.key===card.dataset.key);
+      const byKey=new Map((state.displayIssues||[]).map(i=>[i.key,i]));
+      const activeBlockers=((issue&&issue.blockers)||[]).map(k=>byKey.get(k)).filter(Boolean);
+      if(state.personalTicketFilter === 'unblocked') personalMatch=activeBlockers.length===0;
+      else personalMatch=activeBlockers.some(i=>i.assigneeAccountId!==state.currentUserAccountId);
+    }
 
-    const match = textMatch && userMatch && dueMatch;
+    const match = textMatch && userMatch && dueMatch && personalMatch;
     card.hidden = !match;
     if(match) visibleTotal++;
 
@@ -3732,9 +3778,7 @@ function issueMatchesDueFilter(issue, filterValue){
   if(filter==='next7'){
     end.setDate(end.getDate()+7);
   }else if(filter==='nextMonth'){
-    const targetMonth=today.getMonth()+1;
-    const lastDay=new Date(today.getFullYear(),targetMonth+1,0).getDate();
-    end=new Date(today.getFullYear(),targetMonth,Math.min(today.getDate(),lastDay));
+    end.setDate(end.getDate()+31);
   }else{
     return true;
   }
@@ -4117,11 +4161,49 @@ function dashboardBottleneckHtml(items){
 function dashboardWorkloadHtml(items){
   if(!items.length) return '<div class="dashboard-empty">No active tickets.</div>';
   const max=Math.max(1,...items.map(x=>x.count));
-  return '<div class="dashboard-workload-list">'+items.map(x=>'<button type="button" class="dashboard-workload-row" data-dashboard-assignee="'+esc(x.accountId)+'"><span class="dashboard-workload-name"><strong>'+esc(x.name)+'</strong>'+(x.overdue?'<span>'+x.overdue+' overdue</span>':'')+'</span><span class="dashboard-workload-bar"><span style="width:'+Math.max(4,Math.round(x.count/max*100))+'%"></span></span><strong class="dashboard-workload-count">'+x.count+'</strong></button>').join('')+'</div>';
+  return '<div class="dashboard-workload-list">'+items.map(x=>'<div class="dashboard-workload-row"><span class="dashboard-workload-name"><strong>'+esc(x.name)+'</strong>'+(x.overdue?'<span>'+x.overdue+' overdue</span>':'')+'</span><span class="dashboard-workload-bar"><span style="width:'+Math.max(4,Math.round(x.count/max*100))+'%"></span></span><strong class="dashboard-workload-count">'+x.count+'</strong></div>').join('')+'</div>';
 }
 function dashboardMilestoneHtml(items){
   if(!items.length) return '<div class="dashboard-empty">No active milestones found.</div>';
   return '<div class="dashboard-compact-list dashboard-milestone-risk-list">'+items.map(x=>'<button type="button" class="dashboard-compact-row dashboard-milestone-risk-row" data-dashboard-milestone="'+esc(x.issue.key)+'"><span class="dashboard-compact-main dashboard-milestone-risk-main"><strong>'+esc(x.issue.key)+'</strong><span>'+esc(x.issue.summary||'')+'</span></span><span class="dashboard-milestone-risk-metrics"><span class="dashboard-milestone-risk-blocked">'+(x.blockers===0?'—':x.blockers+' blockers')+'</span><span class="dashboard-milestone-risk-blocks">'+(x.blocked===0?'—':x.blocked+' blocked')+'</span>'+(x.issue.dueDate?'<span class="dashboard-milestone-risk-date'+(x.overdue?' due-date overdue':'')+'">'+esc(formatDueDate(x.issue.dueDate))+'</span>':'<span class="dashboard-milestone-risk-date">No date</span>')+'</span></button>').join('')+'</div>';
+}
+function dashboardPersonalUserOptions(){
+  const users=new Map();
+  (state.issues||[]).forEach(i=>{if(i.assigneeAccountId && i.assignee) users.set(i.assigneeAccountId,String(i.assignee).trim());});
+  const selectedId=state.currentUserAccountId||'';
+  if(selectedId && !users.has(selectedId)) users.set(selectedId,state.currentUserName||selectedId);
+  const options=[...users.entries()].sort((a,b)=>a[1].localeCompare(b[1])).map(([id,name])=>'<option value="'+esc(id)+'"'+(id===selectedId?' selected':'')+'>'+esc(name)+'</option>').join('');
+  return '<select id="personal-user-mapping" class="personal-user-mapping" aria-label="Change user"><option value="">Choose a user…</option>'+options+'</select>';
+}
+function dashboardPersonalViewHtml(activeIssues){
+  // Use all active Jira issues for personal counts so With Remarkable tickets
+  // remain counted even when the board's display toggle hides them.
+  const personalActive=(state.issues||[]).filter(i=>!isCompletedStatus(i.status));
+  const sourceIssues=personalActive.length ? personalActive : activeIssues;
+  const currentName=String(state.currentUserName||'Edward Dyer').trim().toLowerCase();
+  const mine=sourceIssues.filter(i=>String(i.assignee||'').trim().toLowerCase()===currentName ||
+    (state.currentUserAccountId && i.assigneeAccountId===state.currentUserAccountId));
+  const byKey=new Map(sourceIssues.map(i=>[i.key,i]));
+  const isRemarkable=i=>String(i.status||'').trim().toLowerCase()==='with remarkable';
+  const hasActiveBlocker=i=>(i.blockers||[]).some(k=>byKey.has(k));
+  const unblocked=mine.filter(i=>!hasActiveBlocker(i) && !isRemarkable(i));
+  const withRemarkable=mine.filter(isRemarkable);
+  const blockedByOthers=mine.filter(i=>isRemarkable(i)||(i.blockers||[]).some(k=>{
+    const blocker=byKey.get(k); return blocker && blocker.assigneeAccountId!==state.currentUserAccountId;
+  }));
+  const overdue=mine.filter(i=>isDueDateOverdue(i.dueDate));
+  const next7=dashboardDueSoon(mine,7);
+  const nextMonth=dashboardDueSoon(mine,31);
+  const selectedName=String(state.currentUserName||'the selected user').trim();
+  const metric=(label,count,description,filter,extra='')=>'<div class="dashboard-personal-metric"><div><span class="dashboard-personal-label">'+esc(label)+'</span><strong>'+count+'</strong><span class="dashboard-personal-help">'+esc(description)+'</span>'+extra+'</div>'+(filter?'<div class="dashboard-personal-actions"><button type="button" class="dashboard-show-personal" data-personal-filter="'+filter+'">Show on board</button></div>':'')+'</div>';
+  return '<div class="dashboard-personal-grid">'+
+    metric('Tickets assigned to '+selectedName,mine.length,'Active tickets assigned to '+selectedName,'assigned')+
+    metric('Unblocked tickets',unblocked.length,'Tickets with no active blockers, excluding With Remarkable tickets',null,withRemarkable.length?'<span class="dashboard-personal-help">Plus '+withRemarkable.length+' with Remarkable</span>':'')+
+    metric('Tickets blocked by other assignees',blockedByOthers.length,'Includes tickets with active blockers assigned to someone else and With Remarkable tickets',null)+
+    metric('Overdue',overdue.length,selectedName+'’s tickets past their due date','overdue')+
+    metric('Due in the next 7 days',next7.length,selectedName+'’s tickets due today through the next seven days','next7')+
+    metric('Due in the next 31 days',nextMonth.length,selectedName+'’s tickets due today through the next 31 days','nextMonth')+
+    '</div>';
 }
 function dashboardOverviewHtml(){
   const risks=dashboardRiskInfo(state.displayIssues||[]);
@@ -4161,7 +4243,7 @@ function dashboardOverviewHtml(){
     {label:'Chain date risks',detail:risks.chainDateRisks.length+' affected · max '+h.chainDates.weight+' pts',deduction:h.chainDates.deduction}
   ];
   const healthDetail=hRows.map(row=>'<div class="dashboard-health-row"><span class="dashboard-health-row-label">'+esc(row.label)+'</span><span class="dashboard-health-row-detail">'+esc(row.detail)+'</span><strong>'+(row.deduction>0?'−'+row.deduction.toFixed(1)+' pts':'0 pts')+'</strong></div>').join('');
-  const nav=[['overview','Overview'],['milestones','Milestones'],['unblocking','Unblocking opportunities'],['upcoming','Upcoming'],['workload','Workload'],['priority-distribution','Priority distribution'],['attention','Needs attention']];
+  const nav=[['overview','Overview'],['my-view','My view'],['milestones','Milestones'],['unblocking','Unblocking opportunities'],['upcoming','Upcoming'],['workload','Workload'],['priority-distribution','Priority distribution'],['attention','Needs attention']];
   return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Dependency dashboard</div><div class="dashboard-subtitle">What is at risk, what is causing it, and what should be acted on first.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+ 
     '<nav class="dashboard-nav" aria-label="Dashboard sections">'+nav.map(x=>'<button type="button" data-dashboard-nav="'+x[0]+'">'+x[1]+'</button>').join('')+'</nav>'+ 
     '<section class="dashboard-section dashboard-overview" id="overview"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">Overview</span><span class="dashboard-section-note">Board health and immediate signals</span></div></div>'+ 
@@ -4174,6 +4256,7 @@ function dashboardOverviewHtml(){
         '</div>'+ 
         '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="workload"><div class="dashboard-stat-value">'+assignedPeopleCount+' assignees</div><div class="dashboard-stat-label">Top workload</div><div class="dashboard-stat-help">Highest workload assignees by active ticket count.</div><div class="dashboard-top-workload">'+topWorkloadHtml+'</div></div>'+ 
       '</div></section>'+ 
+    '<section class="dashboard-section dashboard-personal-view" id="my-view"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">My view: '+esc(state.currentUserName||'Select a user')+'</span><span class="dashboard-section-note">Your active tickets and deadlines</span><span class="dashboard-section-note personal-overwrite-note">Show on board overwrites your filters</span></div><div class="personal-user-change"><label for="personal-user-mapping">Change user</label>'+dashboardPersonalUserOptions()+'</div></div>'+dashboardPersonalViewHtml(risks.active)+'</section>'+ 
     '<div class="dashboard-two-column dashboard-top-cards">'+
       '<div class="dashboard-section-group" id="milestones"><div class="dashboard-group-head"><h2>Milestones</h2><span>Milestone health and delivery pressure</span></div>'+ 
         dashboardSummarySection('Milestone risk',dashboardMilestoneHtml(milestones),'milestone-risk','Active milestones with due dates, overdue status or blocked work')+
@@ -4215,6 +4298,44 @@ function renderDashboard(){
   attachTicketKeyModalHandlers(board);
   attachEvents();
 
+  const personalUserSelect=board.querySelector('#personal-user-mapping');
+  if(personalUserSelect) personalUserSelect.addEventListener('change',()=>{
+    const accountId=personalUserSelect.value;
+    if(!accountId){ state.currentUserAccountId=''; state.currentUserName=''; state.personalUserOverride=true; }
+    else {
+      const option=personalUserSelect.options[personalUserSelect.selectedIndex];
+      state.currentUserAccountId=accountId; state.currentUserName=option ? option.textContent : accountId; state.personalUserOverride=true;
+    }
+    savePreferences({personalUserAccountId:state.currentUserAccountId,personalUserName:state.currentUserName});
+    render();
+  });
+  board.querySelectorAll('[data-personal-filter]').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const filter=btn.dataset.personalFilter;
+      // These actions are only offered for due-date metrics. Always replace the
+      // current search and filters with the selected user's due-date filter.
+      const meId=state.currentUserAccountId||'';
+      state.searchTerm='';
+      if(searchEl) searchEl.value='';
+      state.showCompleted=false;
+      state.includeWithRemarkable=true;
+      state.personalTicketFilter='';
+      state.filterUser=meId;
+      state.filterDue=filter==='overdue'?'overdue':filter==='next7'?'next7':filter==='nextMonth'?'nextMonth':'all';
+      state.showDashboard=false;
+      state.showMilestones=false;
+      state.lockedKey=null;
+      state.selectionHistory=[];
+      state.showBlocked=false;
+      savedFullBoardView=null;
+      saveFilterPreferences();
+      updateFilterControls();
+      render();
+      // Ensure the visible filter controls reflect the filters applied by this action.
+      populateFilterUsers();
+      updateFilterControls();
+    });
+  });
   function setUpcomingTab(tab){
     const value=tab==='month'?'month':'7';
     board.querySelectorAll('[data-dashboard-upcoming-tab-button]').forEach(btn=>{
@@ -4251,16 +4372,6 @@ function renderDashboard(){
       if(!section) return;
       section.querySelectorAll('[data-dashboard-ticket-index][hidden]').forEach(el=>el.hidden=false);
       updateDashboardPagination(section);
-    });
-  });
-  board.querySelectorAll('[data-dashboard-assignee]').forEach(btn=>{
-    btn.addEventListener('click',e=>{
-      e.stopPropagation();
-      const accountId=btn.dataset.dashboardAssignee||'';
-      state.filterUser=accountId;
-      persistPreference('filterUser',state.filterUser);
-      state.showDashboard=false;
-      render();
     });
   });
   board.querySelectorAll('[data-dashboard-milestone]').forEach(el=>{
@@ -6198,11 +6309,13 @@ toggleCompletedBtn.addEventListener('click', () => {
   render();
 });
 filterUser.addEventListener('change', () => {
+  state.personalTicketFilter='';
   state.filterUser = filterUser.value;
   saveFilterPreferences();
   render();
 });
 filterDue.addEventListener('change', () => {
+  state.personalTicketFilter='';
   state.filterDue = filterDue.value;
   saveFilterPreferences();
   render();
