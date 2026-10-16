@@ -479,7 +479,9 @@ def _start_background_full_load(jql, active_raw, generation=None):
     key=_completed_cache_key(jql,generation)
     with _completed_loads_lock:
         existing=_completed_loads.get(key)
-        if existing and existing.get("status") in {"downloading","ready"}:
+        # A completed snapshot must never suppress a new Jira refresh.
+        # Only coalesce an identical request while its worker is still running.
+        if existing and existing.get("status") == "downloading":
             return
         _completed_loads[key]={"status":"queued","fetched":0,"detail":"Queued completed ticket download…","graph":None,"error":None}
     threading.Thread(target=_background_completed_load,args=(jql,active_raw,generation),daemon=True,name="jira-completed-loader").start()
@@ -6139,9 +6141,17 @@ function attachEvents(){
 }
 
 // ── Load data ─────────────────────────────────────────────────────────────
+// The Flask worker survives browser reloads. A sequence number alone (1, 2, 3…)
+// repeats in each new tab/page and can accidentally reuse an older completed
+// graph. Combine it with a unique ID for this page lifetime.
+const jiraPageSessionId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+  ? crypto.randomUUID()
+  : Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+function jiraLoadKey(loadGeneration){ return jiraPageSessionId + ':' + String(loadGeneration); }
+
 async function fetchGraph(mode, loadGeneration){
   const refreshToken = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
-  const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(String(loadGeneration || '')) + '&refresh=' + encodeURIComponent(refreshToken), {cache:'no-store'});
+  const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(jiraLoadKey(loadGeneration)) + '&refresh=' + encodeURIComponent(refreshToken), {cache:'no-store'});
   const d = await r.json();
   if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
   console.log('Jira graph loaded', {issues:(d.issues || []).length, edges:(d.edges || []).length, withDueDates:(d.issues || []).filter(i => i.dueDate).length});
@@ -6154,7 +6164,7 @@ async function pollCompletedDownload(loadGeneration = state.loadGeneration){
   // Always poll the background job belonging to the currently displayed Jira
   // load. This also makes calls from the Show completed toggle safe.
   loadGeneration = Number(loadGeneration);
-  const generation=String(loadGeneration);
+  const generation=jiraLoadKey(loadGeneration);
   const poll=async()=>{
     // A newer Jira load owns the UI now. Do not let this poll touch its state.
     if(loadGeneration !== state.loadGeneration){
