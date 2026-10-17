@@ -324,25 +324,69 @@ def _jira_search(jql, fields, label):
     print(f"  OK {label}: fetched {len(all_issues):,} issues ({due_dates:,} with due dates; {link_sets:,} with issue links)")
     return all_issues
 
+# These statuses are intentionally excluded from the dependency map. A link
+# to one must not be represented as an external, unresolved blocker.
+EXCLUDED_ISSUE_STATUSES={"cancelled","canceled","archived"}
+
+
+def _block_link(source, link):
+    """Return (blocker, blocked, linked_blocker_status) for a Jira Blocks link.
+
+    Jira supplies either outwardIssue or inwardIssue relative to `source`.
+    The inward linked issue can include a status even if Jira's search endpoint
+    does not return the full linked issue (e.g. out-of-scope/permission cases).
+    """
+    link=link or {}
+    relation=link.get("type") or {}
+    outward=link.get("outwardIssue") or {}
+    inward=link.get("inwardIssue") or {}
+    source=str(source or "").strip()
+    if not source:
+        return None
+    if str(relation.get("outward") or "").strip().lower()=="blocks" and outward.get("key"):
+        blocker,blocked=source,str(outward["key"]).strip()
+        linked_status=None
+    elif str(relation.get("inward") or "").strip().lower()=="is blocked by" and inward.get("key"):
+        blocker,blocked=str(inward["key"]).strip(),source
+        linked_status=(inward.get("fields") or {}).get("status")
+    else:
+        return None
+    if not blocker or not blocked or blocker==blocked:
+        return None
+    return blocker,blocked,linked_status
+
+
+def _nonblocking_external_status(status):
+    """A known inactive/finished linked issue cannot be an *active external* blocker.
+
+    Only applies to issues missing from the loaded raw data. Known issues retain
+    their real historical links and completed visibility in the normal graph.
+    """
+    if not isinstance(status,dict):
+        return False
+    name=str(status.get("name") or "").strip().lower()
+    category=status.get("statusCategory") or {}
+    category_key=str(category.get("key") or "").strip().lower() if isinstance(category,dict) else ""
+    return (name in EXCLUDED_ISSUE_STATUSES or name in {"done","completed","resolved","closed"}
+            or category_key=="done")
+
+
 def _external_blocker_keys(raw_issues):
-    """Return linked blocker keys that were outside the main JQL result set."""
+    """Return linked blockers missing from the current fetch for a follow-up lookup."""
     in_scope={str(r.get("key") or "").strip() for r in raw_issues if r.get("key")}
     external=set()
     for r in raw_issues:
-        source=r.get("key")
+        source=str(r.get("key") or "").strip()
         if source not in in_scope: continue
         for link in (r.get("fields") or {}).get("issuelinks") or []:
-            t=link.get("type") or {}
-            inward=(t.get("inward") or "").strip().lower()
-            outward=(t.get("outward") or "").strip().lower()
-            blocker=blocked=None
-            if outward=="blocks" and link.get("outwardIssue"):
-                blocker=source; blocked=link["outwardIssue"].get("key")
-            elif inward=="is blocked by" and link.get("inwardIssue"):
-                blocker=link["inwardIssue"].get("key"); blocked=source
-            if blocker and blocked and blocker!=blocked and blocker not in in_scope and blocked in in_scope:
-                external.add(str(blocker).strip())
-    return sorted(k for k in external if k)
+            pair=_block_link(source,link)
+            if not pair: continue
+            blocker,blocked,_status=pair
+            if blocker not in in_scope and blocked in in_scope:
+                # Still fetch completed linked tickets so historical relations
+                # can be shown when the user enables Show completed.
+                external.add(blocker)
+    return sorted(external)
 
 def jira_fetch_external_issues(raw_issues, include_completed=True):
     """Recursively fetch external blockers until no new blocker keys are found."""
@@ -475,6 +519,18 @@ def _background_completed_load(jql, active_raw, generation=None):
             _completed_loads[key]={"status":"error","fetched":0,"detail":"Completed ticket download failed","graph":None,"error":str(e)}
         print(f"  Background completed load failed for generation {generation}: {e}")
 
+def _prune_completed_loads(max_finished=8):
+    """Keep recent completed snapshots without discarding active downloads.
+
+    Caller holds _completed_loads_lock. Older finished generations are only
+    retained briefly to support the browser's status/data polling endpoints.
+    """
+    finished=[key for key,entry in _completed_loads.items()
+              if entry.get("status") in ("ready","error")]
+    for key in finished[:-max_finished]:
+        _completed_loads.pop(key,None)
+
+
 def _start_background_full_load(jql, active_raw, generation=None):
     key=_completed_cache_key(jql,generation)
     with _completed_loads_lock:
@@ -484,6 +540,7 @@ def _start_background_full_load(jql, active_raw, generation=None):
         if existing and existing.get("status") == "downloading":
             return
         _completed_loads[key]={"status":"queued","fetched":0,"detail":"Queued completed ticket download…","graph":None,"error":None}
+        _prune_completed_loads()
     threading.Thread(target=_background_completed_load,args=(jql,active_raw,generation),daemon=True,name="jira-completed-loader").start()
 
 def _extract_epic(fields):
@@ -505,12 +562,15 @@ def _extract_epic(fields):
 # ---------------------------------------------------------------------------
 
 def parse_dependency_graph(raw):
-    # Hard-remove cancelled/archived; keep Done & Completed so the frontend toggle can show/hide them.
-    HARD_REMOVE={"cancelled","canceled","archived"}
+    # Keep Done/Completed for historical relationships. Exclude cancelled
+    # statuses, and treat Jira-search-missing linked issues as unverified.
+    # Jira's ARCHIVE action is not a status change: the archived issue may
+    # still say Backlog, so searching status alone cannot identify it.
+    raw_keys={str(r.get("key") or "").strip() for r in raw if r.get("key")}
     issues={}
     for r in raw:
         key=r.get("key"); f=r.get("fields") or {}; s=f.get("status") or {}; name=s.get("name") or ""
-        if not key or name.strip().lower() in HARD_REMOVE: continue
+        if not key or name.strip().lower() in EXCLUDED_ISSUE_STATUSES: continue
         issues[key]={
             "key":key,"summary":f.get("summary") or "","status":name,
             "priority":(f.get("priority") or {}).get("name"),
@@ -520,76 +580,127 @@ def parse_dependency_graph(raw):
             "labels":f.get("labels") or [],
             "epic":_extract_epic(f),
             "url":f"{JIRA_BASE_URL}/browse/{key}",
-            "blockers":set(),"blocked":set(),"externalBlockers":[]
+            "blockers":set(),"blocked":set(),"externalBlockers":[],"unavailableBlockers":[]
         }
-    edges=set(); external=defaultdict(dict)
+    edges=set(); unavailable=defaultdict(dict)
     for r in raw:
         source=r.get("key")
         if source not in issues: continue
         for link in (r.get("fields") or {}).get("issuelinks") or []:
-            t=link.get("type") or {}
-            inward=(t.get("inward") or "").strip().lower()
-            outward=(t.get("outward") or "").strip().lower()
-            blocker=blocked=None
-            if outward=="blocks" and link.get("outwardIssue"): blocker=source; blocked=link["outwardIssue"].get("key")
-            elif inward=="is blocked by" and link.get("inwardIssue"): blocker=link["inwardIssue"].get("key"); blocked=source
-            if not blocker or not blocked or blocker==blocked: continue
+            pair=_block_link(source,link)
+            if not pair: continue
+            blocker,blocked,linked_status=pair
             if blocker in issues and blocked in issues:
-                # Include all internal edges — frontend toggle handles done/completed visibility
+                # Fetched issues remain normal blockers, including completed
+                # issues that can be displayed using Show completed.
                 edges.add((blocker,blocked))
             elif blocked in issues and blocker not in issues:
-                # External blocker (outside our JQL scope) — always include
-                external[blocked][blocker]={"key":blocker,"url":f"{JIRA_BASE_URL}/browse/{blocker}"}
+                if blocker in raw_keys:
+                    # Jira DID return the linked issue, but its status made us
+                    # deliberately exclude it (Cancelled/Archived). Not external.
+                    continue
+                if _nonblocking_external_status(linked_status):
+                    # Explicitly completed/closed/cancelled linked issues are
+                    # historical and have no effect on the active graph.
+                    continue
+                # IMPORTANT: Jira Cloud's JQL search silently omits archived
+                # issues, even when their workflow status is still Backlog or
+                # In Progress. The link itself does not reveal archival state.
+                # A missing issue could also be deleted or inaccessible.
+                # Do not assert that it is an *active external blocker*.
+                # Retain it for inspection/removal in Edit dependencies only.
+                unavailable[blocked][blocker]={"key":blocker,"url":f"{JIRA_BASE_URL}/browse/{blocker}"}
     for a,b in edges: issues[a]["blocked"].add(b); issues[b]["blockers"].add(a)
-    for k,v in external.items(): issues[k]["externalBlockers"]=list(v.values())
+    for k,v in unavailable.items(): issues[k]["unavailableBlockers"]=list(v.values())
     return issues,edges
 
-def detect_cycles(keys,edges):
-    """Iterative Tarjan-style cycle detection — avoids Python recursion limit."""
-    graph=defaultdict(list)
-    for a,b in edges: graph[a].append(b)
-    # colour: 0=white, 1=grey (in stack), 2=black (done)
-    colour={k:0 for k in keys}; cycles=set()
+def _dependency_components(keys, edges):
+    """Find strongly-connected components iteratively in O(vertices + edges).
+
+    Unlike DFS back-edge marking, this includes *every* member of a cycle,
+    including overlapping cycles. No recursion limit issues on large boards.
+    """
+    keys=list(keys)
+    outgoing={key:[] for key in keys}
+    incoming={key:[] for key in keys}
+    for source,target in edges:
+        if source in outgoing and target in outgoing:
+            outgoing[source].append(target)
+            incoming[target].append(source)
+
+    visited=set()
+    finished=[]
     for start in keys:
-        if colour[start]!=0: continue
-        # Each stack frame: (node, iterator-over-neighbours, path-index)
-        path=[]; path_set=set(); call_stack=[(start,iter(graph[start]))]
-        colour[start]=1; path.append(start); path_set.add(start)
-        while call_stack:
-            node,it=call_stack[-1]
+        if start in visited:
+            continue
+        visited.add(start)
+        stack=[(start,iter(outgoing[start]))]
+        while stack:
+            node, neighbours=stack[-1]
             try:
-                nxt=next(it)
-                if colour[nxt]==0:
-                    colour[nxt]=1; path.append(nxt); path_set.add(nxt)
-                    call_stack.append((nxt,iter(graph[nxt])))
-                elif colour[nxt]==1:
-                    # Back-edge → everything from nxt to end of path is in a cycle
-                    idx=path.index(nxt)
-                    cycles.update(path[idx:])
+                nxt=next(neighbours)
+                if nxt not in visited:
+                    visited.add(nxt)
+                    stack.append((nxt,iter(outgoing[nxt])))
             except StopIteration:
-                colour[node]=2
-                if path and path[-1]==node:
-                    path.pop(); path_set.discard(node)
-                call_stack.pop()
-    return cycles
+                finished.append(node)
+                stack.pop()
+
+    component_of={}
+    components=[]
+    for start in reversed(finished):
+        if start in component_of:
+            continue
+        index=len(components)
+        members=[]
+        stack=[start]
+        component_of[start]=index
+        while stack:
+            node=stack.pop()
+            members.append(node)
+            for nxt in incoming[node]:
+                if nxt not in component_of:
+                    component_of[nxt]=index
+                    stack.append(nxt)
+        components.append(members)
+    cycles={key for members in components if len(members)>1 for key in members}
+    cycles.update(a for a,b in edges if a==b and a in outgoing)
+    return components,component_of,cycles
+
+
+def detect_cycles(keys,edges):
+    """Return all tickets belonging to a circular dependency."""
+    return _dependency_components(keys,edges)[2]
+
 
 def calculate_levels(issues,edges):
-    cycles=detect_cycles(issues.keys(),edges); graph=defaultdict(list); indegree=defaultdict(int)
-    for a,b in edges:
-        if a in cycles or b in cycles: continue
-        graph[a].append(b); indegree[b]+=1
-    level={k:0 for k in issues if k not in cycles}
-    for k,v in issues.items():
-        if k not in cycles and v["externalBlockers"]: level[k]=1
-    q=deque(k for k in issues if k not in cycles and indegree[k]==0)
-    while q:
-        n=q.popleft()
-        for nxt in graph[n]:
-            level[nxt]=max(level.get(nxt,0),level[n]+1); indegree[nxt]-=1
-            if indegree[nxt]==0: q.append(nxt)
-    for k,v in issues.items():
-        if k in cycles: level[k]=0
-    return level,cycles
+    """Lay out cycles as a single level, then advance downstream components."""
+    components,component_of,cycles=_dependency_components(issues.keys(),edges)
+    count=len(components)
+    successors=[set() for _ in range(count)]
+    indegree=[0]*count
+    level=[1 if any(issues[key]["externalBlockers"] for key in group) else 0
+           for group in components]
+
+    for source,target in edges:
+        if source not in component_of or target not in component_of:
+            continue
+        a,b=component_of[source],component_of[target]
+        if a==b or b in successors[a]:
+            continue
+        successors[a].add(b)
+        indegree[b]+=1
+
+    queue=deque(i for i in range(count) if indegree[i]==0)
+    while queue:
+        a=queue.popleft()
+        for b in successors[a]:
+            level[b]=max(level[b],level[a]+1)
+            indegree[b]-=1
+            if indegree[b]==0:
+                queue.append(b)
+    return {key:level[component_of[key]] for key in issues},cycles
+
 
 def serialize_graph(raw, jql=None):
     issues,edges=parse_dependency_graph(raw); levels,cycles=calculate_levels(issues,edges); out=[]
@@ -601,6 +712,7 @@ def serialize_graph(raw, jql=None):
             "epic":v.get("epic"),"url":v["url"],
             "blockers":sorted(v["blockers"]),"blocked":sorted(v["blocked"]),
             "externalBlockers":sorted(v["externalBlockers"],key=lambda x:x["key"]),
+            "unavailableBlockers":sorted(v["unavailableBlockers"],key=lambda x:x["key"]),
             "level":levels.get(k,0),"cycle":k in cycles
         })
     out.sort(key=lambda x:(x["level"],x["key"]))
@@ -1507,6 +1619,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dimmed{opacity:.2;filter:grayscale(.6)}
 .highlighted{box-shadow:0 0 0 2px rgba(99,102,241,.35);z-index:8!important}
 .locked{box-shadow:0 0 0 3px rgba(99,102,241,.6)!important;border-color:#6366f1!important}
+.line.cycle-line{stroke:#d97706;stroke-dasharray:4 3;stroke-width:2}
 .line{fill:none;stroke:var(--line);stroke-width:1.6;opacity:.78;
       transition:stroke .2s,opacity .2s,stroke-width .2s}
 .line.highlighted-line{stroke:#6366f1;stroke-width:2.5;opacity:1}
@@ -3036,6 +3149,9 @@ function applySearchFilter(){
   const userFilter = state.filterUser || '';
   const dueFilter = state.filterDue || 'all';
   let visibleTotal = 0;
+  let visibleExternal = false;
+  let visibleCycle = false;
+  const byKey=state.displayByKey || new Map();
 
   cards.forEach(card => {
     const haystack = normaliseSearch(card.dataset.searchIndex || '');
@@ -3053,8 +3169,7 @@ function applySearchFilter(){
     }, dueFilter);
     let personalMatch = true;
     if(state.personalTicketFilter === 'unblocked' || state.personalTicketFilter === 'blocked-by-others'){
-      const issue=(state.displayIssues||[]).find(i=>i.key===card.dataset.key);
-      const byKey=new Map((state.displayIssues||[]).map(i=>[i.key,i]));
+      const issue=byKey.get(card.dataset.key);
       const activeBlockers=((issue&&issue.blockers)||[]).map(k=>byKey.get(k)).filter(Boolean);
       if(state.personalTicketFilter === 'unblocked') personalMatch=activeBlockers.length===0;
       else personalMatch=activeBlockers.some(i=>i.assigneeAccountId!==state.currentUserAccountId);
@@ -3062,7 +3177,11 @@ function applySearchFilter(){
 
     const match = textMatch && userMatch && dueMatch && personalMatch;
     card.hidden = !match;
-    if(match) visibleTotal++;
+    if(match){
+      visibleTotal++;
+      if(card.classList.contains('external')) visibleExternal=true;
+      if(card.classList.contains('cycle')) visibleCycle=true;
+    }
 
     const summary = card.querySelector('.summary');
     if(summary){
@@ -3129,6 +3248,11 @@ function applySearchFilter(){
     board.appendChild(notice);
   }
 
+  // The legend describes the tickets on screen, not unrelated hidden work.
+  const externalStatus=document.getElementById('external-status');
+  const cycleStatus=document.getElementById('cycle-status');
+  if(externalStatus) externalStatus.style.display=visibleExternal?'inline-flex':'none';
+  if(cycleStatus) cycleStatus.style.display=visibleCycle?'inline-flex':'none';
   updateFilterControls();
   if(words.length || userFilter || dueFilter !== 'all'){
     statusText.textContent = visibleTotal.toLocaleString('en-GB') + ' of ' +
@@ -3261,104 +3385,131 @@ function revealSelectedCard(key){
   setTimeout(() => card.classList.remove('dependency-flash'), 950);
 }
 
-function computeDisplayData(){
-  const DONE = new Set(['done','completed']);
-  // Dependency structure must be calculated from the full active/completed
-  // ticket set before the With Remarkable display filter is applied. A hidden
-  // With Remarkable ticket is still a real blocker, so hiding it must never
-  // promote the ticket it blocks into an earlier level.
-  // Dependency chains still ignore search, user and With Remarkable filters,
-  // but continue to honour the Show completed toggle.
-  const structuralIssues = state.showCompleted
-    ? state.issues
-    : state.issues.filter(i => !DONE.has((i.status || '').toLowerCase().trim()));
+// The graph is rebuilt only when issue data or dependencies change, or when the
+// completed toggle changes. Switching board views does not rerun graph layout.
+let graphRevision=0;
+let structuralGraphCache=null;
+function invalidateGraphCache(){
+  graphRevision++;
+  structuralGraphCache=null;
+  assigneeCache=null;
+}
 
-  const structuralKeys = new Set(structuralIssues.map(i => i.key));
-  const structuralEdges = state.edges.filter(e => structuralKeys.has(e.from) && structuralKeys.has(e.to));
+function calculateGraphLayout(issues, edges){
+  const keys=new Set(issues.map(i=>i.key));
+  const outgoing=new Map(), incoming=new Map();
+  keys.forEach(k=>{outgoing.set(k,[]);incoming.set(k,[]);});
+  for(const e of edges){
+    if(!keys.has(e.from) || !keys.has(e.to)) continue;
+    outgoing.get(e.from).push(e.to);
+    incoming.get(e.to).push(e.from);
+  }
 
-  // Calculate levels from the structural graph, before any display-only
-  // filtering. This preserves dependency depth when With Remarkable is hidden.
-  const level = new Map(structuralIssues.map(i => [i.key, (i.externalBlockers && i.externalBlockers.length) ? 1 : 0]));
-  for(let pass = 0; pass < structuralIssues.length; pass++){
-    let changed = false;
-    for(const e of structuralEdges){
-      if(!level.has(e.from) || !level.has(e.to)) continue;
-      const v = level.get(e.from) + 1;
-      if(v > level.get(e.to)){ level.set(e.to, v); changed = true; }
+  // Iterative Kosaraju: every member of a cycle shares its component/column.
+  const visited=new Set(), finished=[];
+  for(const start of keys){
+    if(visited.has(start)) continue;
+    visited.add(start);
+    const stack=[{key:start,index:0}];
+    while(stack.length){
+      const frame=stack[stack.length-1], neighbours=outgoing.get(frame.key);
+      if(frame.index>=neighbours.length){ finished.push(frame.key);stack.pop();continue; }
+      const next=neighbours[frame.index++];
+      if(!visited.has(next)){ visited.add(next);stack.push({key:next,index:0}); }
     }
-    if(!changed) break;
   }
-
-  let issues = structuralIssues;
-  if(!state.lockedKey && !state.showMilestones && !state.includeWithRemarkable){
-    issues = issues.filter(i => (i.status || '').trim() !== 'With Remarkable');
+  const componentOf=new Map(), components=[];
+  for(let index=finished.length-1;index>=0;index--){
+    const start=finished[index];
+    if(componentOf.has(start)) continue;
+    const id=components.length, members=[], stack=[start];
+    componentOf.set(start,id);
+    while(stack.length){
+      const key=stack.pop();members.push(key);
+      for(const next of incoming.get(key)){
+        if(!componentOf.has(next)){componentOf.set(next,id);stack.push(next);}
+      }
+    }
+    components.push(members);
   }
+  const cycleKeys=new Set();
+  components.forEach(members=>{if(members.length>1) members.forEach(k=>cycleKeys.add(k));});
+  edges.forEach(e=>{if(e.from===e.to && keys.has(e.from)) cycleKeys.add(e.from);});
 
-  const issueKeys = new Set(issues.map(i => i.key));
-  // Only draw relationships whose endpoints are actually displayed.
-  const edges = structuralEdges.filter(e => issueKeys.has(e.from) && issueKeys.has(e.to));
+  const successors=components.map(()=>new Set()), indegree=components.map(()=>0);
+  const byKey=new Map(issues.map(i=>[i.key,i]));
+  const componentLevels=components.map(group=>group.some(k=>(byKey.get(k).externalBlockers||[]).length)?1:0);
+  for(const e of edges){
+    const from=componentOf.get(e.from),to=componentOf.get(e.to);
+    if(from===undefined || to===undefined || from===to || successors[from].has(to)) continue;
+    successors[from].add(to);indegree[to]++;
+  }
+  const queue=[];
+  indegree.forEach((n,id)=>{if(n===0) queue.push(id);});
+  for(let cursor=0;cursor<queue.length;cursor++){
+    const from=queue[cursor];
+    for(const to of successors[from]){
+      componentLevels[to]=Math.max(componentLevels[to],componentLevels[from]+1);
+      if(--indegree[to]===0) queue.push(to);
+    }
+  }
+  const levels=new Map();
+  keys.forEach(key=>levels.set(key,componentLevels[componentOf.get(key)]||0));
+  return {levels,cycleKeys,outgoing,incoming};
+}
 
-  // Keep the structural level on each displayed card even when its blocker is
-  // hidden by the With Remarkable filter.
-  state.displayIssues = issues.map(i => ({...i, level: level.get(i.key) ?? 0}));
-  state.displayEdges  = edges;
-  state.displayLevels = state.displayIssues.length ? Math.max(...state.displayIssues.map(i => i.level)) : 0;
+function computeDisplayData(){
+  const unchanged=structuralGraphCache &&
+    structuralGraphCache.issues===state.issues &&
+    structuralGraphCache.edges===state.edges &&
+    structuralGraphCache.revision===graphRevision &&
+    structuralGraphCache.showCompleted===state.showCompleted;
+  if(!unchanged){
+    const structuralIssues=state.showCompleted ? state.issues :
+      state.issues.filter(i=>!isCompletedStatus(i.status));
+    const keys=new Set(structuralIssues.map(i=>i.key));
+    const structuralEdges=state.edges.filter(e=>keys.has(e.from)&&keys.has(e.to));
+    const layout=calculateGraphLayout(structuralIssues,structuralEdges);
+    structuralGraphCache={issues:state.issues,edges:state.edges,revision:graphRevision,
+      showCompleted:state.showCompleted,structuralIssues,structuralEdges,...layout};
+  }
+  const graph=structuralGraphCache;
+  // Hidden With Remarkable items still influence structural depth.
+  const issues=(!state.lockedKey&&!state.showMilestones&&!state.includeWithRemarkable)
+    ? graph.structuralIssues.filter(i=>(i.status||'').trim()!=='With Remarkable')
+    : graph.structuralIssues;
+  const keys=new Set(issues.map(i=>i.key));
+  state.displayEdges=graph.structuralEdges.filter(e=>keys.has(e.from)&&keys.has(e.to));
+  state.displayIssues=issues.map(i=>({...i,level:graph.levels.get(i.key)||0,cycle:graph.cycleKeys.has(i.key)}));
+  state.displayByKey=new Map(state.displayIssues.map(i=>[i.key,i]));
+  state.displayOutgoing=new Map(),state.displayIncoming=new Map();
+  keys.forEach(k=>{state.displayOutgoing.set(k,[]);state.displayIncoming.set(k,[]);});
+  state.displayEdges.forEach(e=>{state.displayOutgoing.get(e.from).push(e.to);state.displayIncoming.get(e.to).push(e.from);});
+  state.displayLevels=state.displayIssues.length?Math.max(...state.displayIssues.map(i=>i.level)):0;
 }
 
 // ── Dependency-chain traversal (ancestors of key) ─────────────────────────
-function blockedChain(key){
-  const keep = new Set([key]), q = [key];
-  while(q.length){
-    const k = q.shift();
-    for(const e of state.displayEdges){
-      if(e.from === k && !keep.has(e.to)){ keep.add(e.to); q.push(e.to); }
+function traverseDisplayGraph(start, adjacent){
+  const keep=new Set([start]),queue=[start];
+  for(let cursor=0;cursor<queue.length;cursor++){
+    for(const next of (adjacent.get(queue[cursor])||[])){
+      if(!keep.has(next)){keep.add(next);queue.push(next);}
     }
   }
   return keep;
 }
+function blockedChain(key){return traverseDisplayGraph(key,state.displayOutgoing);}
+function chain(key){return traverseDisplayGraph(key,state.displayIncoming);}
 
-function chain(key){
-  const keep = new Set([key]), q = [key];
-  while(q.length){
-    const k = q.shift();
-    for(const e of state.displayEdges){
-      if(e.to === k && !keep.has(e.from)){ keep.add(e.from); q.push(e.from); }
-    }
-  }
-  return keep;
-}
-
-// The selected view normally shows the selected card and everything blocking it.
-// When "See blocked cards" is enabled, expand that same view downstream so it
-// behaves like the highest-level dependency in the revealed chain has been selected.
+// The selected view normally shows the upstream chain; optional downstream
+// cards are added without changing the blockers' layout depth.
 function activeSelectionChain(key){
-  const keep = chain(key);
-  if(state.showBlocked){
-    blockedChain(key).forEach(k => keep.add(k));
-  }
+  const keep=chain(key);
+  if(state.showBlocked) blockedChain(key).forEach(k=>keep.add(k));
   return keep;
 }
-
-// ── Hover chain: ancestors + descendants of a key ─────────────────────────
 function computeHoverChain(key){
-  const keep = new Set([key]);
-  // ancestors (blockers that lead to this key)
-  const qa = [key];
-  while(qa.length){
-    const k = qa.shift();
-    for(const e of state.displayEdges){
-      if(e.to === k && !keep.has(e.from)){ keep.add(e.from); qa.push(e.from); }
-    }
-  }
-  // descendants (things this key blocks, transitively)
-  const qd = [key];
-  while(qd.length){
-    const k = qd.shift();
-    for(const e of state.displayEdges){
-      if(e.from === k && !keep.has(e.to)){ keep.add(e.to); qd.push(e.to); }
-    }
-  }
-  return keep;
+  return new Set([...chain(key),...blockedChain(key)]);
 }
 
 function renderHoverHighlight(key){
@@ -3518,19 +3669,13 @@ function redoLocal(){
 
 // ── Local level recalc after drag-add ─────────────────────────────────────
 function recalcLocalLevels(){
-  const level = new Map(state.issues.map(i => [i.key, i.externalBlockers && i.externalBlockers.length ? 1 : 0]));
-  const n = state.issues.length;
-  for(let pass = 0; pass < n; pass++){
-    let changed = false;
-    for(const e of state.edges){
-      if(!level.has(e.from) || !level.has(e.to)) continue;
-      const v = level.get(e.from) + 1;
-      if(v > level.get(e.to)){ level.set(e.to, v); changed = true; }
-    }
-    if(!changed) break;
-  }
-  state.issues.forEach(i => { i.level = level.get(i.key) || 0; });
-  state.levels = Math.max(0, ...state.issues.map(i => i.level || 0));
+  invalidateGraphCache();
+  const layout=calculateGraphLayout(state.issues,state.edges);
+  state.issues.forEach(i=>{
+    i.level=layout.levels.get(i.key)||0;
+    i.cycle=layout.cycleKeys.has(i.key);
+  });
+  state.levels=state.issues.length?Math.max(...state.issues.map(i=>i.level)):0;
 }
 
 function addLocalDependency(source, target){
@@ -3560,14 +3705,22 @@ function addLocalDependency(source, target){
 
 
 function deleteLocalDependency(source, target){
-  // source = blocker, target = blocked  (matches addLocalDependency convention)
-  if(!state.edges.some(e => e.from === source && e.to === target)) return;
+  // source = blocker, target = blocked. Links to unavailable Jira issues
+  // (often archived) are informational, not graph edges, but can be removed.
+  const isInternal=state.edges.some(e => e.from === source && e.to === target);
+  const b=state.issues.find(i=>i.key===target);
+  const isExternal=!!b && (b.externalBlockers||[]).some(x=>x.key===source);
+  const isUnavailable=!!b && (b.unavailableBlockers||[]).some(x=>x.key===source);
+  if(!isInternal && !isExternal && !isUnavailable) return;
   pushHistory();
-  state.edges = state.edges.filter(e => !(e.from === source && e.to === target));
+  if(isInternal) state.edges = state.edges.filter(e => !(e.from === source && e.to === target));
   const a = state.issues.find(i => i.key === source);
-  const b = state.issues.find(i => i.key === target);
-  if(a) a.blocked  = (a.blocked  || []).filter(k => k !== target);
-  if(b) b.blockers = (b.blockers || []).filter(k => k !== source);
+  if(a) a.blocked = (a.blocked || []).filter(k => k !== target);
+  if(b){
+    b.blockers = (b.blockers || []).filter(k => k !== source);
+    b.externalBlockers = (b.externalBlockers || []).filter(x => x.key !== source);
+    b.unavailableBlockers = (b.unavailableBlockers || []).filter(x => x.key !== source);
+  }
   // If this edge was only a pending add (not yet in Jira), cancel it outright.
   const addIdx = state.pendingChanges.findIndex(
     c => c.action === 'add' && c.source === source && c.target === target);
@@ -3593,6 +3746,7 @@ function stageIssueChange(key, field, value){
     const name = opt && opt.selectedOptions[0] ? opt.selectedOptions[0].textContent : 'Unassigned';
     issue.assigneeAccountId = value || null;
     issue.assignee = name;
+    assigneeCache=null;
     if(display){ display.assigneeAccountId = value || null; display.assignee = name; }
   }else if(field === 'priority'){
     issue.priority = value;
@@ -3720,7 +3874,7 @@ function relationHtml(i){
     const x = state.issues.find(v => v.key === k);
     const cls = (extraCls || 'relation-key') + (x && isCompletedStatus(x.status) ? ' completed' : '');
     const issueUrl = x ? x.url : (CFG.jiraBaseUrl + '/browse/' + encodeURIComponent(k));
-    const tooltip = x ? ((x.summary || x.key) + ' - ' + (x.assignee || 'Unassigned') + ' (' + (x.priority || 'No priority') + ')') : k;
+    const tooltip = x ? ((x.summary || x.key) + ' - ' + (x.assignee || 'Unassigned') + ' (' + (x.priority || 'No priority') + ')') : (extraCls && extraCls.includes('external-key') ? 'Linked blocker not returned by Jira: ' + k : k);
     const anchor = '<a class="' + cls + '" href="' + esc(issueUrl) +
       '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' +
       esc(k) + '" title="' + esc(tooltip) + '">' + esc(k) + '</a>';
@@ -3865,11 +4019,24 @@ function highlightSelectedChainDateRisks(){
 }
 
 // ── Card HTML ─────────────────────────────────────────────────────────────
+let assigneeCache=null;
+function getSortedAssignees(){
+  if(assigneeCache && assigneeCache.issues===state.issues && assigneeCache.revision===graphRevision)
+    return assigneeCache.options;
+  const unique=new Map();
+  for(const issue of state.issues){
+    if(issue.assigneeAccountId) unique.set(issue.assigneeAccountId,
+      {name:issue.assignee||'Unassigned',accountId:issue.assigneeAccountId});
+  }
+  const options=[...unique.values()].sort((a,b)=>a.name.localeCompare(b.name));
+  assigneeCache={issues:state.issues,revision:graphRevision,options};
+  return options;
+}
+
 function cardHtml(i, searchTerm){
   const isExternal = i.externalBlockers && i.externalBlockers.length;
   const isMilestone = (i.labels || []).some(label => String(label).toLowerCase() === 'milestone');
-  const assignees = [...new Map(state.issues.filter(x => x.assigneeAccountId).map(x => [x.assigneeAccountId || '', {name:x.assignee || 'Unassigned', accountId:x.assigneeAccountId || ''}])).values()]
-    .sort((a,b) => a.name.localeCompare(b.name));
+  const assignees = getSortedAssignees();
   const priorities = PRIORITY_ORDER.filter((p,idx,arr) => arr.indexOf(p)===idx);
   let epicHtml = '';
   if(i.epic){
@@ -3944,28 +4111,9 @@ function dashboardRiskInfo(issues){
   });
   const chainDateRisks=active.filter(i=>chainDateRiskKeys.has(i.key));
 
-  // Detect circular dependency chains using DFS. A ticket is counted once even
-  // if it participates in more than one cycle. The health score uses the
-  // proportion of active tickets affected by each problem area.
-  const circularKeys=new Set();
-  const visitState=new Map();
-  const stack=[];
-  function visit(key){
-    const stateValue=visitState.get(key)||0;
-    if(stateValue===1){
-      const idx=stack.indexOf(key);
-      if(idx>=0) stack.slice(idx).forEach(k=>circularKeys.add(k));
-      circularKeys.add(key);
-      return;
-    }
-    if(stateValue===2) return;
-    visitState.set(key,1);
-    stack.push(key);
-    for(const next of (downstream.get(key)||[])) visit(next);
-    stack.pop();
-    visitState.set(key,2);
-  }
-  active.forEach(i=>visit(i.key));
+  // Use the same iterative cycle detector as the board, preventing stack
+  // overflow on deep chains and consistent counts for overlapping cycles.
+  const circularKeys=calculateGraphLayout(active,state.edges).cycleKeys;
   const circularDependencies=active.filter(i=>circularKeys.has(i.key));
 
   const totalActive=active.length;
@@ -4000,8 +4148,7 @@ function dashboardRiskInfo(issues){
   };
 }
 function dashboardAssigneeOptions(i){
-  const assignees=[...new Map(state.issues.filter(x=>x.assigneeAccountId).map(x=>[x.assigneeAccountId,{name:x.assignee||'Unassigned',accountId:x.assigneeAccountId}])).values()]
-    .sort((a,b)=>a.name.localeCompare(b.name));
+  const assignees=getSortedAssignees();
   return '<select class="assignee-select dashboard-assignee-select' + (!i.assigneeAccountId?' unassigned':'') + '" data-field="assignee" data-stop-propagation="1" title="Change assignee"><option value="">Unassigned</option>'+
     assignees.map(a=>'<option value="'+esc(a.accountId)+'"'+(a.accountId===(i.assigneeAccountId||'')?' selected':'')+'>'+esc(a.name)+'</option>').join('')+
     '</select>';
@@ -4741,7 +4888,19 @@ function renderMilestoneOverview(flashKey){
 }
 
 // ── Render ────────────────────────────────────────────────────────────────
+let boardRenderEpoch=0;
+let linesRenderFrame=0;
+function scheduleDependencyLines(){
+  if(linesRenderFrame) cancelAnimationFrame(linesRenderFrame);
+  const epoch=boardRenderEpoch;
+  linesRenderFrame=requestAnimationFrame(()=>{
+    linesRenderFrame=0;
+    if(epoch===boardRenderEpoch) drawLines();
+  });
+}
 function render(){
+  boardRenderEpoch++;
+  if(linesRenderFrame){cancelAnimationFrame(linesRenderFrame);linesRenderFrame=0;}
   // Capture the scroll position belonging to the view currently on screen.
   // This must happen before state.showMilestones/lockedKey changes are applied
   // and before the existing columns are removed.
@@ -4868,6 +5027,12 @@ function render(){
   let visibleIssues = visibleKeys
     ? state.displayIssues.filter(i => visibleKeys.has(i.key))
     : state.displayIssues;
+  // When locked, the normal search filter is not run. Update the legend for
+  // the selected chain rather than retaining markers from another ticket.
+  if(locked){
+    if(externalStatus) externalStatus.style.display=visibleIssues.some(i=>(i.externalBlockers||[]).length)?'inline-flex':'none';
+    if(cycleStatus) cycleStatus.style.display=visibleIssues.some(i=>i.cycle)?'inline-flex':'none';
+  }
 
   // Column map
   const cols = new Map();
@@ -4877,25 +5042,9 @@ function render(){
   const orders = [];
   for(let lv = 0; lv <= max; lv++) orders[lv] = [...(cols.get(lv) || [])].sort((a,b) => a.key.localeCompare(b.key));
 
-  // Barycenter sort passes (use display edges & display issues)
-  function neighbours(item, lv){
-    const keys = new Set();
-    (item.blockers || []).forEach(k => keys.add(k));
-    state.displayEdges.forEach(e => { if(e.to === item.key) keys.add(e.from); if(e.from === item.key) keys.add(e.to); });
-    return [...keys].map(k => state.displayIssues.find(x => x.key === k)).filter(Boolean)
-      .filter(x => Math.abs((x.level || 0) - lv) === 1 && (!visibleKeys || visibleKeys.has(x.key)));
-  }
-  for(let pass = 0; pass < 8; pass++){
-    for(let lv = 0; lv <= max; lv++){
-      const pos = new Map();
-      for(let l = 0; l <= max; l++) orders[l].forEach((x,i) => pos.set(x.key, {level:l, index:i}));
-      orders[lv].sort((a,b) => {
-        function score(item){ const ns = neighbours(item, lv); if(!ns.length) return 999999; return ns.reduce((s,n) => s + pos.get(n.key).index, 0) / ns.length; }
-        const sa = score(a), sb = score(b);
-        return sa === sb ? a.key.localeCompare(b.key) : sa - sb;
-      });
-    }
-  }
+  // The default view sorts by priority; selected chains sort by distance.
+  // The old eight-pass barycenter sort was overwritten in *both* modes,
+  // so avoid doing that unused O(columns × issues × edges) work.
   if(!locked){
     // On the default board, each level follows the exact same priority order
     // exposed by the priority menu. Priority is the primary order, with the
@@ -4916,9 +5065,9 @@ function render(){
     const distance = new Map([[state.lockedKey, 0]]), q = [state.lockedKey];
     while(q.length){
       const k = q.shift();
-      for(const e of state.displayEdges){
-        if(e.to === k && !distance.has(e.from)){
-          distance.set(e.from, (distance.get(k) || 0) + 1); q.push(e.from);
+      for(const previous of (state.displayIncoming.get(k)||[])){
+        if(!distance.has(previous)){
+          distance.set(previous,(distance.get(k)||0)+1);q.push(previous);
         }
       }
     }
@@ -4926,11 +5075,11 @@ function render(){
       const dq = [state.lockedKey], dSeen = new Set([state.lockedKey]);
       while(dq.length){
         const k = dq.shift();
-        for(const e of state.displayEdges){
-          if(e.from === k && !dSeen.has(e.to)){
-            dSeen.add(e.to);
-            if(!distance.has(e.to)) distance.set(e.to, -(distance.get(k) || 0) - 1);
-            dq.push(e.to);
+        for(const next of (state.displayOutgoing.get(k)||[])){
+          if(!dSeen.has(next)){
+            dSeen.add(next);
+            if(!distance.has(next)) distance.set(next,-(distance.get(k)||0)-1);
+            dq.push(next);
           }
         }
       }
@@ -4942,7 +5091,8 @@ function render(){
     });
   }
 
-  // Build columns
+  // Build the columns in one DOM insertion to avoid repeated layout work.
+  const columnFragment=document.createDocumentFragment();
   for(let lv = 0; lv <= max; lv++){
     const col = document.createElement('section');
     col.className = 'column' + (locked ? ' unlocked' : '');
@@ -4960,26 +5110,19 @@ function render(){
                      + '<span class="column-count">' + items.length + '</span>';
     col.appendChild(header);
     col.appendChild(cardsDiv);
-    board.appendChild(col);
+    columnFragment.appendChild(col);
   }
+  board.appendChild(columnFragment);
 
-  // The dashboard changes the board display model and can leave the first
-  // post-transition layout pass with stale card geometry. Redraw after the
-  // layout has settled at several points so returning Dashboard -> Chain
-  // cannot permanently leave the SVG paths missing.
-  requestAnimationFrame(() => {
+  // Measure after the new cards are in the DOM; observers catch any later
+  // layout/size changes instead of repeatedly resetting the SVG on timers.
+  const renderEpoch=boardRenderEpoch;
+  requestAnimationFrame(()=>{
+    if(renderEpoch!==boardRenderEpoch) return;
     spaceLongRoutes();
-    requestAnimationFrame(() => {
-      drawLines();
-      attachEvents();
-      requestAnimationFrame(() => {
-        drawLines();
-        requestAnimationFrame(drawLines);
-      });
-      setTimeout(drawLines, 60);
-      setTimeout(drawLines, 180);
-      scheduleMiniMapUpdate();
-    });
+    attachEvents();
+    scheduleDependencyLines();
+    scheduleMiniMapUpdate();
   });
 
   // Restore search focus/caret after a genuine board rebuild (refresh, toggle,
@@ -5385,25 +5528,28 @@ function drawLines(){
 
     const fromCol = colOf(source);
     const toCol = colOf(target);
-    if(fromCol < 0 || toCol < 0 || toCol <= fromCol) return;
+    if(fromCol < 0 || toCol < 0 || toCol < fromCol) return;
 
-    const s = exit_(source);
-    const t = entry(target);
-    const nextCol = colEls[fromCol + 1];
-    if(!nextCol) return;
+    const s=exit_(source);
+    const sameColumn=fromCol===toCol;
+    const t=sameColumn?exit_(target):entry(target);
+    const nextCol=colEls[fromCol+1];
+    const sr=source.getBoundingClientRect();
+    const nr=nextCol?.getBoundingClientRect();
+    // Internal cycle edges bend through the right-hand gutter instead of
+    // drawing across cards or being silently dropped.
+    const routeX=sameColumn
+      ? s.x+16+(e.from.length+e.to.length)%3*4
+      : nr ? ((sr.right+nr.left)/2)-br.left : s.x+20;
 
-    const sr = source.getBoundingClientRect();
-    const nr = nextCol.getBoundingClientRect();
-    const routeX = ((sr.right + nr.left) / 2) - br.left;
+    const d='M '+s.x+' '+s.y
+      +' L '+routeX+' '+s.y
+      +' L '+routeX+' '+t.y
+      +' L '+t.x+' '+t.y;
 
-    const d = 'M ' + s.x + ' ' + s.y
-      + ' L ' + routeX + ' ' + s.y
-      + ' L ' + routeX + ' ' + t.y
-      + ' L ' + t.x + ' ' + t.y;
-
-    const path = document.createElementNS(ns, 'path');
-    path.setAttribute('d', d);
-    path.setAttribute('class', 'line highlighted-line');
+    const path=document.createElementNS(ns,'path');
+    path.setAttribute('d',d);
+    path.setAttribute('class',sameColumn?'line highlighted-line cycle-line':'line highlighted-line');
     path.dataset.from = e.from;
     path.dataset.to = e.to;
     path.setAttribute('marker-end', 'url(#arrow)');
@@ -5524,22 +5670,31 @@ function currentDependencyPairs(){
   const a = depA.value;
   if(!a) return {blockedBy:[], blocks:[]};
   const issue = state.issues.find(i => i.key === a);
+  // Jira JQL does not return archived issues. A link whose source cannot be
+  // retrieved is NOT verified as an active blocker. Show it in a separate,
+  // clearly qualified editor section so it can be cleaned up if appropriate.
+  const externalKeys=(issue?.externalBlockers || []).map(x=>x.key);
+  const unavailableKeys=(issue?.unavailableBlockers || []).map(x=>x.key);
   return {
-    blockedBy: (issue?.blockers || []).slice().sort(),
-    blocks: (issue?.blocked || []).slice().sort()
+    blockedBy: [...new Set([...(issue?.blockers || []),...externalKeys])].sort(),
+    blocks: (issue?.blocked || []).slice().sort(),
+    unavailable: [...new Set(unavailableKeys)].sort()
   };
 }
 
 function renderDependencyList(){
-  const {blockedBy, blocks} = currentDependencyPairs();
+  const {blockedBy, blocks, unavailable} = currentDependencyPairs();
 
-  function row(key, source, target){
+  function row(key, source, target, isUnavailable=false){
     const issue = state.issues.find(i => i.key === key);
+    const external=!issue && !!state.issues.find(i=>i.key===target)?.externalBlockers?.some(x=>x.key===source);
     const issueUrl = issue?.url || (CFG.jiraBaseUrl + '/browse/' + encodeURIComponent(key));
+    const detail=isUnavailable ? 'Not returned by Jira search (possibly archived, deleted or inaccessible)'
+      : external ? 'External blocker (not returned by Jira)' : (issue?.summary || '');
     return '<div class="dependency-row">' +
       '<div class="dependency-row-text"><a class="dependency-row-key" href="' + esc(issueUrl) +
       '" target="_blank" rel="noopener noreferrer" data-issue-key="' + esc(key) + '">' + esc(key) + '</a> · ' +
-      esc(issue?.summary || '') + '</div>' +
+      esc(detail) + '</div>' +
       '<button type="button" class="dependency-remove" data-remove-source="' + esc(source) +
       '" data-remove-target="' + esc(target) + '">Remove</button>' +
       '</div>';
@@ -5556,7 +5711,11 @@ function renderDependencyList(){
 
   depList.innerHTML =
     section('Blocked by', blockedBy, true) +
-    section('Blocks', blocks, false);
+    section('Blocks', blocks, false) +
+    (unavailable.length ? '<div class="dependency-section blocked-by">' +
+      '<div class="dependency-section-title">Unavailable linked issues (not counted as blockers)</div>' +
+      '<div class="dependency-empty">These links may be archived, deleted or inaccessible. Removing one changes Jira only after Save.</div>' +
+      unavailable.map(key=>row(key,key,depA.value,true)).join('') + '</div>' : '');
 
   attachTicketKeyModalHandlers(depList);
 
@@ -6528,7 +6687,14 @@ window.addEventListener('beforeunload', e => {
   }
 });
 
-window.addEventListener('resize', () => { requestAnimationFrame(drawLines); scheduleMiniMapUpdate(); });
+if(typeof ResizeObserver!=='undefined'){
+  const lineResizeObserver=new ResizeObserver(()=>{
+    if(state.lockedKey && !state.showDashboard && !state.showMilestones) scheduleDependencyLines();
+  });
+  lineResizeObserver.observe(board);
+  lineResizeObserver.observe(document.getElementById('app'));
+}
+window.addEventListener('resize', () => { scheduleDependencyLines(); scheduleMiniMapUpdate(); });
 // Do not redraw dependency SVG paths while the app scrolls. In the selected
 // view the board, cards and SVG move together, so rebuilding the paths on
 // every scroll frame only causes flicker.
