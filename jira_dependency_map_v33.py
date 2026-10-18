@@ -2,10 +2,21 @@
 """Jira Dependency Map — standalone Flask application."""
 import subprocess,sys,time,threading,webbrowser,os,base64,json,ctypes
 from collections import defaultdict,deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 import requests as req
 from flask import Flask,Response,jsonify,request
 
 JIRA_BATCH_SIZE=1000
+# The enhanced search endpoint gives only a nextPageToken for complete issue
+# records (often a 100-result limit). Ask for IDs alone, then retrieve the
+# selected fields through parallel bulk requests, as recommended by Atlassian.
+JIRA_ID_BATCH_SIZE=5000
+JIRA_DETAIL_BATCH_SIZE=100  # links/labels require the normal bulk-fetch limit
+JIRA_DETAIL_WORKERS=4
+JIRA_MAX_CONCURRENT_REQUESTS=5
+_jira_request_slots=threading.BoundedSemaphore(JIRA_MAX_CONCURRENT_REQUESTS)
 _loading_progress={"phase":"Idle","batch":0,"fetched":0,"total":None,"detail":""}
 _loading_progress_lock=threading.Lock()
 
@@ -17,7 +28,28 @@ def _get_loading_progress():
     with _loading_progress_lock:
         return dict(_loading_progress)
 
-JIRA_HTTP_SESSION=req.Session()
+_jira_session_local=threading.local()
+
+def _jira_session():
+    """Keep-alive connections within each worker, without sharing Session state."""
+    if not hasattr(_jira_session_local,"session"):
+        _jira_session_local.session=req.Session()
+    return _jira_session_local.session
+
+def _jira_retry_wait(response, attempt):
+    """Respect Jira's Retry-After header, with a bounded exponential fallback."""
+    retry_after=response.headers.get("Retry-After", "").strip()
+    if retry_after:
+        try:
+            return min(30.0,max(0.0,float(retry_after)))
+        except ValueError:
+            try:
+                date=parsedate_to_datetime(retry_after)
+                return min(30.0,max(0.0,(date-datetime.now(timezone.utc)).total_seconds()))
+            except (TypeError,ValueError,OverflowError):
+                pass
+    return min(12.0, 1.5*(2**attempt))
+
 
 # Background cache for the slower full/completed-ticket load. The initial board
 # can render from active tickets while this cache is populated.
@@ -135,7 +167,7 @@ def _get_latest_stable_release():
             "Pragma":"no-cache",
             "X-GitHub-Api-Version":"2022-11-28",
         },
-        timeout=10,
+        timeout=5,
     )
     resp.raise_for_status()
     releases=resp.json()
@@ -303,9 +335,7 @@ def _jira_search(jql, fields, label):
         _set_loading_progress(phase=f"Downloading batch {page} work items…",batch=page,fetched=len(all_issues),detail=f"Requesting batch {page}…")
         print(f"  -> Jira {label} page {page} (have {len(all_issues):,} so far; batch size {batch_size:,})")
         started=time.time()
-        request_headers=get_jira_headers()
-        request_headers.update({"Cache-Control":"no-store, no-cache, max-age=0","Pragma":"no-cache","Expires":"0"})
-        resp=JIRA_HTTP_SESSION.post(request_url,headers=request_headers,json=body,timeout=60)
+        resp=_jira_post(request_url,body,retry_label=f"{label} search")
         # Some Jira configurations enforce a smaller maxResults limit. Fall back once.
         if resp.status_code==400 and batch_size!=100:
             print(f"  <- Jira rejected batch size {batch_size}; retrying with 100")
@@ -323,6 +353,170 @@ def _jira_search(jql, fields, label):
     link_sets=sum(1 for issue in all_issues if (issue.get("fields") or {}).get("issuelinks"))
     print(f"  OK {label}: fetched {len(all_issues):,} issues ({due_dates:,} with due dates; {link_sets:,} with issue links)")
     return all_issues
+
+
+class JiraBulkFetchUnavailable(RuntimeError):
+    """Bulk fetch was unsuccessful; the caller can use normal JQL pagination."""
+
+
+def _jira_post(url, body, *, retry_label="Jira", timeout=60):
+    """Rate-limit-aware POST, with one shared concurrency cap across workers."""
+    headers=get_jira_headers()
+    headers.update({"Cache-Control":"no-store, no-cache, max-age=0",
+                    "Pragma":"no-cache","Expires":"0"})
+    for attempt in range(4):
+        with _jira_request_slots:
+            response=_jira_session().post(url, headers=headers, json=body, timeout=timeout)
+        if response.status_code not in (429,500,502,503,504) or attempt==3:
+            return response
+        pause=_jira_retry_wait(response,attempt)
+        print(f"  <- {retry_label}: HTTP {response.status_code}; retry {attempt+1}/3 in {pause:.1f}s")
+        time.sleep(pause)
+    return response
+
+
+def _jira_search_ids(jql,label):
+    """Fetch matching Jira issue IDs with the fast, high-capacity index search.
+
+    With NO 'fields' entry in the request, Jira can return up to 5,000 IDs
+    per cursor page; selecting 'fields' would impose the ~100-details limit.
+    The cursor must still be followed sequentially for each ID page.
+    """
+    url=f"{JIRA_BASE_URL}/rest/api/3/search/jql"
+    token=None
+    page=0
+    batch_size=JIRA_ID_BATCH_SIZE
+    ids=[]
+    seen=set()
+    seen_tokens=set()
+    while True:
+        page+=1
+        body={"jql":jql,"maxResults":batch_size}
+        if token: body["nextPageToken"]=token
+        request_url=f"{url}?_refresh={time.time_ns()}_{page}"
+        _set_loading_progress(phase=f"Finding {label} ticket IDs…",batch=page,
+                              fetched=len(ids),total=None,
+                              detail=f"Finding ticket IDs (index page {page})…")
+        started=time.perf_counter()
+        resp=_jira_post(request_url,body,retry_label=f"{label} ID search")
+        if resp.status_code==400 and batch_size!=100:
+            # Some Jira sites cap even lightweight JQL searches. Never skip a
+            # page just because the requested maximum was not accepted.
+            batch_size=100
+            page-=1
+            continue
+        if not resp.ok:
+            raise RuntimeError(f"Jira ID search API {resp.status_code}: {jira_error(resp)}")
+        data=resp.json()
+        batch=data.get("issues")
+        if not isinstance(batch,list):
+            raise RuntimeError("Jira ID search did not return an issues list.")
+        for issue in batch:
+            issue_id=str((issue or {}).get("id") or "").strip()
+            if not issue_id:
+                raise RuntimeError("Jira ID search returned an issue without an ID.")
+            if issue_id not in seen:
+                seen.add(issue_id)
+                ids.append(issue_id)
+        print(f"  <- Jira {label} IDs page {page}: {len(batch):,} IDs "
+              f"(total {len(ids):,}, {time.perf_counter()-started:.2f}s)")
+        token=data.get("nextPageToken")
+        if not token or data.get("isLast") is True:
+            break
+        if token in seen_tokens:
+            raise RuntimeError("Jira returned a repeated ID-page cursor; stopping to prevent missing tickets.")
+        seen_tokens.add(token)
+    return ids
+
+
+def _jira_bulk_issue_chunk(ids,fields,label):
+    """Fetch precisely these issues (including dependency links) in one call."""
+    url=f"{JIRA_BASE_URL}/rest/api/3/issue/bulkfetch"
+    body={"issueIdsOrKeys":ids,"fields":fields}
+    started=time.perf_counter()
+    resp=_jira_post(url,body,retry_label=f"{label} bulk details")
+    if not resp.ok:
+        raise JiraBulkFetchUnavailable(
+            f"HTTP {resp.status_code}: {jira_error(resp)}")
+    data=resp.json()
+    batch=data.get("issues")
+    errors=data.get("issueErrors") or []
+    if not isinstance(batch,list) or errors:
+        raise JiraBulkFetchUnavailable(f"Invalid/partial Jira bulk result: {errors}")
+    returned_ids={str(issue.get("id") or "") for issue in batch}
+    if returned_ids != set(ids) or len(batch)!=len(ids):
+        # Issues can disappear/change permissions between the ID snapshot and
+        # bulk lookup. Re-run normal search instead of silently dropping any.
+        raise JiraBulkFetchUnavailable(
+            f"Requested {len(ids)} IDs but received {len(batch)} complete issues")
+    print(f"  <- Jira {label} bulk: {len(batch):,} details "
+          f"({time.perf_counter()-started:.2f}s)")
+    return batch
+
+
+def _jira_search_parallel(jql,fields,label):
+    """Index scan + bounded concurrent bulk details, with safe fallback.
+
+    Cursor pages are never requested concurrently. Once all the independent
+    issue IDs are known, details are fetched in parallel. The output has the
+    exact same Jira issue structure expected by dependency parsing.
+    """
+    started=time.perf_counter()
+    try:
+        ids=_jira_search_ids(jql,label)
+    except Exception as exc:
+        print(f"  Jira {label}: fast ID search failed ({exc}); using normal pagination")
+        return _jira_search(jql,fields,label)
+
+    if not ids:
+        _set_loading_progress(phase=f"Downloaded {label} work items", batch=0,
+                              fetched=0,total=0,detail="No matching tickets")
+        return []
+
+    id_seconds=time.perf_counter()-started
+    chunks=[ids[i:i+JIRA_DETAIL_BATCH_SIZE]
+            for i in range(0,len(ids),JIRA_DETAIL_BATCH_SIZE)]
+    print(f"  Jira {label}: {len(ids):,} matching IDs found in {id_seconds:.2f}s; "
+          f"fetching {len(chunks):,} independent detail batches with "
+          f"{min(JIRA_DETAIL_WORKERS,len(chunks))} workers")
+    _set_loading_progress(phase=f"Downloading {label} ticket details…",batch=0,
+                          fetched=0,total=len(ids),
+                          detail=f"0 of {len(ids):,} tickets; {len(chunks)} parallel batches")
+    fetched=0
+    completed_batches=0
+    results=[None]*len(chunks)
+    try:
+        with ThreadPoolExecutor(max_workers=min(JIRA_DETAIL_WORKERS,len(chunks)),
+                                thread_name_prefix="jira-bulk") as pool:
+            future_map={pool.submit(_jira_bulk_issue_chunk,chunk,fields,label):n
+                        for n,chunk in enumerate(chunks)}
+            for future in as_completed(future_map):
+                index=future_map[future]
+                result=future.result()
+                results[index]=result
+                fetched+=len(result)
+                completed_batches+=1
+                _set_loading_progress(phase=f"Downloading {label} ticket details…",
+                                      batch=completed_batches,fetched=fetched,
+                                      total=len(ids),
+                                      detail=f"{fetched:,} of {len(ids):,} tickets "
+                                             f"({completed_batches}/{len(chunks)} batches)")
+    except Exception as exc:
+        print(f"  Jira {label}: parallel bulk fetch failed ({exc}); "
+              "reloading from sequential JQL to preserve all tickets")
+        return _jira_search(jql,fields,label)
+    issues=[issue for group in results for issue in group]
+    if len(issues)!=len(ids):
+        print(f"  Jira {label}: count mismatch; retrying via normal pagination")
+        return _jira_search(jql,fields,label)
+    _set_loading_progress(phase=f"Downloaded {label} work items",
+                          batch=len(chunks),fetched=len(issues),total=len(issues),
+                          detail=f"{len(issues):,} work items downloaded")
+    print(f"  OK {label}: {len(issues):,} issues in "
+          f"{time.perf_counter()-started:.2f}s "
+          f"(ID search {id_seconds:.2f}s, details "
+          f"{time.perf_counter()-started-id_seconds:.2f}s)")
+    return issues
 
 # These statuses are intentionally excluded from the dependency map. A link
 # to one must not be represented as an external, unresolved blocker.
@@ -388,14 +582,17 @@ def _external_blocker_keys(raw_issues):
                 external.add(blocker)
     return sorted(external)
 
-def jira_fetch_external_issues(raw_issues, include_completed=True):
+def jira_fetch_external_issues(raw_issues, include_completed=True, known_issues=()):
     """Recursively fetch external blockers until no new blocker keys are found."""
     fields=["summary","status","priority","assignee","duedate","issuelinks","parent","customfield_10014","labels"]
     # Jira can impose a limit on the number of values in an IN clause. Keep the
     # normal case to one JQL request, and only split unusually large sets.
-    chunk_size=1000
+    chunk_size=250
 
+    # Completed fetches may reference already downloaded active blockers. Do not
+    # request those issues again; their own ancestors were explored in the first pass.
     known={str(r.get("key")).strip() for r in raw_issues if r.get("key")}
+    known.update(str(r.get("key")).strip() for r in known_issues if r.get("key"))
     pending=set(_external_blocker_keys(raw_issues)) - known
     fetched=[]
     round_no=0
@@ -406,15 +603,22 @@ def jira_fetch_external_issues(raw_issues, include_completed=True):
         pending.clear()
         print(f"  External blockers: round {round_no}, {len(current):,} new ticket(s) to fetch")
 
-        round_fetched=[]
-        for start in range(0,len(current),chunk_size):
-            chunk=current[start:start+chunk_size]
+        chunks=[current[start:start+chunk_size] for start in range(0,len(current),chunk_size)]
+        def fetch_chunk(chunk):
             key_list=", ".join(chunk)
             jql=f"key in ({key_list})"
             if not include_completed:
                 jql=f"({jql}) AND statusCategory != Done"
             print(f"  External blockers: requesting {len(chunk):,} ticket(s) in one JQL")
-            round_fetched.extend(_jira_search(jql,fields,"external blocker"))
+            return _jira_search(jql,fields,"external blocker")
+        # Only independent key groups are parallel. Jira's nextPageToken pages
+        # remain strictly sequential; cap concurrency to respect Cloud rate limits.
+        if len(chunks)==1:
+            results=[fetch_chunk(chunks[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=min(3,len(chunks)),thread_name_prefix="jira-external") as executor:
+                results=list(executor.map(fetch_chunk,chunks))
+        round_fetched=[issue for result in results for issue in result]
 
         # Only successfully returned issues are candidates for another round.
         # This also prevents circular dependency chains from causing an endless loop.
@@ -458,7 +662,7 @@ def _merge_issues(target, additions):
 def jira_fetch_active_issues(jql=None):
     fields=_base_issue_fields()
     active_jql=_active_jql(jql)
-    all_issues=_jira_search(active_jql,fields,"open")
+    all_issues=_jira_search_parallel(active_jql,fields,"open")
 
     # First external-ticket pass: only after every open/main ticket has been
     # downloaded. This keeps the first board build focused on active work.
@@ -467,22 +671,25 @@ def jira_fetch_active_issues(jql=None):
     _merge_issues(all_issues, external_issues)
     return all_issues
 
-def jira_fetch_completed_issues(jql=None):
+def jira_fetch_completed_issues(jql=None, known_issues=()):
     fields=_base_issue_fields()
     completed_jql=_completed_jql(jql)
-    completed=_jira_search(completed_jql,fields,"completed")
+    completed=_jira_search_parallel(completed_jql,fields,"completed")
 
     # Second external-ticket pass: only after every completed ticket has been
     # downloaded, so blockers referenced solely by completed work are included.
     _set_loading_progress(phase="Checking external blockers for completed tickets…",batch=0,fetched=len(completed),total=len(completed),detail="Checking links from completed tickets…")
-    external_issues=jira_fetch_external_issues(completed, include_completed=True)
+    external_issues=jira_fetch_external_issues(completed, include_completed=True, known_issues=known_issues)
     _merge_issues(completed, external_issues)
     return completed
 
 def jira_fetch_all_issues(jql=None):
     """Load open tickets, check their externals, then completed tickets, then their externals."""
+    began=time.perf_counter()
     active=jira_fetch_active_issues(jql)
-    completed=jira_fetch_completed_issues(jql)
+    active_seconds=time.perf_counter()-began
+    completed=jira_fetch_completed_issues(jql, known_issues=active)
+    print(f"  TIMING active+external={active_seconds:.2f}s completed+external={time.perf_counter()-began-active_seconds:.2f}s")
     all_issues=[]
     _merge_issues(all_issues,active)
     _merge_issues(all_issues,completed)
@@ -506,7 +713,7 @@ def _background_completed_load(jql, active_raw, generation=None):
         with _completed_loads_lock:
             _completed_loads[key]={"status":"downloading","fetched":0,"detail":"Starting completed ticket download…","graph":None,"error":None}
         print(f"  Background completed load started for JQL generation {generation}: {jql}")
-        completed=jira_fetch_completed_issues(jql)
+        completed=jira_fetch_completed_issues(jql, known_issues=active_raw)
         raw=[]
         _merge_issues(raw,active_raw)
         _merge_issues(raw,completed)
@@ -737,13 +944,17 @@ def api_dependencies():
         active_jql=str(jql or JQL_QUERY).strip() or JQL_QUERY
         mode=(request.args.get("mode") or "all").strip().lower()
         generation=str(request.args.get("generation") or "").strip()
+        started=time.perf_counter()
         if mode == "active":
             raw=jira_fetch_active_issues(active_jql)
             # Associate the slower completed-ticket load with the exact browser
             # refresh that requested it. An older refresh must never publish its
             # snapshot into a newer refresh.
             _start_background_full_load(active_jql, raw, generation)
-            return jsonify(serialize_graph(raw,active_jql))
+            downloaded=time.perf_counter()
+            graph=serialize_graph(raw,active_jql)
+            print(f"  TIMING active fetch={downloaded-started:.2f}s serialize={time.perf_counter()-downloaded:.2f}s total={time.perf_counter()-started:.2f}s")
+            return jsonify(graph)
         return jsonify(serialize_graph(jira_fetch_all_issues(active_jql), active_jql))
     except RuntimeError as e: return jsonify({"error":str(e)}),502
     except Exception as e: return jsonify({"error":f"Unexpected error: {e}"}),500
@@ -1415,6 +1626,11 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   display:flex;flex-direction:column;gap:9px;
   overflow-y:auto;overflow-x:hidden;
   padding:2px 20px 80px;
+  /* Do not chain a wheel fling into the parent page at the top/bottom.
+     Native overflow anchoring can fight our explicit per-column restoration. */
+  overscroll-behavior-y:contain;
+  overflow-anchor:none;
+  scrollbar-gutter:stable;
   scrollbar-width:thin;scrollbar-color:#cbd5e1 transparent;
 }
 /* When an item is locked the chain is short — let it expand, no scrollbar */
@@ -1440,6 +1656,9 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .assignee-select.unassigned{background:#2563eb;color:#fff;border-radius:999px;padding:2px 7px;font-weight:700}
 .assignee-select.unassigned option{background:#fff;color:#334155}
 .priority-picker{position:relative;display:inline-flex;align-items:center;flex-shrink:0}
+/* Cards have their real height from the first paint. Using content-visibility
+   with an estimated height caused the scrollbar to jump when offscreen ticket
+   cards were measured during scrolling. The edit controls remain lazy. */
 .priority-trigger{display:flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:0;background:transparent;border-radius:4px;cursor:pointer}
 .priority-trigger:hover,.priority-picker.open .priority-trigger{background:#f1f5f9}
 .priority-icon{width:16px;height:16px;display:block;flex-shrink:0;pointer-events:none}
@@ -2353,14 +2572,8 @@ const state = {
     milestone:{appLeft:0,appTop:0,columns:{}}
   }
 };
-fetch('/api/credential-status',{cache:'no-store'}).then(r=>r.json()).then(data=>{
-  // Credential discovery is a helpful default only. A saved manual mapping always wins.
-  if(data && data.configured && !state.personalUserOverride){
-    state.currentUserName=data.displayName || (String(data.email||'').toLowerCase()==='edward.dyer@warwick.ac.uk'?'Edward Dyer':'');
-    state.currentUserAccountId=data.accountId||'';
-    if(state.showDashboard) render();
-  }
-}).catch(()=>{});
+// Initial credential data is obtained by initialiseApp once; do not trigger
+// another Jira /myself call here before the first board loads.
 
 // ── Shareable selected-card URL ───────────────────────────────────────────
 // URLs use the compact form ?opd-523 and optionally ?opd-523&showblocked.
@@ -3037,34 +3250,36 @@ document.getElementById('required-update-button').addEventListener('click',insta
 
 async function initialiseApp(){
   try{
-    const r = await fetch('/api/credential-status',{cache:'no-store'});
-    const data = await r.json().catch(()=>({}));
+    // Independent local endpoints can run together; neither depends on Jira
+    // issue downloads, and no credential-status check is duplicated at startup.
+    const [r,configResponse] = await Promise.all([
+      fetch('/api/credential-status',{cache:'no-store'}),
+      fetch('/api/config?ts='+Date.now(),{cache:'no-store'})
+    ]);
+    const [data,config] = await Promise.all([
+      r.json().catch(()=>({})),configResponse.json().catch(()=>({}))
+    ]);
     if(!r.ok || data.error){
       showCredentialError(data.error || 'Unable to access the Windows Credential Manager.');
       openCredentialModal(false);
       return;
     }
-    if(!data.configured){
-      openCredentialModal(false);
-      return;
-    }
-    const configResponse = await fetch('/api/config?ts=' + Date.now(),{cache:'no-store'});
-    const config = await configResponse.json().catch(()=>({}));
+    if(!data.configured){openCredentialModal(false);return;}
     if(!configResponse.ok || !config.jql){
       throw new Error(config.error || 'Unable to load the default Jira JQL.');
     }
-    DEFAULT_JQL = String(config.jql).trim();
-
-    // Load optional per-user preferences after the server and Jira
-    // configuration are confirmed. A preferences problem must never prevent
-    // the normal application startup.
+    DEFAULT_JQL=String(config.jql).trim();
+    // Saved manual user mapping takes precedence over credential discovery.
+    if(!state.personalUserOverride){
+      state.currentUserName=data.displayName || (String(data.email||'').toLowerCase()==='edward.dyer@warwick.ac.uk'?'Edward Dyer':'');
+      state.currentUserAccountId=data.accountId||'';
+    }
     await loadPreferences();
     updateJiraModalSetting();
     updateMiniMapSetting();
     updateStartingViewSetting();
     updateCustomJqlIndicator();
     updateFilterControls();
-
     load(true);
   }catch(e){
     openCredentialModal(false);
@@ -3301,68 +3516,63 @@ function captureBoardScroll(){
     const cards = column.querySelector('.cards');
     if(!cards) return;
     const level = column.dataset.level != null ? column.dataset.level : String(index);
-    columns[level] = cards.scrollTop;
+    const entry = {top:cards.scrollTop};
+    // Remember the first actually visible ticket as a scroll anchor. If a
+    // refresh changes card heights or sort order, keep that ticket at the
+    // same position instead of letting the column jump or appear to bounce.
+    const viewport=cards.getBoundingClientRect();
+    for(const card of cards.querySelectorAll(':scope > .card:not([hidden])')){
+      const rect=card.getBoundingClientRect();
+      if(rect.bottom>viewport.top+1 && rect.top<viewport.bottom){
+        entry.anchorKey=card.dataset.key;
+        entry.anchorOffset=rect.top-viewport.top;
+        break;
+      }
+    }
+    columns[level]=entry;
   });
-  saved.columns = columns;
+  saved.columns=columns;
 }
 
 function restoreBoardScroll(){
-  const app = document.getElementById('app');
+  const app=document.getElementById('app');
   if(!app) return;
-  const mode = getRenderedViewMode();
-  const saved = state.scrollPositions[mode];
+  const saved=state.scrollPositions[getRenderedViewMode()];
   if(!saved) return;
+  app.scrollLeft=saved.appLeft || 0;
+  app.scrollTop=saved.appTop || 0;
 
-  app.scrollLeft = saved.appLeft || 0;
-  app.scrollTop = saved.appTop || 0;
-
-  board.querySelectorAll('.column').forEach((column, index) => {
-    const cards = column.querySelector('.cards');
+  board.querySelectorAll('.column').forEach((column,index)=>{
+    const cards=column.querySelector('.cards');
     if(!cards) return;
-    const level = column.dataset.level != null ? column.dataset.level : String(index);
-    if(Object.prototype.hasOwnProperty.call(saved.columns || {}, level)){
-      cards.scrollTop = saved.columns[level] || 0;
-    }
+    const level=column.dataset.level!=null?column.dataset.level:String(index);
+    const entry=(saved.columns || {})[level];
+    if(entry===undefined) return;
+    // Accept older saved snapshots that stored a simple numeric scrollTop.
+    cards.scrollTop=typeof entry==='number'?entry:(entry.top || 0);
+    if(!entry || typeof entry!=='object' || !entry.anchorKey) return;
+    const anchor=cards.querySelector('.card[data-key="'+CSS.escape(entry.anchorKey)+'"]');
+    if(!anchor || anchor.hidden) return;
+    const actualOffset=anchor.getBoundingClientRect().top-cards.getBoundingClientRect().top;
+    cards.scrollTop+=actualOffset-entry.anchorOffset;
   });
 }
 
 function preserveBoardScrollDuringRender(){
-  requestAnimationFrame(() => {
-    // A newly selected card is a new chain view. Do not restore the previous
-    // board position first, otherwise a card on the far right can briefly
-    // jump back to the old left-hand position before being scrolled right.
-    if(!state.revealSelectedKey){
-      restoreBoardScroll();
-    }
-
-    // A second frame catches layout changes from route spacing and card
-    // rendering before the browser paints the final scroll position.
-    requestAnimationFrame(() => {
-      if(!state.revealSelectedKey){
-        restoreBoardScroll();
-      }
-
-      if(state.revealSelectedKey){
-        requestAnimationFrame(() => {
-          // Start the new chain from its natural top-left position and make
-          // one direct, non-animated move to the selected card. This avoids
-          // the visible left-then-right scroll when selecting far-right cards.
-          const app = document.getElementById('app');
-          if(app){
-            app.scrollLeft = 0;
-            app.scrollTop = 0;
-          }
-          board.querySelectorAll('.cards').forEach(cards => {
-            cards.scrollTop = 0;
-            cards.scrollLeft = 0;
-          });
-
-          revealSelectedCard(state.revealSelectedKey);
-          state.revealSelectedKey = null;
-        });
-      }
+  // All cards now exist synchronously. Restore before the browser's first
+  // paint, rather than across multiple animation frames while heights grow.
+  if(state.revealSelectedKey){
+    const app=document.getElementById('app');
+    if(app){app.scrollLeft=0;app.scrollTop=0;}
+    board.querySelectorAll('.cards').forEach(cards=>{
+      cards.scrollTop=0;
+      cards.scrollLeft=0;
     });
-  });
+    revealSelectedCard(state.revealSelectedKey);
+    state.revealSelectedKey=null;
+  }else{
+    restoreBoardScroll();
+  }
 }
 
 function revealSelectedCard(key){
@@ -4036,24 +4246,16 @@ function getSortedAssignees(){
 function cardHtml(i, searchTerm){
   const isExternal = i.externalBlockers && i.externalBlockers.length;
   const isMilestone = (i.labels || []).some(label => String(label).toLowerCase() === 'milestone');
-  const assignees = getSortedAssignees();
-  const priorities = PRIORITY_ORDER.filter((p,idx,arr) => arr.indexOf(p)===idx);
+  // Full option lists are inserted only when a control is used; large boards
+  // no longer produce tens of thousands of unused option/menu DOM nodes.
   let epicHtml = '';
   if(i.epic){
     const rawLabel = i.epic.summary ? i.epic.key + ' · ' + (i.epic.summary.length > 32 ? i.epic.summary.substring(0, 32) + '…' : i.epic.summary) : i.epic.key;
     epicHtml = '<a class="epic-badge" href="' + esc(i.epic.url) + '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' + esc(i.epic.key) + '" title="' + esc(i.epic.summary || i.epic.key) + '"><span class="epic-dot">◆</span>' + esc(rawLabel) + '</a>';
   }
   const summaryHtml = esc(i.summary);
-  const priorityOptions = priorities.map(p =>
-    '<button type="button" class="priority-option' + (p === i.priority ? ' selected' : '') + '" data-priority="' + esc(p) + '" data-stop-propagation="1">'
-    + priorityIconHtml(p) + '<span>' + esc(p) + '</span></button>'
-  ).join('');
-  const assigneeOptions = assignees.map(a => '<option value="' + esc(a.accountId) + '"' + (a.accountId === (i.assigneeAccountId || '') ? ' selected' : '') + '>' + esc(a.name) + '</option>').join('');
-  const assigneeSelect = '<select class="assignee-select' + (!i.assigneeAccountId ? ' unassigned' : '') + '" data-field="assignee" data-stop-propagation="1" title="Change assignee"><option value="">Unassigned</option>' + assigneeOptions + '</select>';
-  const prioritySelect = '<span class="priority-picker" data-stop-propagation="1" title="Change priority">'
-    + '<button type="button" class="priority-trigger" data-stop-propagation="1" aria-label="Change priority" aria-haspopup="true" aria-expanded="false">' + priorityIconHtml(i.priority) + '</button>'
-    + '<span class="priority-menu" role="menu">' + priorityOptions + '</span>'
-    + '</span>';
+  const assigneeSelect = lazyAssigneeSelectHtml(i);
+  const prioritySelect = lazyPriorityPickerHtml(i);
 
   const searchIndex = buildSearchIndex(i);
   const isCompleted = isCompletedStatus(i.status);
@@ -4077,6 +4279,126 @@ function cardHtml(i, searchTerm){
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────
+let dashboardTraversalCache=null;
+function dashboardGraphTraversal(issues){
+  const active=issues.filter(i=>!isCompletedStatus(i.status));
+  const cacheKey=state.issues;
+  const flags=String(graphRevision)+':'+String(state.showCompleted)+':'+String(state.includeWithRemarkable);
+  if(dashboardTraversalCache && dashboardTraversalCache.key===cacheKey &&
+     dashboardTraversalCache.flags===flags && dashboardTraversalCache.count===active.length &&
+     dashboardTraversalCache.edges===state.edges){
+    // Metadata such as due dates, priority and assignee is mutable. Reuse only
+    // the graph shape, and always read the latest issue objects during metrics.
+    dashboardTraversalCache.active=active;
+    return dashboardTraversalCache;
+  }
+  const byKey=new Map(active.map((issue,index)=>[issue.key,index]));
+  const count=active.length;
+  const outgoing=active.map(i=>(i.blocked||[]).map(k=>byKey.get(k)).filter(k=>k!==undefined));
+  const incoming=Array.from({length:count},()=>[]);
+  outgoing.forEach((list,index)=>list.forEach(target=>incoming[target].push(index)));
+
+  const seen=new Uint8Array(count), finished=[];
+  for(let start=0;start<count;start++){
+    if(seen[start]) continue;
+    seen[start]=1;
+    const stack=[[start,0]];
+    while(stack.length){
+      const frame=stack[stack.length-1], adj=outgoing[frame[0]];
+      if(frame[1]>=adj.length){finished.push(frame[0]);stack.pop();continue;}
+      const next=adj[frame[1]++];
+      if(!seen[next]){seen[next]=1;stack.push([next,0]);}
+    }
+  }
+  const compId=new Int32Array(count).fill(-1), members=[];
+  for(let pos=finished.length-1;pos>=0;pos--){
+    const start=finished[pos];
+    if(compId[start]!==-1) continue;
+    const id=members.length, list=[], stack=[start];compId[start]=id;
+    while(stack.length){
+      const cur=stack.pop();list.push(cur);
+      for(const prev of incoming[cur]) if(compId[prev]===-1){compId[prev]=id;stack.push(prev);}
+    }
+    members.push(list);
+  }
+  const c=members.length, children=Array.from({length:c},()=>new Set());
+  const parents=Array.from({length:c},()=>new Set()), indegree=new Int32Array(c);
+  outgoing.forEach((targets,source)=>targets.forEach(target=>{
+    const a=compId[source],b=compId[target];
+    if(a!==b && !children[a].has(b)){
+      children[a].add(b);parents[b].add(a);indegree[b]++;
+    }
+  }));
+  const order=[],queue=[];
+  for(let i=0;i<c;i++) if(!indegree[i]) queue.push(i);
+  for(let cursor=0;cursor<queue.length;cursor++){
+    const a=queue[cursor];order.push(a);
+    for(const b of children[a]) if(!--indegree[b]) queue.push(b);
+  }
+  // One bit per SCC, not per ticket; this includes all members of cycles.
+  // Limit quadratic memory on exceptionally huge boards.
+  const useBits=c<=10000;
+  const words=Math.ceil(c/32);
+  const down=useBits?Array.from({length:c},()=>new Uint32Array(words)):null;
+  const up=useBits?Array.from({length:c},()=>new Uint32Array(words)):null;
+  if(useBits){
+    for(let i=0;i<c;i++){
+      down[i][i>>>5]|=(1<<(i&31));
+      up[i][i>>>5]|=(1<<(i&31));
+    }
+    for(let pos=order.length-1;pos>=0;pos--){
+      const a=order[pos],row=down[a];
+      for(const b of children[a]){
+        const other=down[b];
+        for(let w=0;w<words;w++) row[w]|=other[w];
+      }
+    }
+    for(const a of order){
+      const row=up[a];
+      for(const b of parents[a]){
+        const other=up[b];
+        for(let w=0;w<words;w++) row[w]|=other[w];
+      }
+    }
+  }
+  const descendantCounts=new Int32Array(c),ancestorCounts=new Int32Array(c);
+  const weights=members.map(x=>x.length);
+  function visitComponents(start,reverse,visit){
+    if(!useBits){
+      const seen=new Set([start]),todo=[start],adj=reverse?parents:children;
+      for(let cursor=0;cursor<todo.length;cursor++){
+        for(const next of adj[todo[cursor]]) if(!seen.has(next)){seen.add(next);todo.push(next);}
+      }
+      todo.forEach(visit);return;
+    }
+    const row=(reverse?up:down)[start];
+    for(let w=0;w<row.length;w++){
+      let bits=row[w];
+      while(bits){
+        const position=31-Math.clz32(bits&-bits), id=w*32+position;
+        if(id<c) visit(id);
+        bits&=bits-1;
+      }
+    }
+  }
+  for(let a=0;a<c;a++){
+    visitComponents(a,false,b=>{descendantCounts[a]+=weights[b];});
+    visitComponents(a,true,b=>{ancestorCounts[a]+=weights[b];});
+  }
+  function eachReachable(key,callback,reverse=false){
+    const index=byKey.get(key);
+    if(index===undefined) return;
+    visitComponents(compId[index],reverse,id=>{
+      for(const member of members[id]) if(member!==index) callback(result.active[member]);
+    });
+  }
+  const result={key:cacheKey,flags,count,edges:state.edges,active,byKey,eachReachable,
+    downstreamCount:key=>{const i=byKey.get(key);return i===undefined?0:descendantCounts[compId[i]]-1;},
+    upstreamCount:key=>{const i=byKey.get(key);return i===undefined?0:ancestorCounts[compId[i]]-1;}};
+  dashboardTraversalCache=result;
+  return result;
+}
+
 function dashboardRiskInfo(issues){
   const active=issues.filter(i => !isCompletedStatus(i.status));
   const overdue=active.filter(i=>isDueDateOverdue(i.dueDate));
@@ -4085,29 +4407,20 @@ function dashboardRiskInfo(issues){
 
   // Flag a ticket when a downstream ticket is due before an upstream ticket.
   // Compare every reachable upstream/downstream pair, not just direct links.
-  const byKey=new Map(active.map(i=>[i.key,i]));
-  const downstream=new Map();
-  active.forEach(i=>downstream.set(i.key,(i.blocked||[]).filter(k=>byKey.has(k))));
+  const graph=dashboardGraphTraversal(issues);
   const chainDateRiskKeys=new Set();
   const chainDateRiskDetails=new Map();
   active.forEach(source=>{
     const sourceDate=source.dueDate ? new Date(source.dueDate+'T00:00:00') : null;
     if(!sourceDate || Number.isNaN(sourceDate.getTime())) return;
-    const queue=[source.key], seen=new Set([source.key]);
-    while(queue.length){
-      const key=queue.shift();
-      for(const next of (downstream.get(key)||[])){
-        if(seen.has(next)) continue;
-        seen.add(next); queue.push(next);
-        const target=byKey.get(next);
-        const targetDate=target?.dueDate ? new Date(target.dueDate+'T00:00:00') : null;
-        if(targetDate && !Number.isNaN(targetDate.getTime()) && targetDate < sourceDate){
-          chainDateRiskKeys.add(target.key);
-          if(!chainDateRiskDetails.has(target.key)) chainDateRiskDetails.set(target.key,[]);
-          chainDateRiskDetails.get(target.key).push({earlier:source.key,date:source.dueDate});
-        }
+    graph.eachReachable(source.key,target=>{
+      const targetDate=target.dueDate ? new Date(target.dueDate+'T00:00:00') : null;
+      if(targetDate && !Number.isNaN(targetDate.getTime()) && targetDate<sourceDate){
+        chainDateRiskKeys.add(target.key);
+        if(!chainDateRiskDetails.has(target.key)) chainDateRiskDetails.set(target.key,[]);
+        chainDateRiskDetails.get(target.key).push({earlier:source.key,date:source.dueDate});
       }
-    }
+    });
   });
   const chainDateRisks=active.filter(i=>chainDateRiskKeys.has(i.key));
 
@@ -4147,20 +4460,51 @@ function dashboardRiskInfo(issues){
     }
   };
 }
-function dashboardAssigneeOptions(i){
-  const assignees=getSortedAssignees();
-  return '<select class="assignee-select dashboard-assignee-select' + (!i.assigneeAccountId?' unassigned':'') + '" data-field="assignee" data-stop-propagation="1" title="Change assignee"><option value="">Unassigned</option>'+
-    assignees.map(a=>'<option value="'+esc(a.accountId)+'"'+(a.accountId===(i.assigneeAccountId||'')?' selected':'')+'>'+esc(a.name)+'</option>').join('')+
-    '</select>';
+function lazyAssigneeSelectHtml(i, dashboard=false){
+  // The current selection must be present immediately for value/keyboard
+  // semantics; every other option is populated on first interaction.
+  const currentId=i.assigneeAccountId||'';
+  const currentName=i.assignee||'Unassigned';
+  return '<select class="assignee-select'+(dashboard?' dashboard-assignee-select':'')+(!currentId?' unassigned':'')+'" data-field="assignee" data-stop-propagation="1" title="Change assignee" data-assignees-lazy="1">'+
+    '<option value="'+esc(currentId)+'">'+esc(currentId?currentName:'Unassigned')+'</option></select>';
 }
-function dashboardPriorityHtml(i){
-  const options=PRIORITY_ORDER.filter((p,idx,arr)=>arr.indexOf(p)===idx).map(p=>
-    '<button type="button" class="priority-option'+(p===i.priority?' selected':'')+'" data-priority="'+esc(p)+'" data-stop-propagation="1">'+priorityIconHtml(p)+'<span>'+esc(p)+'</span></button>'
-  ).join('');
+function populateAssigneeSelect(select){
+  if(!select || select.dataset.assigneesLazy!=='1') return;
+  const selected=select.value;
+  const oldLabel=select.selectedOptions[0]?.textContent||'';
+  const assignees=getSortedAssignees();
+  // Use native option nodes so a selected label cannot be lost when an
+  // assignee is no longer among the users on the current board.
+  const fragment=document.createDocumentFragment();
+  const unassigned=new Option('Unassigned','',false,!selected);
+  fragment.appendChild(unassigned);
+  let found=!selected;
+  for(const a of assignees){
+    fragment.appendChild(new Option(a.name,a.accountId,false,a.accountId===selected));
+    if(a.accountId===selected) found=true;
+  }
+  if(selected && !found) fragment.appendChild(new Option(oldLabel,selected,false,true));
+  select.replaceChildren(fragment);
+  select.dataset.assigneesLazy='0';
+}
+function lazyPriorityPickerHtml(i){
   return '<span class="priority-picker" data-stop-propagation="1" title="Change priority">'+
     '<button type="button" class="priority-trigger" data-stop-propagation="1" aria-label="Change priority" aria-haspopup="true" aria-expanded="false">'+priorityIconHtml(i.priority)+'</button>'+
-    '<span class="priority-menu" role="menu">'+options+'</span></span>';
+    '<span class="priority-menu" role="menu"></span></span>';
 }
+function populatePriorityMenu(picker){
+  const menu=picker.querySelector('.priority-menu');
+  if(!menu || menu.dataset.optionsReady==='1') return;
+  const key=picker.closest('.card, .dashboard-ticket')?.dataset.key;
+  const active=state.issues.find(i=>i.key===key);
+  const selected=active?.priority||'';
+  menu.innerHTML=PRIORITY_ORDER.filter((p,idx,arr)=>arr.indexOf(p)===idx).map(p=>
+    '<button type="button" class="priority-option'+(p===selected?' selected':'')+'" data-priority="'+esc(p)+'" data-stop-propagation="1">'+priorityIconHtml(p)+'<span>'+esc(p)+'</span></button>'
+  ).join('');
+  menu.dataset.optionsReady='1';
+}
+function dashboardAssigneeOptions(i){return lazyAssigneeSelectHtml(i,true);}
+function dashboardPriorityHtml(i){return lazyPriorityPickerHtml(i);}
 function dashboardTicketHtml(i, risks){
   const overdue=isDueDateOverdue(i.dueDate);
   const chainRisk=risks.chainDateRiskKeys?.has(i.key);
@@ -4225,22 +4569,11 @@ function dashboardHighPriorityRisk(issues,risks){
   });
 }
 function dashboardDependencyBottlenecks(issues){
-  const active=issues.filter(i=>!isCompletedStatus(i.status));
-  const byKey=new Map(active.map(i=>[i.key,i]));
-  const downstream=new Map(active.map(i=>[i.key,(i.blocked||[]).filter(k=>byKey.has(k))]));
-  const impact=new Map();
-  active.forEach(i=>{
-    const seen=new Set([i.key]); const queue=[i.key];
-    while(queue.length){
-      const key=queue.shift();
-      for(const next of (downstream.get(key)||[])){
-        if(seen.has(next)) continue;
-        seen.add(next); queue.push(next);
-      }
-    }
-    impact.set(i.key,Math.max(0,seen.size-1));
-  });
-  return active.filter(i=>(impact.get(i.key)||0)>0).sort((a,b)=>(impact.get(b.key)||0)-(impact.get(a.key)||0)).slice(0,10).map(i=>({issue:i,impact:impact.get(i.key)||0}));
+  const graph=dashboardGraphTraversal(issues);
+  return graph.active.map(issue=>({issue,impact:graph.downstreamCount(issue.key)}))
+    .filter(x=>x.impact>0)
+    .sort((a,b)=>b.impact-a.impact)
+    .slice(0,10);
 }
 function dashboardUnblocking(issues){
   return dashboardDependencyBottlenecks(issues).filter(x=>x.issue.assigneeAccountId || x.issue.dueDate || x.issue.priority);
@@ -4258,33 +4591,12 @@ function dashboardWorkload(issues){
   return [...groups.values()].sort((a,b)=>b.count-a.count || a.name.localeCompare(b.name));
 }
 function dashboardMilestones(issues){
-  const active=issues.filter(i=>!isCompletedStatus(i.status));
-  const byKey=new Map(issues.map(i=>[i.key,i]));
-  const countChain=(startKey,field)=>{
-    // Match the milestone view: count only active tickets actually present in
-    // this board's dataset. Relationship arrays can still reference completed
-    // or otherwise excluded tickets, so never count/traverse those keys.
-    const seen=new Set(), queue=[startKey];
-    while(queue.length){
-      const key=queue.shift(), issue=byKey.get(key);
-      if(!issue || isCompletedStatus(issue.status)) continue;
-      (issue[field]||[]).forEach(next=>{
-        if(next===startKey || seen.has(next)) return;
-        const nextIssue=byKey.get(next);
-        if(!nextIssue || isCompletedStatus(nextIssue.status)) return;
-        seen.add(next);
-        queue.push(next);
-      });
-    }
-    seen.delete(startKey);
-    return seen.size;
-  };
-  const milestones=active.filter(i=>(i.labels||[]).some(l=>String(l).toLowerCase()==='milestone'));
+  const graph=dashboardGraphTraversal(issues);
+  const milestones=graph.active.filter(i=>(i.labels||[]).some(l=>String(l).toLowerCase()==='milestone'));
   return milestones.map(m=>{
     const due=m.dueDate?new Date(m.dueDate+'T00:00:00'):null;
-    // Count every unique ticket in the full dependency chain, not only direct links.
-    const blockers=countChain(m.key,'blockers');
-    const blocked=countChain(m.key,'blocked');
+    const blockers=graph.upstreamCount(m.key);
+    const blocked=graph.downstreamCount(m.key);
     const overdue=isDueDateOverdue(m.dueDate);
     return {issue:m,blockers,blocked,overdue,due:due&&!Number.isNaN(due.getTime())?due:null};
   }).sort((a,b)=>Number(b.overdue)-Number(a.overdue) || (a.due?.getTime()||Infinity)-(b.due?.getTime()||Infinity));
@@ -4443,7 +4755,9 @@ function dashboardOverviewHtml(){
   '</div>';
 }
 function renderDashboard(){
+  const start=performance.now();
   board.insertAdjacentHTML('beforeend', dashboardOverviewHtml());
+  console.info('[Performance] Dashboard render',{milliseconds:Math.round(performance.now()-start)});
   attachTicketKeyModalHandlers(board);
   attachEvents();
 
@@ -4887,6 +5201,9 @@ function renderMilestoneOverview(flashKey){
   });
 }
 
+// Render each level's full set of cards before displaying the board.
+// Incremental batches made column heights grow under an active scrollbar and
+// forced delayed scroll restoration. Editing menus are still created lazily.
 // ── Render ────────────────────────────────────────────────────────────────
 let boardRenderEpoch=0;
 let linesRenderFrame=0;
@@ -4899,6 +5216,7 @@ function scheduleDependencyLines(){
   });
 }
 function render(){
+  const renderStart=performance.now();
   boardRenderEpoch++;
   if(linesRenderFrame){cancelAnimationFrame(linesRenderFrame);linesRenderFrame=0;}
   // Capture the scroll position belonging to the view currently on screen.
@@ -5091,39 +5409,37 @@ function render(){
     });
   }
 
-  // Build the columns in one DOM insertion to avoid repeated layout work.
+  // Construct the entire board off-document and install it in one operation.
+  // No cards are appended later during scrolling, and scroll offsets are
+  // restored in this same task, before the first visible paint.
   const columnFragment=document.createDocumentFragment();
-  for(let lv = 0; lv <= max; lv++){
-    const col = document.createElement('section');
-    col.className = 'column' + (locked ? ' unlocked' : '');
-    col.dataset.level = String(lv);
-    const items = orders[lv];
-    const cardsDiv = document.createElement('div');
-    cardsDiv.className = 'cards' + (locked ? ' noscroll' : '');
-    cardsDiv.innerHTML = items.length
-      ? items.map(i => cardHtml(i, searchTerm)).join('')
-      : '<div class="empty">No tickets at this level</div>';
-
-    const header = document.createElement('div');
-    header.className = 'column-header';
-    header.innerHTML = '<span class="column-title">' + (labels[lv] || 'Level ' + lv) + '</span>'
-                     + '<span class="column-count">' + items.length + '</span>';
-    col.appendChild(header);
-    col.appendChild(cardsDiv);
+  for(let lv=0;lv<=max;lv++){
+    const col=document.createElement('section');
+    col.className='column'+(locked?' unlocked':'');
+    col.dataset.level=String(lv);
+    const items=orders[lv];
+    const cardsDiv=document.createElement('div');
+    cardsDiv.className='cards'+(locked?' noscroll':'');
+    if(!items.length) cardsDiv.innerHTML='<div class="empty">No tickets at this level</div>';
+    else cardsDiv.innerHTML=items.map(i=>cardHtml(i,searchTerm)).join('');
+    const header=document.createElement('div');
+    header.className='column-header';
+    header.innerHTML='<span class="column-title">'+(labels[lv]||'Level '+lv)+'</span>'+
+      '<span class="column-count">'+items.length+'</span>';
+    col.appendChild(header);col.appendChild(cardsDiv);
     columnFragment.appendChild(col);
   }
   board.appendChild(columnFragment);
-
-  // Measure after the new cards are in the DOM; observers catch any later
-  // layout/size changes instead of repeatedly resetting the SVG on timers.
-  const renderEpoch=boardRenderEpoch;
-  requestAnimationFrame(()=>{
-    if(renderEpoch!==boardRenderEpoch) return;
-    spaceLongRoutes();
-    attachEvents();
-    scheduleDependencyLines();
-    scheduleMiniMapUpdate();
-  });
+  console.info('[Performance] Board column preparation',{milliseconds:Math.round(performance.now()-renderStart),tickets:visibleIssues.length});
+  // Attach handlers and apply filtering while the full set of cards exists.
+  // Never wait for scrolling, animation frames or an incremental-card batch.
+  attachEvents();
+  if(locked) spaceLongRoutes();
+  else applySearchFilter();
+  preserveBoardScrollDuringRender();
+  scheduleDependencyLines();
+  scheduleMiniMapUpdate();
+  console.info('[Performance] Board ready',{milliseconds:Math.round(performance.now()-renderStart),tickets:visibleIssues.length});
 
   // Restore search focus/caret after a genuine board rebuild (refresh, toggle,
   // selection change, etc.). Typing itself no longer rebuilds the board.
@@ -5136,15 +5452,10 @@ function render(){
     }
   }
 
-  // Restore the saved position after the new columns exist.
-  preserveBoardScrollDuringRender();
-
   if(locked){
     statusText.textContent = visibleIssues.length.toLocaleString('en-GB') + ' tickets in chain · Esc to deselect';
-  } else {
-    applySearchFilter();
   }
-
+  return Promise.resolve();
 }
 
 // ── Board mini-map ────────────────────────────────────────────────────────
@@ -6114,9 +6425,9 @@ function saveDueDateModal(clear=false){
   render();
 }
 
-function attachEvents(){
+function attachEvents(root=board, partial=false){
   // ── Card click (select / deselect) ──
-  board.querySelectorAll('.card').forEach(card => {
+  root.querySelectorAll('.card').forEach(card => {
     card.addEventListener('click', e => {
       // Ignore clicks on links and controls inside the card.
       if(e.target.closest('[data-stop-propagation]')) return;
@@ -6147,7 +6458,7 @@ function attachEvents(){
   });
 
   // ── Persistent hover highlight lock ─────────────────────────────────────
-  board.querySelectorAll('.hover-lock-btn').forEach(btn => {
+  root.querySelectorAll('.hover-lock-btn').forEach(btn => {
     btn.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
@@ -6161,7 +6472,7 @@ function attachEvents(){
   // ── Milestone banner ─────────────────────────────────────────────────────
   // The card itself selects the normal dependency chain. The dedicated banner
   // is the separate navigation target for opening the milestone overview.
-  board.querySelectorAll('.milestone-banner').forEach(banner => {
+  root.querySelectorAll('.milestone-banner').forEach(banner => {
     banner.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
@@ -6183,12 +6494,15 @@ function attachEvents(){
   });
 
   // ── Links/badges inside cards stop propagation via data attribute ──
-  board.querySelectorAll('[data-stop-propagation]').forEach(el => {
+  root.querySelectorAll('[data-stop-propagation]').forEach(el => {
     el.addEventListener('click', e => e.stopPropagation());
   });
 
   // ── Editable Jira fields ──
-  board.querySelectorAll('select[data-field]').forEach(select => {
+  root.querySelectorAll('select[data-field]').forEach(select => {
+    select.addEventListener('pointerdown',()=>populateAssigneeSelect(select));
+    select.addEventListener('focus',()=>populateAssigneeSelect(select));
+    select.addEventListener('keydown',()=>populateAssigneeSelect(select));
     select.addEventListener('change', e => {
       e.stopPropagation();
       const card = select.closest('.card, .dashboard-ticket');
@@ -6200,7 +6514,7 @@ function attachEvents(){
   });
 
   // ── Due date picker ──
-  board.querySelectorAll('[data-due-date-key]').forEach(btn => {
+  root.querySelectorAll('[data-due-date-key]').forEach(btn => {
     btn.addEventListener('click', e => {
       e.preventDefault(); e.stopPropagation();
       openDueDateModal(btn.dataset.dueDateKey);
@@ -6208,7 +6522,7 @@ function attachEvents(){
   });
 
   // ── Custom priority picker with Jira icons ──
-  board.querySelectorAll('.priority-picker').forEach(picker => {
+  root.querySelectorAll('.priority-picker').forEach(picker => {
     const trigger = picker.querySelector('.priority-trigger');
     trigger.addEventListener('click', e => {
       e.stopPropagation();
@@ -6219,6 +6533,7 @@ function attachEvents(){
       picker.classList.toggle('open', !wasOpen);
       trigger.setAttribute('aria-expanded', String(!wasOpen));
       if(!wasOpen){
+        populatePriorityMenu(picker);
         const menu = picker.querySelector('.priority-menu');
         if(menu){
           // Move the menu to <body> so column/card overflow and stacking
@@ -6242,28 +6557,29 @@ function attachEvents(){
         }
       }
     });
-    picker.querySelectorAll('.priority-option').forEach(option => {
-      option.addEventListener('click', e => {
-        e.stopPropagation();
-        const card = picker.closest('.card, .dashboard-ticket');
-        if(!card) return;
-        const value = option.dataset.priority;
-        stageIssueChange(card.dataset.key, 'priority', value);
-        const img = picker.querySelector('.priority-icon');
-        if(img && CFG.jiraBaseUrl){
-          img.src = CFG.jiraBaseUrl + '/images/icons/priorities/' + value.toLowerCase() + '.svg';
-          img.alt = value; img.title = value;
-        }
-        const menu = option.closest('.priority-menu');
-        if(menu) menu.querySelectorAll('.priority-option').forEach(x => x.classList.toggle('selected', x === option));
-        closePriorityPicker(picker);
-      });
+    // Delegation works for lazily inserted choices as well as existing menus.
+    picker.querySelector('.priority-menu')?.addEventListener('click', e => {
+      const option=e.target.closest('.priority-option');
+      if(!option) return;
+      e.stopPropagation();
+      const card=picker.closest('.card, .dashboard-ticket');
+      if(!card) return;
+      const value=option.dataset.priority;
+      stageIssueChange(card.dataset.key,'priority',value);
+      const img=picker.querySelector('.priority-icon');
+      if(img && CFG.jiraBaseUrl){
+        img.src=CFG.jiraBaseUrl+'/images/icons/priorities/'+value.toLowerCase()+'.svg';
+        img.alt=value; img.title=value;
+      }
+      const menu=option.closest('.priority-menu');
+      if(menu) menu.querySelectorAll('.priority-option').forEach(x=>x.classList.toggle('selected',x===option));
+      closePriorityPicker(picker);
     });
   });
 
 
   // ── Reveal downstream / higher-level blocked cards ──
-  board.querySelectorAll('.see-blocked-btn').forEach(btn => {
+  root.querySelectorAll('.see-blocked-btn').forEach(btn => {
     btn.addEventListener('click', e => {
       e.stopPropagation();
       state.showBlocked = !state.showBlocked;
@@ -6271,7 +6587,7 @@ function attachEvents(){
     });
   });
   // ── Edit dependency buttons ──
-  board.querySelectorAll('.edit-dependency-btn').forEach(btn => {
+  root.querySelectorAll('.edit-dependency-btn').forEach(btn => {
     btn.addEventListener('click', e => {
       e.stopPropagation();
       openDependencyModal(btn.dataset.editDependency);
@@ -6279,7 +6595,7 @@ function attachEvents(){
   });
 
   // ── Hover → highlight chain (only while an item is selected) ──
-  board.querySelectorAll('.card').forEach(card => {
+  root.querySelectorAll('.card').forEach(card => {
     card.addEventListener('mouseenter', () => {
       if(state.lockedKey) applyHoverHighlight(card.dataset.key);
     });
@@ -6293,10 +6609,12 @@ function attachEvents(){
   // and SVG together. Do not rebuild the SVG on scroll: replacing all paths
   // during scrolling causes visible flicker and briefly resets hover styling.
 
-  highlightSelectedChainDateRisks();
-  updateSaveButton();
-  attachTicketKeyModalHandlers();
-  updateHoverLockButtons();
+  if(!partial){
+    highlightSelectedChainDateRisks();
+    updateSaveButton();
+    updateHoverLockButtons();
+  }
+  attachTicketKeyModalHandlers(root);
 }
 
 // ── Load data ─────────────────────────────────────────────────────────────
@@ -6310,9 +6628,12 @@ function jiraLoadKey(loadGeneration){ return jiraPageSessionId + ':' + String(lo
 
 async function fetchGraph(mode, loadGeneration){
   const refreshToken = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+  const started=performance.now();
   const r = await fetch('/api/dependencies?mode=' + encodeURIComponent(mode) + '&jql=' + encodeURIComponent(getActiveJql()) + '&generation=' + encodeURIComponent(jiraLoadKey(loadGeneration)) + '&refresh=' + encodeURIComponent(refreshToken), {cache:'no-store'});
+  const transferred=performance.now();
   const d = await r.json();
   if(!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+  console.info('[Performance] Jira response', {networkSeconds:((transferred-started)/1000).toFixed(2), jsonSeconds:((performance.now()-transferred)/1000).toFixed(2), issues:(d.issues||[]).length});
   console.log('Jira graph loaded', {issues:(d.issues || []).length, edges:(d.edges || []).length, withDueDates:(d.issues || []).filter(i => i.dueDate).length});
   return d;
 }
@@ -6416,8 +6737,13 @@ async function load(resetSelection){
         startupViewPending=false;
       }
     }
-    render(); updateSaveButton();
-    if(startupMessagePromise) await startupMessagePromise;
+    await render(); updateSaveButton();
+    if(loadGeneration!==state.loadGeneration) return;
+    // The optional Sitebuilder message must not hold a fully rendered Jira
+    // board behind the loading overlay when the remote feed is slow.
+    if(startupMessagePromise){
+      await Promise.race([startupMessagePromise,new Promise(done=>setTimeout(done,250))]);
+    }
     finishLoadingStages();
     if(!wantCompleted) pollCompletedDownload(loadGeneration);
     await new Promise(resolve => setTimeout(resolve,180));
