@@ -4160,41 +4160,44 @@ function isValidDueDateValue(value){
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
 }
 
+// All due-date checks must use the same *active* links as the normal board
+// (Show completed OFF). Completed tickets cannot be an intermediate hop in a
+// risk path. Do not apply the With Remarkable visibility filter here: those
+// tickets are still active blockers even when hidden from the board.
+function activeDateRiskGraph(){
+  const active=state.issues.filter(i=>!isCompletedStatus(i.status));
+  const byKey=new Map(active.map(i=>[i.key,i]));
+  const outgoing=new Map(),incoming=new Map();
+  byKey.forEach((_,key)=>{outgoing.set(key,[]);incoming.set(key,[]);});
+  for(const edge of (state.edges||[])){
+    if(!byKey.has(edge.from) || !byKey.has(edge.to)) continue;
+    outgoing.get(edge.from).push(edge.to);
+    incoming.get(edge.to).push(edge.from);
+  }
+  return {active,byKey,outgoing,incoming};
+}
+
 function chainDateRiskPairs(keys=null, dateOverrides=null){
   const allowed=keys ? new Set(keys) : null;
-  const byKey=new Map(state.issues.map(i=>[i.key,i]));
-  const outgoing=new Map();
-  state.issues.forEach(i=>outgoing.set(i.key,[]));
-  (state.edges||[]).forEach(edge=>{
-    if(!outgoing.has(edge.from)) outgoing.set(edge.from,[]);
-    outgoing.get(edge.from).push(edge.to);
-  });
+  const {active,byKey,outgoing}=activeDateRiskGraph();
   const effectiveDate=key=>{
     if(dateOverrides && Object.prototype.hasOwnProperty.call(dateOverrides,key)) return dateOverrides[key] || '';
     return byKey.get(key)?.dueDate || '';
   };
   const pairs=[];
-  const seenPairs=new Set();
-  for(const source of state.issues){
+  for(const source of active){
     if(allowed && !allowed.has(source.key)) continue;
-    if(isCompletedStatus(source.status)) continue;
     const sourceDate=effectiveDate(source.key);
     if(!isValidDueDateValue(sourceDate)) continue;
-    const queue=[source.key], seen=new Set([source.key]);
-    while(queue.length){
-      const current=queue.shift();
-      for(const targetKey of (outgoing.get(current)||[])){
+    const queue=[source.key],seen=new Set([source.key]);
+    for(let cursor=0;cursor<queue.length;cursor++){
+      for(const targetKey of (outgoing.get(queue[cursor])||[])){
         if(seen.has(targetKey)) continue;
         seen.add(targetKey);
         queue.push(targetKey);
         if(allowed && !allowed.has(targetKey)) continue;
-        const target=byKey.get(targetKey);
-        if(!target || isCompletedStatus(target.status)) continue;
         const targetDate=effectiveDate(targetKey);
         if(!isValidDueDateValue(targetDate) || targetDate>=sourceDate) continue;
-        const pairId=source.key+'>'+targetKey;
-        if(seenPairs.has(pairId)) continue;
-        seenPairs.add(pairId);
         pairs.push({source:source.key,target:targetKey,sourceDate,targetDate});
       }
     }
@@ -6271,24 +6274,17 @@ function openDueDateModal(key){
 function closeDueDateModal(){ if(dueDateModal) dueDateModal.classList.remove('open'); }
 
 function reachableChainIssues(startKey, direction){
-  const byKey=new Map(state.issues.map(i=>[i.key,i]));
-  const adjacent=new Map();
-  state.issues.forEach(i=>adjacent.set(i.key,[]));
-  for(const edge of state.edges){
-    const from=direction==='downstream' ? edge.from : edge.to;
-    const to=direction==='downstream' ? edge.to : edge.from;
-    if(!adjacent.has(from)) adjacent.set(from,[]);
-    adjacent.get(from).push(to);
-  }
-  const result=[], queue=[startKey], seen=new Set([startKey]);
-  while(queue.length){
-    const current=queue.shift();
-    for(const next of (adjacent.get(current)||[])){
+  const {byKey,outgoing,incoming}=activeDateRiskGraph();
+  // Never walk through completed tickets, including when Show completed is ON.
+  if(!byKey.has(startKey)) return [];
+  const adjacent=direction==='downstream' ? outgoing : incoming;
+  const result=[],queue=[startKey],seen=new Set([startKey]);
+  for(let cursor=0;cursor<queue.length;cursor++){
+    for(const next of (adjacent.get(queue[cursor])||[])){
       if(seen.has(next)) continue;
       seen.add(next);
       queue.push(next);
-      const issue=byKey.get(next);
-      if(issue) result.push(issue);
+      result.push(byKey.get(next));
     }
   }
   return result;
