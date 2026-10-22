@@ -89,7 +89,8 @@ PREFERENCES_DIR=os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduse
 PREFERENCES_FILE=os.path.join(PREFERENCES_DIR,"preferences.txt")
 DEFAULT_PREFERENCES={
     "showCompleted":False,"filterUser":"","filterDue":"all","includeWithRemarkable":True,
-    "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default","personalUserAccountId":"","personalUserName":"",
+    "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default","personalUserAccountId":"","personalUserName":"","myViewSorts":{},
+    "ganttScale":12,"ganttShowDependencies":True,
 }
 _preferences_lock=threading.Lock()
 
@@ -104,9 +105,22 @@ def _normalise_preferences(data):
     out["customJql"]=str(out["customJql"] or "").strip()
     out["useJiraModal"]=out["useJiraModal"] is True
     out["showMiniMap"]=out["showMiniMap"] is not False
-    out["startingView"]=out["startingView"] if out["startingView"] in {"default","dashboard","milestone"} else "default"
+    out["ganttScale"]=out["ganttScale"] if out["ganttScale"] in (6,12,20) and type(out["ganttScale"]) is int else 12
+    out["ganttShowDependencies"]=out["ganttShowDependencies"] is not False
+    out["startingView"]=out["startingView"] if out["startingView"] in {"default","my-view","dashboard","milestone"} else "default"
     out["personalUserAccountId"]=str(out["personalUserAccountId"] or "")
     out["personalUserName"]=str(out["personalUserName"] or "").strip()
+    valid_sort_fields={"priority","dueDate","key","summary","epic","status","blockers","blocked"}
+    sort_values=out.get("myViewSorts")
+    cleaned={}
+    if isinstance(sort_values,dict):
+        for user_id,sorting in list(sort_values.items())[:500]:
+            if isinstance(user_id,str) and user_id and len(user_id)<256 and isinstance(sorting,dict):
+                field=sorting.get("field")
+                direction=sorting.get("direction")
+                if field in valid_sort_fields and direction in {"asc","desc"}:
+                    cleaned[user_id]={"field":field,"direction":direction}
+    out["myViewSorts"]=cleaned
     return out
 
 def _read_preferences():
@@ -584,7 +598,7 @@ def _external_blocker_keys(raw_issues):
 
 def jira_fetch_external_issues(raw_issues, include_completed=True, known_issues=()):
     """Recursively fetch external blockers until no new blocker keys are found."""
-    fields=["summary","status","priority","assignee","duedate","issuelinks","parent","customfield_10014","labels"]
+    fields=_base_issue_fields()
     # Jira can impose a limit on the number of values in an IN clause. Keep the
     # normal case to one JQL request, and only split unusually large sets.
     chunk_size=250
@@ -642,8 +656,36 @@ def jira_fetch_external_issues(raw_issues, include_completed=True, known_issues=
     print(f"  External blockers: recursively found {len(fetched):,} additional issue(s)")
     return fetched
 
+_jira_schedule_fields_lock=threading.Lock()
+_jira_schedule_fields_cache=None
+
+def _jira_schedule_fields():
+    """Find configured Jira Start date field IDs once per application session."""
+    global _jira_schedule_fields_cache
+    with _jira_schedule_fields_lock:
+        if _jira_schedule_fields_cache is not None:
+            return list(_jira_schedule_fields_cache)
+        result=[]
+        try:
+            response=req.get(f"{JIRA_BASE_URL}/rest/api/3/field",headers=get_jira_headers(),timeout=15)
+            response.raise_for_status()
+            for item in response.json():
+                if not isinstance(item,dict): continue
+                name=str(item.get("name") or "").casefold().replace(" ","").replace("_","").replace("-","")
+                fid=str(item.get("id") or "")
+                if name=="startdate" and (fid=="startdate" or fid.startswith("customfield_")) and fid not in result:
+                    result.append(fid)
+            print(f"  Jira Gantt start date fields: {result or 'not configured'}")
+            _jira_schedule_fields_cache=tuple(result)
+        except Exception as exc:
+            # A missing field should not stop the dependency map loading.
+            # Retry next fetch if the lookup itself failed.
+            print(f"  Jira Gantt start date field lookup failed: {exc}")
+        return list(result)
+
 def _base_issue_fields():
-    return ["summary","status","priority","assignee","duedate","issuelinks","parent","customfield_10014","labels"]
+    return ["summary","status","priority","assignee","duedate","created","issuelinks","parent","customfield_10014","labels"] + _jira_schedule_fields()
+
 
 def _completed_jql(jql):
     """Restrict a JQL query to Jira's Done status category."""
@@ -784,6 +826,8 @@ def parse_dependency_graph(raw):
             "assignee":((f.get("assignee") or {}).get("displayName") or (f.get("assignee") or {}).get("name") or "Unassigned"),
             "assigneeAccountId":(f.get("assignee") or {}).get("accountId"),
             "dueDate":f.get("duedate") or None,
+            "startDate":next((str(f.get(field) or "")[:10] for field in _jira_schedule_fields_cache or () if f.get(field)),None),
+            "created":str(f.get("created") or "")[:10] or None,
             "labels":f.get("labels") or [],
             "epic":_extract_epic(f),
             "url":f"{JIRA_BASE_URL}/browse/{key}",
@@ -915,7 +959,7 @@ def serialize_graph(raw, jql=None):
         out.append({
             "key":k,"summary":v["summary"],"status":v["status"],"priority":v["priority"],"assignee":v.get("assignee") or "Unassigned","assigneeAccountId":v.get("assigneeAccountId"),
             "labels":v.get("labels") or [],
-            "dueDate":v.get("dueDate"),
+            "dueDate":v.get("dueDate"),"startDate":v.get("startDate"),"created":v.get("created"),
             "epic":v.get("epic"),"url":v["url"],
             "blockers":sorted(v["blockers"]),"blocked":sorted(v["blocked"]),
             "externalBlockers":sorted(v["externalBlockers"],key=lambda x:x["key"]),
@@ -1283,6 +1327,205 @@ def api_unlink():
     except RuntimeError as e: return jsonify({"error":str(e)}),502
     except Exception as e: return jsonify({"error":f"Unexpected error: {e}"}),500
 
+# ---------------------------------------------------------------------------
+# Milestone Gantt PDF export: vector PDF written using the standard library,
+# so the packaged Windows app does not require any new runtime dependencies.
+# ---------------------------------------------------------------------------
+def _gantt_pdf_escape(value, limit=220):
+    """Escape a string as a WinAnsi PDF string with no untrusted operators."""
+    import unicodedata
+    value=str(value or '')[:limit].replace('\r',' ').replace('\n',' ')
+    value=value.replace('\u2011','-').replace('\u2192','->')
+    value=''.join(ch if ch.encode('cp1252',errors='ignore') else (unicodedata.normalize('NFKD',ch).encode('ascii',errors='ignore').decode('ascii') or '?') for ch in value)
+    return value.replace('\\','\\\\').replace('(','\\(').replace(')','\\)')
+
+
+def _gantt_pdf_bytes(payload):
+    """Return a complete landscape, multipage, dependency-aware vector PDF."""
+    from datetime import date,timedelta
+    import io,re
+    if not isinstance(payload,dict): raise ValueError('Invalid Gantt PDF request.')
+    milestone=payload.get('milestone') or {}
+    records=payload.get('rows') or []
+    links=payload.get('edges') or []
+    if not isinstance(records,list) or not isinstance(links,list) or len(records)>1800 or len(links)>10000:
+        raise ValueError('Gantt is too large to export.')
+    def date_value(v):
+        if not v: return None
+        try: return date.fromisoformat(str(v)[:10])
+        except (TypeError,ValueError): return None
+    rows=[];seen=set()
+    for item in records:
+        if not isinstance(item,dict): continue
+        key=str(item.get('key') or '').strip()[:60]
+        if not key or key in seen: continue
+        seen.add(key)
+        start=date_value(item.get('start')); end=date_value(item.get('end'))
+        raw_color=str(item.get('color') or '')
+        color=raw_color if re.fullmatch(r'#[0-9a-fA-F]{6}',raw_color) else '#64748b'
+        rows.append({'key':key,'summary':str(item.get('summary') or '')[:300],
+                     'status':str(item.get('status') or '')[:60],
+                     'start':start,'end':end,'color':color,
+                     'source':str(item.get('source') or '')[:70],
+                     'reason':str(item.get('reason') or '')[:140],
+                     'milestone':bool(item.get('milestone'))})
+    scheduled=[r for r in rows if r['start'] is not None and r['end'] is not None and r['end']>=r['start']]
+    unscheduled=[r for r in rows if r['start'] is None or r['end'] is None or r['end']<r['start']]
+    page_w,page_h=1190.55,841.89   # A3 landscape, points
+    margin=40.; left_w=360.; chart_left=margin+left_w
+    chart_w=page_w-margin-chart_left; day_w=5.0
+    row_h=23.; table_top=632.; table_bottom=88.
+    per_page=max(1,int((table_top-table_bottom)/row_h))
+    capacity=max(1,int(chart_w/day_w))
+    dates=[d for r in scheduled for d in (r['start'],r['end'])]
+    first=min(dates) if dates else date.today()
+    last=max(dates) if dates else first
+    days=(last-first).days+1
+    slices=max(1,(days+capacity-1)//capacity) if scheduled else 0
+    page_specs=[]
+    for ix in range(slices):
+        begin=first+timedelta(days=ix*capacity)
+        finish=min(last,begin+timedelta(days=capacity-1))
+        for offset in range(0,len(scheduled),per_page):
+            page_specs.append(('timeline',ix+1,begin,finish,scheduled[offset:offset+per_page]))
+    for offset in range(0,len(unscheduled),per_page):
+        page_specs.append(('unscheduled',0,None,None,unscheduled[offset:offset+per_page]))
+    if not page_specs:
+        page_specs.append(('unscheduled',0,None,None,[]))
+    def rgb(value):
+        return tuple(int(value[i:i+2],16)/255 for i in (1,3,5))
+    def poscolor(hex_value):
+        r,g,b=rgb(hex_value);return f'{r:.3f} {g:.3f} {b:.3f}'
+    def txt(x,y,label,size=10,bold=False,shade='#172033',max_chars=100):
+        safe=_gantt_pdf_escape(str(label)[:max_chars])
+        return f'BT /{"F2" if bold else "F1"} {size} Tf {poscolor(shade)} rg 1 0 0 1 {x:.2f} {y:.2f} Tm ({safe}) Tj ET\n'
+    def rect(x,y,w,h,c,stroke=None):
+        op=f'{poscolor(c)} rg {x:.2f} {y:.2f} {w:.2f} {h:.2f} re f\n'
+        if stroke: op+=f'{poscolor(stroke)} RG 0.5 w {x:.2f} {y:.2f} {w:.2f} {h:.2f} re S\n'
+        return op
+    def line(x1,y1,x2,y2,c='#cbd5e1',width=.65):
+        return f'{poscolor(c)} RG {width:.2f} w {x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S\n'
+    def diamond(cx,cy,r,c):
+        return f'{poscolor(c)} rg {cx:.2f} {cy+r:.2f} m {cx+r:.2f} {cy:.2f} l {cx:.2f} {cy-r:.2f} l {cx-r:.2f} {cy:.2f} l h f\n'
+    content=[]
+    total_pages=len(page_specs)
+    all_edges={(str(e.get('from')),str(e.get('to'))) for e in links if isinstance(e,dict)}
+    is_milestone=milestone.get('isMilestone') is not False
+    title=str(milestone.get('summary') or milestone.get('key') or 'Milestone')[:110]
+    key=str(milestone.get('key') or '')[:60]
+    for page_no,(mode,part,begin,finish,page_rows) in enumerate(page_specs,1):
+        cmds=[]
+        cmds.append(rect(0,page_h-112,page_w,112,'#172033'))
+        cmds.append(txt(margin,page_h-47,('MILESTONE GANTT  /  ' if is_milestone else 'SELECTED CHAIN GANTT  /  ')+key,12,True,'#bfdbfe'))
+        cmds.append(txt(margin,page_h-78,title,20,True,'#ffffff',102))
+        cmds.append(txt(page_w-270,page_h-49,'Page '+str(page_no)+' of '+str(total_pages),11,True,'#ffffff'))
+        detail='Scheduled '+str(len(scheduled))+'  |  Unscheduled '+str(len(unscheduled))+'  |  Dates from Jira and dependency fallbacks'
+        cmds.append(txt(margin,page_h-137,detail,10,False,'#475569'))
+        if mode=='timeline':
+            cmds.append(txt(margin,page_h-162,'Timeline: '+begin.strftime('%d %b %Y')+' - '+finish.strftime('%d %b %Y')+f'  (date segment {part}/{slices})',10,True))
+        else:
+            cmds.append(txt(margin,page_h-162,'Unscheduled tasks  |  Missing due date, usable start date or invalid date range',10,True))
+        cmds.append(rect(margin,table_top+15,left_w,32,'#f1f5f9'))
+        cmds.append(txt(margin+8,table_top+26,'ISSUE / SUMMARY',10,True))
+        if mode=='timeline':
+            cmds.append(rect(chart_left,table_top+15,chart_w,32,'#e0f2fe'))
+            cursor=begin
+            while cursor<=finish:
+                idx=(cursor-begin).days; x=chart_left+idx*day_w
+                if cursor.day==1 or cursor==begin:
+                    label=cursor.strftime('%b %Y')
+                    cmds.append(txt(x+3,table_top+26,label,9,True,'#0369a1'))
+                if cursor.weekday()==0:
+                    cmds.append(line(x,table_bottom,x,table_top+15,'#e2e8f0',.45))
+                cursor+=timedelta(days=1)
+        else:
+            cmds.append(rect(chart_left,table_top+15,chart_w,32,'#f1f5f9'))
+            cmds.append(txt(chart_left+10,table_top+26,'REASON / DATES AVAILABLE',10,True))
+        row_centers={}
+        for idx,r in enumerate(page_rows):
+            y=table_top-idx*row_h-row_h; cy=y+row_h/2
+            row_centers[r['key']]=cy
+            if idx%2==1: cmds.append(rect(margin,y,page_w-2*margin,row_h,'#f8fafc'))
+            cmds.append(line(margin,y,page_w-margin,y,'#e2e8f0',.45))
+            cmds.append(txt(margin+8,y+12,r['key']+(('  [Milestone]' if is_milestone else '  [Selected]') if r['milestone'] else '')+'  |  '+r['status'],9,True,'#172033',46))
+            cmds.append(txt(margin+8,y+2,r['summary'],8,False,'#64748b',77))
+            if mode=='timeline':
+                a=max(r['start'],begin); b=min(r['end'],finish)
+                if b>=a:
+                    x=chart_left+((a-begin).days)*day_w+1
+                    length=max(3,((b-a).days+1)*day_w-2)
+                    if r['milestone']:
+                        marker=r['end'] if begin<=r['end']<=finish else a
+                        mx=chart_left+((marker-begin).days+.5)*day_w
+                        cmds.append(diamond(mx,cy,6.5,'#b45309'))
+                    else:
+                        cmds.append(rect(x,cy-5,length,10,r['color']))
+                if r['start']<begin or r['end']>finish:
+                    pass
+            else:
+                dates='Start: '+(r['start'].isoformat() if r['start'] else 'missing') + '   Due: '+(r['end'].isoformat() if r['end'] else 'missing')
+                cmds.append(txt(chart_left+9,y+12,r['reason'] or 'Missing schedule data',9,True,'#b45309',110))
+                cmds.append(txt(chart_left+9,y+2,dates+'  |  '+r['status'],8,False,'#64748b',110))
+        if mode=='timeline':
+            visible={r['key']:r for r in page_rows}
+            for parent,child in all_edges:
+                if parent not in visible or child not in visible: continue
+                a,b=visible[parent],visible[child]
+                # Draw connectors across rows only when both endpoints lie in this date segment.
+                if not(begin<=a['end']<=finish and begin<=b['start']<=finish):continue
+                x1=chart_left+((a['end']-begin).days+.5)*day_w
+                x2=chart_left+((b['start']-begin).days+.5)*day_w
+                y1,y2=row_centers[parent],row_centers[child]
+                joint=x1+min(9,max(4,(x2-x1)/2)) if x2>x1 else x1+7
+                cmds.append(line(x1,y1,joint,y1,'#94a3b8',.8))
+                cmds.append(line(joint,y1,joint,y2,'#94a3b8',.8))
+                cmds.append(line(joint,y2,x2-2,y2,'#94a3b8',.8))
+                cmds.append(f'{poscolor("#64748b")} rg {x2:.2f} {y2:.2f} m {x2-5:.2f} {y2+2.5:.2f} l {x2-5:.2f} {y2-2.5:.2f} l h f\n')
+        cmds.append(line(margin,table_bottom,page_w-margin,table_bottom))
+        cmds.append(txt(margin,55,'Start source: Jira start date > latest direct blocker due date + 1 day > Jira creation date.',9,False,'#64748b'))
+        cmds.append(txt(margin,38,'PDF includes the upstream dependency chain; tasks without complete dates are listed separately.',9,False,'#64748b'))
+        content.append(''.join(cmds).encode('cp1252',errors='replace'))
+    # Minimal standards-compliant PDF writer (xref & page tree), no font files.
+    objects=[b'']
+    def add(b): objects.append(b);return len(objects)-1
+    pages_obj=add(b'')
+    font_regular=add(b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>')
+    font_bold=add(b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>')
+    page_ids=[]
+    for stream in content:
+        body=add(b'<< /Length '+str(len(stream)).encode()+b' >>\nstream\n'+stream+b'\nendstream')
+        page_ids.append(add((f'<< /Type /Page /Parent {pages_obj} 0 R /MediaBox [0 0 {page_w:.2f} {page_h:.2f}] /Resources << /Font << /F1 {font_regular} 0 R /F2 {font_bold} 0 R >> >> /Contents {body} 0 R >>').encode('ascii')))
+    objects[pages_obj]=b'<< /Type /Pages /Kids ['+b' '.join((str(i)+' 0 R').encode() for i in page_ids)+b'] /Count '+str(len(page_ids)).encode()+b' >>'
+    root=add((f'<< /Type /Catalog /Pages {pages_obj} 0 R >>').encode())
+    pdf=io.BytesIO();pdf.write(b'%PDF-1.4\n%\xe2\xe3\xcf\xd3\n');offsets=[0]
+    for n,obj in enumerate(objects[1:],1):
+        offsets.append(pdf.tell())
+        pdf.write(f'{n} 0 obj\n'.encode()+obj+b'\nendobj\n')
+    pointer=pdf.tell();pdf.write(f'xref\n0 {len(objects)}\n0000000000 65535 f \n'.encode())
+    for off in offsets[1:]:pdf.write(f'{off:010d} 00000 n \n'.encode())
+    pdf.write(f'trailer\n<< /Size {len(objects)} /Root {root} 0 R >>\nstartxref\n{pointer}\n%%EOF\n'.encode())
+    return pdf.getvalue()
+
+@app.route('/api/gantt-pdf',methods=['POST'])
+def api_gantt_pdf():
+    try:
+        if request.content_length and request.content_length>2500000:
+            return jsonify({'error':'Gantt export exceeds the size limit.'}),413
+        body=request.get_json(force=True)
+        pdf=_gantt_pdf_bytes(body)
+        milestone=(body.get('milestone') or {}).get('key','milestone')
+        import re
+        filename=re.sub(r'[^A-Za-z0-9_-]','_',str(milestone))[:60] or 'milestone'
+        return Response(pdf,mimetype='application/pdf',headers={
+            'Content-Disposition':f'attachment; filename="{filename}_gantt.pdf"',
+            'Cache-Control':'no-store'
+        })
+    except (ValueError,TypeError) as exc:
+        return jsonify({'error':str(exc)}),400
+    except Exception as exc:
+        return jsonify({'error':'Could not generate Gantt PDF: '+str(exc)}),500
+
+
 @app.route("/")
 def index(): return Response(build_html(),mimetype="text/html")
 
@@ -1403,7 +1646,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .milestone-overview-title{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted)}
 .milestone-overview-count{font-size:12px;background:#e0f2fe;border-radius:999px;padding:3px 9px;color:#0369a1;font-weight:800}
 .milestone-row{display:flex;gap:14px;overflow:visible;padding:2px 2px 14px}
-.milestone-item{width:400px;min-width:400px;display:flex;flex-direction:column;gap:7px}
+.milestone-item{width:600px;min-width:600px;display:flex;flex-direction:column;gap:7px}
 .milestone-item .card{width:100%;}
 .milestone-blocked{border:1px solid var(--border);border-radius:9px;background:#fff;padding:9px 10px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
 .milestone-blocked-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}
@@ -1421,6 +1664,9 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   box-shadow:0 1px 1px rgba(15,23,42,.06);
 }
 .hover-lock-btn:hover{background:#f8fafc;color:#334155}
+.hover-gantt-btn{display:none;align-items:center;justify-content:center;width:24px;height:22px;margin:-1px 5px 0 0;padding:2px;border:1px solid #c7d2fe;border-radius:5px;background:#eef2ff;color:#4338ca;cursor:pointer}
+.card.selection-highlight .hover-gantt-btn{display:inline-flex}
+.hover-gantt-btn:hover,.hover-gantt-btn:focus-visible{background:#dbeafe;border-color:#818cf8}
 .hover-lock-btn.active{
   background:#fff7ed;border-color:#f59e0b;color:#b45309;
   box-shadow:0 0 0 2px rgba(245,158,11,.16);
@@ -1497,6 +1743,8 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 }
 .ticket-preview-close:hover{background:#334155;border-color:#475569;color:#fff}
 .ticket-preview-modal iframe{display:block;flex:1 1 auto;width:100%;min-height:0;border:0;background:#fff}
+body.gantt-open .ticket-preview-backdrop{z-index:25030}
+body.gantt-open .ticket-preview-modal{z-index:25031}
 #faqs-modal{display:none;position:fixed;inset:0;z-index:10079;background:rgba(15,23,42,.22);align-items:center;justify-content:center;padding:24px}
 #faqs-modal.open{display:flex}
 .faqs-dialog{width:min(760px,calc(100vw - 48px));height:min(760px,calc(100vh - 48px));display:flex;flex-direction:column;overflow:hidden;background:#fff;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 24px 70px rgba(15,23,42,.28)}
@@ -1902,7 +2150,7 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .due-date.chain-date-risk:hover{color:#7c2d12;background:#ffedd5;border-color:#f97316}
 .card.chain-date-risk-card{box-shadow:inset 0 0 0 2px rgba(249,115,22,.32)}
 .card.overdue-card{outline:2px solid #ef4444;outline-offset:-2px}
-.due-date-empty{color:#64748b}
+.due-date-empty{color:#1d4ed8;background:#eff6ff;border-color:#bfdbfe;font-weight:750}
 .due-date-icon{font-size:11px}
 #due-date-modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.42);backdrop-filter:blur(2px);z-index:10060;align-items:center;justify-content:center;padding:16px}
 #due-date-modal.open{display:flex}
@@ -2229,8 +2477,149 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .required-update-status{min-height:18px;margin-top:12px;color:#64748b;font-size:12px;line-height:1.45}
 .required-update-status.error{color:#b91c1c}
 
+
+/* Dedicated personal view; table remains readable in a narrow window. */
+#board.my-view-board{width:100%;min-width:0;display:block;padding:18px 20px 40px}
+#board.my-view-board #lines{display:none!important}
+#app.my-view-mode{overflow-x:hidden;overflow-y:auto}
+.my-view{display:flex;flex-direction:column;gap:16px;max-width:1500px;margin:0 auto;min-width:0}
+.my-view .dashboard-personal-view{margin:0}
+.my-view-table-section{background:#fff;border:1px solid #dbe2ea;border-radius:10px;padding:15px;min-width:0}
+.my-view-table-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.my-view-table-heading h2{font-size:15px;color:#172033}
+.my-view-table-heading p{font-size:11px;color:#64748b;margin-top:3px}
+.my-view-sort-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.my-view-sort-status{color:#64748b;font-size:11px}
+.my-view-save-sort{border:1px solid #6366f1;border-radius:7px;padding:8px 12px;background:#4f46e5;color:#fff;cursor:pointer;font-weight:750;font-size:12px}
+.my-view-save-sort:hover{background:#4338ca}
+.my-view-save-sort:disabled{background:#e2e8f0;border-color:#cbd5e1;color:#64748b;cursor:default}
+/* Keep the wide table inside the My view card, with its own horizontal scroll. */
+.my-view-table-scroll{overflow-x:auto;overflow-y:hidden;max-width:100%;min-width:0;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;scrollbar-width:thin;scrollbar-color:#94a3b8 #f1f5f9}
+.my-view-table-scroll::-webkit-scrollbar{height:10px}
+.my-view-table-scroll::-webkit-scrollbar-thumb{background:#94a3b8;border:2px solid #f1f5f9;border-radius:8px}
+.my-view-table-scroll::-webkit-scrollbar-track{background:#f1f5f9}
+.my-view-table-scroll:focus-visible{outline:2px solid #6366f1;outline-offset:2px}
+.my-view-scroll-controls{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:0 0 9px}
+.my-view-scroll-controls[hidden]{display:none!important}
+.my-view-scroll-hint{font-size:11px;color:#64748b;margin-right:2px}
+.my-view-scroll-button{width:32px;height:28px;display:inline-flex;align-items:center;justify-content:center;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#475569;cursor:pointer;font-size:16px;font-weight:800}
+.my-view-scroll-button:not(:disabled):hover{background:#eef2ff;color:#4338ca;border-color:#a5b4fc}
+.my-view-scroll-button:focus-visible{outline:2px solid #6366f1;outline-offset:2px}
+.my-view-scroll-button:disabled{opacity:.4;cursor:default}
+.my-view-table{width:100%;min-width:1080px;border-collapse:separate;border-spacing:0;font-size:12px}
+.my-view-table th{text-align:left;background:#f1f5f9;color:#475569;font-weight:750;border-block:1px solid #e2e8f0;padding:10px 8px;white-space:nowrap}
+.my-view-table th:first-child{border-radius:6px 0 0 6px;padding-left:12px}
+.my-view-table th:last-child{border-radius:0 6px 6px 0}
+.my-view-table th button{display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;color:inherit;font:inherit;font-weight:inherit;cursor:pointer;text-align:left;padding:0}
+.my-view-table th button.active{color:#4338ca}
+.my-view-table th button:focus-visible{outline:2px solid #6366f1;outline-offset:3px}
+.my-view-row{cursor:pointer}
+.my-view-row td{padding:10px 8px;border-bottom:1px solid #e2e8f0;background:#fff;vertical-align:middle;color:#334155}
+.my-view-row td:first-child{padding-left:12px;white-space:nowrap}
+.my-view-row:hover td{background:#f8fafc}
+.my-view-row .my-view-summary{min-width:230px;max-width:480px;line-height:1.4}
+.my-view-row .my-view-priority{display:flex;align-items:center;gap:8px;white-space:nowrap}
+.my-view-row .my-view-parent a{color:#4338ca;text-decoration:none}
+.my-view-row .my-view-parent a:hover{text-decoration:underline}
+.my-view-row .dashboard-ticket-key{font-size:12px;font-weight:800}
+.my-view-row .due-date{white-space:nowrap}
+.my-view-row .status-badge{white-space:nowrap}
+.my-view-count{display:inline-block;font-weight:800;font-size:12px;color:#475569;min-width:24px}
+.my-view-count.upstream{color:#9a6700}.my-view-count.downstream{color:#4338ca}
+.my-view-empty{text-align:center!important;padding:22px!important;color:#64748b!important}
+/* Milestone blocker rows stay on one line. Only the summary is truncated. */
+.milestone-blocked-item{flex-wrap:nowrap;overflow:hidden;white-space:nowrap;gap:8px;min-width:0}
+.milestone-blocked-content{display:flex;align-items:center;flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap;gap:4px}
+.milestone-blocked-content .milestone-blocked-priority,
+.milestone-blocked-content .milestone-blocked-key{flex-shrink:0;margin:0}
+.milestone-blocked-summary{display:block;min-width:0;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.milestone-blocked-editor{display:flex;align-items:center;gap:7px;justify-content:flex-end;flex:0 0 auto;flex-wrap:nowrap;width:auto;padding:0;margin-left:auto}
+.milestone-blocked-editor .assignee-select{width:125px;max-width:125px;min-width:125px;margin-top:0;font-size:11px;text-overflow:ellipsis}
+.milestone-blocked-editor .due-date{font-size:11px;flex-shrink:0}
+.milestone-blocked-item .due-date-empty{color:#1d4ed8}
+.milestone-blocked-actions{display:flex;align-items:center;gap:7px}
+.milestone-blocked-copy{width:25px;height:25px;padding:4px;display:inline-flex;align-items:center;justify-content:center;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#475569;cursor:pointer}
+.milestone-blocked-copy:hover{background:#eef2ff;border-color:#a5b4fc;color:#4338ca}
+.milestone-blocked-copy:focus-visible{outline:2px solid #6366f1;outline-offset:2px}
+.milestone-blocked-copy:disabled{opacity:.45;cursor:default}
+.milestone-blocked-copy.copied{background:#d1fae5;color:#047857;border-color:#6ee7b7}
+.my-view-remarkable-toggle{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:650;color:#334155;white-space:nowrap;cursor:pointer}
+.my-view-remarkable-toggle input{width:16px;height:16px;accent-color:#6366f1;cursor:pointer}
+.my-view-remarkable-count{font-size:10px;color:#64748b}
+.my-view-row .my-view-parent{min-width:175px;max-width:275px}
+.my-view-row .my-view-parent a{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.milestone-overview-card .card-meta{display:flex;align-items:center;flex-wrap:wrap;gap:7px}
+.milestone-overview-card .assignee-select{min-width:160px;max-width:230px}
+.milestone-overview-card .card-meta{padding-right:35px}
+
 @media (max-width:1100px){.dashboard-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.dashboard-health-stat{grid-column:span 2}}
 @media (max-width:700px){.dashboard-stats{grid-template-columns:1fr}.dashboard-health-stat{grid-column:span 1}.dashboard-two-column{grid-template-columns:1fr}}
+/* ── Full-screen milestone Gantt viewer ───────────────────────────────── */
+.milestone-overview-card{position:relative}
+.milestone-gantt-launch{position:absolute;bottom:10px;right:9px;z-index:5;width:28px;height:28px;display:grid;place-items:center;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#4338ca;box-shadow:0 1px 3px #0001;cursor:pointer}
+.milestone-gantt-launch:hover,.milestone-gantt-launch:focus-visible{background:#eef2ff;border-color:#818cf8;outline-offset:2px}
+body.gantt-open{overflow:hidden}
+#gantt-overlay[hidden]{display:none!important}
+#gantt-overlay{position:fixed;inset:0;z-index:25000;background:rgba(15,23,42,.6);display:flex;align-items:stretch;justify-content:stretch;padding:12px}
+.gantt-modal{display:flex;flex-direction:column;width:100%;height:100%;min-width:0;min-height:0;background:#fff;border-radius:12px;box-shadow:0 16px 55px #0004;overflow:hidden}
+.gantt-header{padding:14px 18px;background:#172033;color:#fff;display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap}
+.gantt-header-main{min-width:0;flex:1}
+.gantt-eyebrow{font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:#93c5fd;font-weight:750}
+.gantt-header h2{font-size:18px;margin:3px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gantt-counts{color:#cbd5e1;font-size:11px}
+.gantt-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.gantt-action{border:1px solid #64748b;border-radius:7px;padding:8px 12px;background:#334155;color:#fff;font-size:12px;font-weight:750;cursor:pointer}
+.gantt-action:hover{background:#475569}
+.gantt-export{background:#4f46e5;border-color:#818cf8}
+.gantt-export:hover{background:#4338ca}
+.gantt-action:disabled{opacity:.6;cursor:wait}
+.gantt-toolbar{display:flex;gap:14px;align-items:center;padding:9px 18px;background:#f8fafc;border-bottom:1px solid #e2e8f0;flex-wrap:wrap}
+.gantt-scale-buttons{display:flex;gap:3px}
+.gantt-scale{border:1px solid #cbd5e1;background:#fff;color:#334155;padding:5px 10px;border-radius:6px;font-size:11px;cursor:pointer}
+.gantt-scale.active{background:#e0e7ff;color:#3730a3;border-color:#818cf8;font-weight:750}
+.gantt-dependency-toggle{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;color:#334155;font-size:11px;font-weight:650;cursor:pointer}
+.gantt-dependency-toggle input{accent-color:#4f46e5;width:14px;height:14px}
+.gantt-legend{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:11px;color:#64748b}
+.gantt-legend [hidden]{display:none!important}
+.gantt-legend b{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:3px;background:#64748b}
+.gantt-legend .gantt-legend-milestone{display:inline-block;width:11px;height:11px;background:#b45309;transform:rotate(45deg);margin:0 6px 0 4px}
+.gantt-export-status{font-size:11px;color:#c7d2fe;min-height:16px}
+.gantt-chart-wrap{min-height:140px;flex:1;overflow:auto;overscroll-behavior:contain;background:#fff}
+.gantt-canvas{--gantt-left:420px;position:relative;min-width:100%;}
+.gantt-timeline-heading{display:flex;position:sticky;top:0;z-index:12;background:#e2e8f0;border-bottom:1px solid #cbd5e1}
+.gantt-heading-label{position:sticky;left:0;z-index:14;flex:0 0 420px;width:420px;display:flex;flex-direction:column;justify-content:center;padding:9px 12px;font-size:11px;font-weight:850;color:#334155;background:#e2e8f0;border-right:1px solid #cbd5e1}
+.gantt-heading-label small{font-size:10px;font-weight:500;color:#64748b}
+.gantt-heading-scale{position:relative;flex:0 0 auto;background:linear-gradient(#dbeafe,#eff6ff)}
+.gantt-month-label{position:absolute;top:7px;white-space:nowrap;font-size:11px;font-weight:800;color:#1e40af;border-left:1px solid #93c5fd;padding-left:5px}
+.gantt-day-label{position:absolute;top:32px;transform:translateX(-50%);text-align:center;font-size:9px;line-height:14px;color:#475569;white-space:nowrap;pointer-events:none;user-select:none}
+.gantt-task-area{position:relative}
+.gantt-task-row{position:relative;display:flex;min-height:66px;border-bottom:1px solid #e2e8f0}
+.gantt-task-row:nth-of-type(even){background:#f8fafc}
+.gantt-task-label{position:sticky;left:0;z-index:11;box-sizing:border-box;width:420px;flex:0 0 420px;background:inherit;border-right:1px solid #cbd5e1;padding:6px 12px;white-space:normal;overflow-wrap:anywhere;font-size:11px;line-height:15px}
+.gantt-task-row:nth-of-type(even) .gantt-task-label{background:#f8fafc}
+.gantt-task-row:nth-of-type(odd) .gantt-task-label{background:#fff}
+.gantt-task-label>a{color:#4338ca;font-weight:800;text-decoration:none}
+.gantt-task-label>a:hover{text-decoration:underline}
+.gantt-task-summary{display:block;white-space:normal;overflow-wrap:anywhere;color:#475569;margin:2px 0}
+.gantt-task-dates{display:block;color:#64748b;font-size:9px;white-space:normal;overflow-wrap:anywhere}
+.gantt-milestone-tag{font-size:8px;color:#92400e;background:#fef3c7;border-radius:3px;padding:2px 4px;margin-left:5px;font-weight:800}
+.gantt-task-track{position:relative;flex:0 0 auto}
+.gantt-calendar-overlay{pointer-events:none;position:absolute;top:0;bottom:0;z-index:0}
+.gantt-week-line{position:absolute;top:0;bottom:0;border-left:1px dashed #e2e8f0}
+.gantt-today{position:absolute;top:0;bottom:0;border-left:2px solid #ef4444;z-index:10;pointer-events:none;box-shadow:0 0 0 1px rgba(255,255,255,.4)}
+.gantt-links-svg{position:absolute;top:0;z-index:2;overflow:visible;pointer-events:none}
+.gantt-bar{position:absolute;z-index:3;top:50%;transform:translateY(-50%);height:12px;min-width:4px;border-radius:4px;opacity:.95;box-shadow:0 1px 2px #0002}
+.gantt-diamond{position:absolute;top:50%;z-index:4;width:13px;height:13px;transform:translateY(-50%) rotate(45deg);border:1px solid #fff;box-shadow:0 1px 2px #0003}
+.gantt-unscheduled{border-top:1px solid #dbe2ea;background:#fff;flex:0 0 auto;max-height:25vh;overflow:auto;padding:10px 18px;color:#475569}
+.gantt-unscheduled-heading{font-size:12px;font-weight:850;color:#334155;margin-bottom:7px}
+.gantt-unscheduled-item{display:grid;grid-template-columns:85px minmax(0,1fr) 250px;gap:10px;padding:5px 0;border-bottom:1px solid #f1f5f9;font-size:11px;align-items:center}
+.gantt-unscheduled-item a{color:#4338ca;font-weight:750;text-decoration:none}
+.gantt-unscheduled-item span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gantt-unscheduled-item strong{color:#b45309}
+.gantt-unscheduled-empty,.gantt-schedule-notes{font-size:11px;color:#64748b}
+.gantt-schedule-notes{margin-top:9px}
+@media(max-width:700px){#gantt-overlay{padding:0}.gantt-modal{border-radius:0}.gantt-header{padding:10px}.gantt-header h2{font-size:14px}.gantt-unscheduled-item{grid-template-columns:70px minmax(0,1fr)}.gantt-unscheduled-item strong{grid-column:2}}
+
 </style>
 </head>
 <body>
@@ -2312,7 +2701,8 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
         </div>
         <select id="settings-starting-view" class="filter-user-select" style="width:145px">
           <option value="default">Default board</option>
-          <option value="dashboard">Dashboard</option>
+          <option value="my-view">My view</option>
+          <option value="dashboard">Project overview</option>
           <option value="milestone">Milestone view</option>
         </select>
       </div>
@@ -2480,7 +2870,8 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
     </button>
     <div class="view-switcher" id="view-switcher" role="group" aria-label="Board view">
       <button class="view-switch active" data-view="default" type="button">Full board</button>
-      <button class="view-switch" data-view="dashboard" type="button">Dashboard</button>
+      <button class="view-switch" data-view="my-view" type="button">My view</button>
+      <button class="view-switch" data-view="dashboard" type="button">Project overview</button>
       <button class="view-switch" data-view="milestone" type="button">Milestones</button>
     </div>
     <button class="btn btn-settings" id="settings" title="Settings" aria-label="Settings">&#9881;</button>
@@ -2530,6 +2921,17 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
     </div>
   </div>
 </div>
+<div id="gantt-overlay" role="dialog" aria-modal="true" aria-labelledby="gantt-title" hidden>
+  <section class="gantt-modal">
+    <div class="gantt-header">
+      <div class="gantt-header-main"><div class="gantt-eyebrow">Milestone timeline</div><h2 id="gantt-title"></h2><div id="gantt-counts" class="gantt-counts"></div></div>
+      <div class="gantt-actions"><span id="gantt-export-status" class="gantt-export-status" role="status" aria-live="polite"></span><button type="button" class="gantt-action gantt-export" id="gantt-export">↓ Download PDF</button><button type="button" class="gantt-action" id="gantt-close">Close ×</button></div>
+    </div>
+    <div class="gantt-toolbar"><div class="gantt-scale-buttons" role="group" aria-label="Timeline zoom"><button type="button" class="gantt-scale" data-gantt-scale="6">Compact</button><button type="button" class="gantt-scale active" data-gantt-scale="12">Normal</button><button type="button" class="gantt-scale" data-gantt-scale="20">Expanded</button></div><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-show-dependencies" checked> Show dependencies</label><div class="gantt-legend"><span><b style="background:#2563eb"></b>In progress</span><span id="gantt-legend-completed"><b style="background:#16a34a"></b>Completed</span><span><b style="background:#d97706"></b>With Remarkable</span><span><i class="gantt-legend-milestone"></i>Milestone</span><span id="gantt-legend-dependencies">→ Dependencies</span><span style="color:#ef4444">│ Today</span></div></div>
+    <div id="gantt-chart" class="gantt-chart-wrap" aria-label="Milestone Gantt timeline"></div>
+    <div id="gantt-unscheduled" class="gantt-unscheduled"></div>
+  </section>
+</div>
 <div id="loading"><div class="loading-favicon-wrap"><img class="loading-favicon" src="https://warwick.ac.uk/services/marketing/teams/cds/opd/1486504840-cog-cogwheel-gear-repr-options-setting_81360.png" alt=""></div><div id="loading-label">Connecting to Jira&hellip;</div><div class="loading-progress"><div id="loading-progress-bar"></div></div><div id="loading-status">Working on it…</div><div id="startup-message" class="startup-message" style="display:none"></div></div>
 <div id="app"><main id="board"><svg id="lines" aria-hidden="true"></svg></main></div>
 <div id="board-minimap" aria-label="Board overview">
@@ -2569,8 +2971,10 @@ const state = {
   loadGeneration:0,
   showMilestones:false,         // toggle: OFF by default; milestone overview
   showDashboard:false,
+  showMyView:false,
+  myViewSavedSorts:{}, myViewSort:{field:'priority',direction:'asc'},
   startingView:'default',
-  showMiniMap:true, customJql:'', useJiraModal:false, currentUserName:'', currentUserAccountId:'', personalUserOverride:false, personalTicketFilter:'',
+  showMiniMap:true, customJql:'', useJiraModal:false, ganttScale:12, ganttShowDependencies:true, currentUserName:'', currentUserAccountId:'', personalUserOverride:false, personalTicketFilter:'',
   displayIssues:[], displayEdges:[], displayLevels:0,
   hoverKey:null, hoverLockKey:null,
   returnMilestoneKey:null,
@@ -2579,7 +2983,8 @@ const state = {
   scrollPositions:{
     main:{appLeft:0,appTop:0,columns:{}},
     locked:{appLeft:0,appTop:0,columns:{}},
-    milestone:{appLeft:0,appTop:0,columns:{}}
+    milestone:{appLeft:0,appTop:0,columns:{}},
+    'my-view':{appLeft:0,appTop:0,columns:{}}
   }
 };
 // Initial credential data is obtained by initialiseApp once; do not trigger
@@ -2599,7 +3004,7 @@ let pendingSharedView=readSharedViewUrl();
 let savedFullBoardView=null;
 
 function syncSharedViewUrl(){
-  const selectedKey=(!state.showDashboard && !state.showMilestones && state.lockedKey)
+  const selectedKey=(!state.showDashboard && !state.showMilestones && !state.showMyView && state.lockedKey)
     ? String(state.lockedKey).toLowerCase()
     : '';
   const query=selectedKey
@@ -2631,12 +3036,16 @@ async function loadPreferences(){
     state.customJql=typeof saved.customJql==='string' ? saved.customJql.trim() : '';
     state.useJiraModal=saved.useJiraModal===true;
     state.showMiniMap=saved.showMiniMap!==false;
-    state.startingView=['default','dashboard','milestone'].includes(saved.startingView) ? saved.startingView : 'default';
+    state.ganttScale=[6,12,20].includes(saved.ganttScale) ? saved.ganttScale : 12;
+    state.ganttShowDependencies=saved.ganttShowDependencies!==false;
+    state.startingView=['default','my-view','dashboard','milestone'].includes(saved.startingView) ? saved.startingView : 'default';
+    state.myViewSavedSorts=(saved.myViewSorts && typeof saved.myViewSorts==='object' && !Array.isArray(saved.myViewSorts)) ? saved.myViewSorts : {};
     if(saved.personalUserAccountId || saved.personalUserName){
       state.currentUserAccountId=saved.personalUserAccountId||'';
       state.currentUserName=saved.personalUserName||'';
       state.personalUserOverride=true;
     }
+    resetMyViewSort();
   }catch(e){
     console.warn('Could not load persistent preferences; using defaults.',e);
   }finally{
@@ -2649,17 +3058,21 @@ async function savePreferences(updates){
   Object.assign(state,updates||{});
   if(!preferencesReady) return;
   try{
-    await fetch('/api/preferences',{
+    const response=await fetch('/api/preferences',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         showCompleted:!!state.showCompleted, filterUser:state.filterUser||'', filterDue:state.filterDue||'all',
         includeWithRemarkable:state.includeWithRemarkable!==false,
         customJql:state.customJql||'', useJiraModal:!!state.useJiraModal,
         showMiniMap:state.showMiniMap!==false, startingView:state.startingView || 'default',
-        personalUserAccountId:state.currentUserAccountId||'', personalUserName:state.currentUserName||''
+        ganttScale:state.ganttScale, ganttShowDependencies:state.ganttShowDependencies!==false,
+        personalUserAccountId:state.currentUserAccountId||'', personalUserName:state.currentUserName||'',
+        myViewSorts:state.myViewSavedSorts||{}
       }),cache:'no-store'
     });
-  }catch(e){ console.warn('Could not save persistent preferences.',e); }
+    if(!response.ok) throw new Error('Preferences API returned '+response.status);
+    return true;
+  }catch(e){ console.warn('Could not save persistent preferences.',e); return false; }
 }
 function saveFilterPreferences(){
   savePreferences({showCompleted:!!state.showCompleted,filterUser:state.filterUser||'',filterDue:state.filterDue||'all',
@@ -2902,10 +3315,10 @@ function updateJiraModalSetting(){
   if(stateLabel) stateLabel.textContent = enabled ? 'On' : 'Off';
 }
 function updateStartingViewSetting(){
-  if(settingsStartingView) settingsStartingView.value = ['default','dashboard','milestone'].includes(state.startingView) ? state.startingView : 'default';
+  if(settingsStartingView) settingsStartingView.value = ['default','my-view','dashboard','milestone'].includes(state.startingView) ? state.startingView : 'default';
 }
 function setStartingView(value){
-  state.startingView = ['default','dashboard','milestone'].includes(value) ? value : 'default';
+  state.startingView = ['default','my-view','dashboard','milestone'].includes(value) ? value : 'default';
   savePreferences({startingView:state.startingView});
   updateStartingViewSetting();
 }
@@ -3508,6 +3921,7 @@ function highlight(text, term){
 function getRenderedViewMode(){
   const app = document.getElementById('app');
   if(board.classList.contains('milestone-board') || app.classList.contains('milestone-mode')) return 'milestone';
+  if(board.classList.contains('my-view-board') || app.classList.contains('my-view-mode')) return 'my-view';
   if(board.classList.contains('dashboard-board') || app.classList.contains('dashboard-mode')) return 'dashboard';
   if(app.classList.contains('locked')) return 'locked';
   return 'main';
@@ -3962,7 +4376,8 @@ function stageIssueChange(key, field, value){
   pushHistory();
   const display = state.displayIssues.find(i => i.key === key);
   if(field === 'assignee'){
-    const opt = [...document.querySelectorAll('.assignee-select')].find(s => s.closest('.card, .dashboard-ticket')?.dataset.key === key);
+    const focused=document.activeElement;
+    const opt = (focused?.matches?.('.assignee-select') && focused.closest('.card, .dashboard-ticket')?.dataset.key===key) ? focused : [...document.querySelectorAll('.assignee-select')].find(s => s.closest('.card, .dashboard-ticket')?.dataset.key === key);
     const name = opt && opt.selectedOptions[0] ? opt.selectedOptions[0].textContent : 'Unassigned';
     issue.assigneeAccountId = value || null;
     issue.assignee = name;
@@ -4278,6 +4693,7 @@ function cardHtml(i, searchTerm){
     + '<div class="card-top">'
     +   '<div class="card-top-left">'
     +     '<button type="button" class="hover-lock-btn" data-key="' + esc(i.key) + '" data-stop-propagation="1" title="Lock highlight to this chain" aria-label="Lock highlight to this chain">🔓</button>'
+    +     '<button type="button" class="hover-gantt-btn" data-gantt-chain="' + esc(i.key) + '" data-stop-propagation="1" title="View Gantt for selected dependency chain" aria-label="View Gantt for selected dependency chain"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4v16M3 7h18M3 12h18M3 17h18"/><path d="M7 5v4h5V5M14 10v4h6v-4M8 15v4h8v-4"/></svg></button>'
     +     prioritySelect
     +     '<a class="key" href="' + esc(i.url) + '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' + esc(i.key) + '">' + esc(i.key) + '</a>'
     +   '</div>'
@@ -4548,7 +4964,7 @@ function dashboardSection(title,items,risks,options={}){
   const id=options.id?' id="'+esc(options.id)+'"':'';
   const note=options.note?'<span class="dashboard-section-note">'+esc(options.note)+'</span>':'';
   const sorted=dashboardSortItems(items);
-  const visibleCount=Math.min(10,sorted.length);
+  const visibleCount=options.showAll?sorted.length:Math.min(10,sorted.length);
   const returnSection=options.returnSection||options.id||'';
   const cards=sorted.map((i,index)=>'<div class="dashboard-ticket-wrap" data-dashboard-ticket-index="'+index+'" data-dashboard-return-section="'+esc(returnSection)+'"'+(index>=visibleCount?' hidden':'')+'>'+dashboardTicketHtml(i,risks)+'</div>').join('');
   const remaining=Math.max(0,sorted.length-visibleCount);
@@ -4711,6 +5127,9 @@ function dashboardOverviewHtml(){
   const milestones=dashboardMilestones(risks.active);
   const blockedTickets=risks.active.filter(i=>(i.blockers||[]).length);
   const priorityDistribution=dashboardPriorityDistribution(risks.active);
+  // Include every active With Remarkable ticket, even if the Full board filter
+  // currently hides them from state.displayIssues.
+  const inDevelopment=(state.issues||[]).filter(i=>!isCompletedStatus(i.status) && isWithRemarkableStatus(i));
   const completed=(state.issues||[]).filter(i=>isCompletedStatus(i.status)).sort((a,b)=>String(b.updated||'').localeCompare(String(a.updated||''))).slice(0,8);
   const attentionItems=[
     ['high-priority-risk','High-priority risk',highPriorityRisk.length],
@@ -4734,9 +5153,9 @@ function dashboardOverviewHtml(){
     {label:'Chain date risks',detail:risks.chainDateRisks.length+' affected · max '+h.chainDates.weight+' pts',deduction:h.chainDates.deduction}
   ];
   const healthDetail=hRows.map(row=>'<div class="dashboard-health-row"><span class="dashboard-health-row-label">'+esc(row.label)+'</span><span class="dashboard-health-row-detail">'+esc(row.detail)+'</span><strong>'+(row.deduction>0?'−'+row.deduction.toFixed(1)+' pts':'0 pts')+'</strong></div>').join('');
-  const nav=[['overview','Overview'],['my-view','My view'],['milestones','Milestones'],['unblocking','Unblocking opportunities'],['upcoming','Upcoming'],['workload','Workload'],['priority-distribution','Priority distribution'],['attention','Needs attention']];
-  return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Dependency dashboard</div><div class="dashboard-subtitle">What is at risk, what is causing it, and what should be acted on first.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+ 
-    '<nav class="dashboard-nav" aria-label="Dashboard sections">'+nav.map(x=>'<button type="button" data-dashboard-nav="'+x[0]+'">'+x[1]+'</button>').join('')+'</nav>'+ 
+  const nav=[['overview','Overview'],['milestones','Milestones'],['unblocking','Unblocking opportunities'],['upcoming','Upcoming'],['workload','Workload'],['priority-distribution','Priority distribution'],['in-development','In Development'],['attention','Needs attention']];
+  return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Project overview</div><div class="dashboard-subtitle">What is at risk, what is causing it, and what should be acted on first.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+ 
+    '<nav class="dashboard-nav" aria-label="Project overview sections">'+nav.map(x=>'<button type="button" data-dashboard-nav="'+x[0]+'">'+x[1]+'</button>').join('')+'</nav>'+ 
     '<section class="dashboard-section dashboard-overview" id="overview"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">Overview</span><span class="dashboard-section-note">Board health and immediate signals</span></div></div>'+ 
       '<div class="dashboard-stats">'+
         '<div class="dashboard-stat dashboard-summary-link dashboard-health-stat '+risks.boardHealthStatus+'" data-dashboard-nav="attention" role="button" tabindex="0"><div class="dashboard-health-score-line"><div class="dashboard-stat-value">'+score+'%</div><span class="dashboard-health-status">'+statusLabel+'</span></div><div class="dashboard-stat-label">Board health</div><div class="dashboard-stat-help">Health combines overdue, unassigned, missing due dates, circular dependencies and chain-date risks.</div><div class="dashboard-health-breakdown">'+healthDetail+'</div></div>'+ 
@@ -4747,7 +5166,6 @@ function dashboardOverviewHtml(){
         '</div>'+ 
         '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="workload"><div class="dashboard-stat-value">'+assignedPeopleCount+' assignees</div><div class="dashboard-stat-label">Top workload</div><div class="dashboard-stat-help">Highest workload assignees by active ticket count.</div><div class="dashboard-top-workload">'+topWorkloadHtml+'</div></div>'+ 
       '</div></section>'+ 
-    '<section class="dashboard-section dashboard-personal-view" id="my-view"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">My view: '+esc(state.currentUserName||'Select a user')+'</span><span class="dashboard-section-note">Your active tickets and deadlines</span><span class="dashboard-section-note personal-overwrite-note">Show on board overwrites your filters</span></div><div class="personal-user-change"><label for="personal-user-mapping">Change user</label>'+dashboardPersonalUserOptions()+'</div></div>'+dashboardPersonalViewHtml(risks.active)+'</section>'+ 
     '<div class="dashboard-two-column dashboard-top-cards">'+
       '<div class="dashboard-section-group" id="milestones"><div class="dashboard-group-head"><h2>Milestones</h2><span>Milestone health and delivery pressure</span></div>'+ 
         dashboardSummarySection('Milestone risk',dashboardMilestoneHtml(milestones),'milestone-risk','Active milestones with due dates, overdue status or blocked work')+
@@ -4773,6 +5191,9 @@ function dashboardOverviewHtml(){
         dashboardSummarySection('Priority distribution',dashboardPriorityDistributionHtml(priorityDistribution),'priority-distribution-content','Active tickets by Jira priority')+
       '</div>'+ 
     '</div>'+ 
+    '<div class="dashboard-section-group" id="in-development"><div class="dashboard-group-head"><h2>In Development</h2><span>All active tickets with status With Remarkable</span></div>'+ 
+      dashboardSection('With Remarkable',inDevelopment,risks,{id:'in-development-tickets',returnSection:'in-development-tickets',note:'Sorted by priority and due date'})+
+    '</div>'+ 
     '<div class="dashboard-section-group" id="attention"><div class="dashboard-group-head"><h2>Needs attention</h2><span>Risks that should be reviewed first</span></div>'+ 
       dashboardSection('High-priority risk',highPriorityRisk,risks,{id:'high-priority-risk',returnSection:'high-priority-risk',note:'Highest and Critical work that is overdue, due soon or has a chain-date risk'})+
       dashboardSection('Overdue tickets',risks.overdue,risks,{id:'overdue',returnSection:'overdue',note:'Past their due date'})+
@@ -4791,44 +5212,6 @@ function renderDashboard(){
   attachTicketKeyModalHandlers(board);
   attachEvents();
 
-  const personalUserSelect=board.querySelector('#personal-user-mapping');
-  if(personalUserSelect) personalUserSelect.addEventListener('change',()=>{
-    const accountId=personalUserSelect.value;
-    if(!accountId){ state.currentUserAccountId=''; state.currentUserName=''; state.personalUserOverride=true; }
-    else {
-      const option=personalUserSelect.options[personalUserSelect.selectedIndex];
-      state.currentUserAccountId=accountId; state.currentUserName=option ? option.textContent : accountId; state.personalUserOverride=true;
-    }
-    savePreferences({personalUserAccountId:state.currentUserAccountId,personalUserName:state.currentUserName});
-    render();
-  });
-  board.querySelectorAll('[data-personal-filter]').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      const filter=btn.dataset.personalFilter;
-      // These actions are only offered for due-date metrics. Always replace the
-      // current search and filters with the selected user's due-date filter.
-      const meId=state.currentUserAccountId||'';
-      state.searchTerm='';
-      if(searchEl) searchEl.value='';
-      state.showCompleted=false;
-      state.includeWithRemarkable=true;
-      state.personalTicketFilter='';
-      state.filterUser=meId;
-      state.filterDue=filter==='overdue'?'overdue':filter==='next7'?'next7':filter==='nextMonth'?'nextMonth':'all';
-      state.showDashboard=false;
-      state.showMilestones=false;
-      state.lockedKey=null;
-      state.selectionHistory=[];
-      state.showBlocked=false;
-      savedFullBoardView=null;
-      saveFilterPreferences();
-      updateFilterControls();
-      render();
-      // Ensure the visible filter controls reflect the filters applied by this action.
-      populateFilterUsers();
-      updateFilterControls();
-    });
-  });
   function setUpcomingTab(tab){
     const value=tab==='month'?'month':'7';
     board.querySelectorAll('[data-dashboard-upcoming-tab-button]').forEach(btn=>{
@@ -4873,6 +5256,7 @@ function renderDashboard(){
       const key=el.dataset.dashboardMilestone;
       if(!key) return;
       state.showDashboard=false;
+      state.showMyView=false;
       state.showMilestones=true;
       state.lockedKey=null;
       state.selectionHistory=[];
@@ -4889,6 +5273,7 @@ function renderDashboard(){
       const key=el.dataset.dashboardUnblocking;
       if(!key) return;
       state.showDashboard=false;
+      state.showMyView=false;
       state.showMilestones=false;
       state.lockedKey=key;
       state.selectionHistory=[];
@@ -4917,6 +5302,207 @@ function updateDashboardPagination(section){
   const remaining=hidden.length;
   if(more){ more.textContent='Show more (+'+Math.min(10,remaining)+')'; more.hidden=remaining===0; }
   if(all){ all.textContent='Show all ('+items.length+')'; all.hidden=remaining===0; }
+}
+
+// ── My view (independent of the project overview) ───────────────────────
+function isWithRemarkableStatus(i){
+  return String(i?.status||'').trim().toLowerCase()==='with remarkable';
+}
+const MY_VIEW_SORT_FIELDS=['key','summary','priority','dueDate','epic','status','blockers','blocked'];
+function resetMyViewSort(){
+  const preference=state.myViewSavedSorts?.[state.currentUserAccountId||''];
+  state.myViewSort={field:MY_VIEW_SORT_FIELDS.includes(preference?.field)?preference.field:'priority',direction:preference?.direction==='desc'?'desc':'asc'};
+}
+function myViewSortChanged(){
+  const saved=state.myViewSavedSorts?.[state.currentUserAccountId||''];
+  const stored={field:MY_VIEW_SORT_FIELDS.includes(saved?.field)?saved.field:'priority',direction:saved?.direction==='desc'?'desc':'asc'};
+  return state.myViewSort.field!==stored.field || state.myViewSort.direction!==stored.direction;
+}
+function myViewAssignedIssues(includeHiddenRemarkable=false){
+  const active=(state.issues||[]).filter(i=>!isCompletedStatus(i.status));
+  const id=state.currentUserAccountId||'';
+  if(!id) return [];
+  return active.filter(i=>i.assigneeAccountId===id && (includeHiddenRemarkable || state.includeWithRemarkable || !isWithRemarkableStatus(i)));
+}
+function compareMyViewIssues(a,b){
+  const field=state.myViewSort.field, dir=state.myViewSort.direction==='desc'?-1:1;
+  const getValue=i=>{
+    if(field==='priority') return priorityRank(i.priority);
+    if(field==='dueDate') return i.dueDate||'';
+    if(field==='epic') return (i.epic?.key||'').toLowerCase();
+    if(field==='blockers') return dashboardMyViewGraph.upstreamCount(i.key);
+    if(field==='blocked') return dashboardMyViewGraph.downstreamCount(i.key);
+    return String(i[field]||'').toLowerCase();
+  };
+  const av=getValue(a),bv=getValue(b);
+  // Missing due dates are consistently last when sorting a table by due date.
+  if(field==='dueDate' && (!av||!bv) && av!==bv) return !av?1:-1;
+  const cmp=typeof av==='number' ? av-bv : String(av).localeCompare(String(bv),undefined,{numeric:true});
+  if(cmp) return dir*cmp;
+  if(field==='priority'){
+    const da=a.dueDate||'9999-12-31',db=b.dueDate||'9999-12-31';
+    if(da!==db) return da.localeCompare(db);
+  }
+  return a.key.localeCompare(b.key);
+}
+let dashboardMyViewGraph=null;
+function myViewTableHtml(){
+  const tickets=myViewAssignedIssues();
+  const remarkableCount=myViewAssignedIssues(true).filter(isWithRemarkableStatus).length;
+  // All active Jira issues must contribute to upstream/downstream counts,
+  // including With Remarkable even if hidden by a Full board filter.
+  dashboardMyViewGraph=dashboardGraphTraversal(state.issues||[]);
+  const sorted=[...tickets].sort(compareMyViewIssues);
+  const headers=[['key','Key'],['summary','Summary'],['priority','Priority'],['dueDate','Due date'],['epic','Parent (epic)'],['status','Status'],['blockers','Blockers'],['blocked','Blocked']];
+  const headerHtml=headers.map(([field,label])=>{
+    const active=state.myViewSort.field===field;
+    return '<th scope="col" aria-sort="'+(active?(state.myViewSort.direction==='asc'?'ascending':'descending'):'none')+'"><button type="button" class="'+(active?'active':'')+'" data-my-view-sort="'+field+'">'+label+' <span aria-hidden="true">'+(active?(state.myViewSort.direction==='asc'?'▲':'▼'):'↕')+'</span></button></th>';
+  }).join('');
+  const rows=sorted.map(i=>{
+    const epic=i.epic;
+    const epicLabel=epic?(epic.summary?epic.summary+' ('+epic.key+')':epic.key):'';
+    const epicHtml=epic?'<a href="'+esc(epic.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(epic.key)+'" title="'+esc(epicLabel)+'">'+esc(epicLabel)+'</a>':'—';
+    return '<tr class="my-view-row dashboard-ticket" data-key="'+esc(i.key)+'" data-my-view-key="'+esc(i.key)+'" tabindex="0" title="Open dependency chain for '+esc(i.key)+'">'+
+      '<td><a class="dashboard-ticket-key" href="'+esc(i.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(i.key)+'">'+esc(i.key)+'</a></td>'+
+      '<td class="my-view-summary">'+esc(i.summary||'')+'</td>'+
+      '<td><div class="my-view-priority" title="'+esc(i.priority||'Unspecified')+'">'+dashboardPriorityHtml(i)+'</div></td>'+
+      '<td>'+dueDateHtml(i)+'</td>'+
+      '<td class="my-view-parent">'+epicHtml+'</td>'+
+      '<td><span class="status-badge" style="'+statusStyle(i.status)+'">'+esc(i.status||'—')+'</span></td>'+
+      '<td><span class="my-view-count upstream">'+dashboardMyViewGraph.upstreamCount(i.key)+'</span></td>'+
+      '<td><span class="my-view-count downstream">'+dashboardMyViewGraph.downstreamCount(i.key)+'</span></td>'+
+    '</tr>';
+  }).join('');
+  const hasUser=!!state.currentUserAccountId;
+  const remarkableToggle=remarkableCount
+    ? '<label class="my-view-remarkable-toggle" for="my-view-remarkable"><input type="checkbox" id="my-view-remarkable"'+(state.includeWithRemarkable?' checked':'')+'><span>Include With Remarkable</span><span class="my-view-remarkable-count">('+remarkableCount+')</span></label>'
+    : '';
+  return '<section class="my-view-table-section"><div class="my-view-table-heading"><div><h2>Assigned work <span class="dashboard-section-count">('+sorted.length+')</span></h2><p>Active tickets assigned to the selected user. Select a row to open its dependency chain. Click a heading to change the sort.</p></div>'+
+    '<div class="my-view-sort-actions">'+remarkableToggle+'<span class="my-view-sort-status">'+(myViewSortChanged()?'Sorting not saved':(state.myViewSavedSorts?.[state.currentUserAccountId||'']?'Sorting saved':'Default sorting'))+'</span><button class="my-view-save-sort" type="button" id="my-view-save-sort"'+(!hasUser || !myViewSortChanged()?' disabled':'')+'>Save sort</button></div></div>'+
+    '<div class="my-view-scroll-controls" hidden><span class="my-view-scroll-hint">Scroll to see more columns</span><button type="button" class="my-view-scroll-button" data-my-view-scroll="left" aria-label="Scroll assigned work left">&#8592;</button><button type="button" class="my-view-scroll-button" data-my-view-scroll="right" aria-label="Scroll assigned work right">&#8594;</button></div>'+ 
+    '<div class="my-view-table-scroll" role="region" aria-label="Assigned work table, horizontally scrollable" tabindex="0"><table class="my-view-table"><thead><tr>'+headerHtml+'</tr></thead><tbody>'+
+    (rows || '<tr><td colspan="8" class="my-view-empty">'+(hasUser?'No active tickets assigned to this user.':'Choose a user above to see their tickets.')+'</td></tr>')+'</tbody></table></div></section>';
+}
+// The scroll buttons appear only when the table is wider than its container.
+function updateMyViewScrollControls(){
+  const scroller=board.querySelector('.my-view-table-scroll');
+  const controls=board.querySelector('.my-view-scroll-controls');
+  if(!scroller || !controls) return;
+  const maxScroll=Math.max(0,scroller.scrollWidth-scroller.clientWidth);
+  controls.hidden=maxScroll<=1;
+  controls.querySelector('[data-my-view-scroll="left"]').disabled=scroller.scrollLeft<=1;
+  controls.querySelector('[data-my-view-scroll="right"]').disabled=scroller.scrollLeft>=maxScroll-1;
+}
+const myViewScrollObserver=typeof ResizeObserver==='undefined' ? null : new ResizeObserver(updateMyViewScrollControls);
+window.addEventListener('resize',updateMyViewScrollControls);
+
+function renderMyView(){
+  const risksActive=(state.issues||[]).filter(i=>!isCompletedStatus(i.status));
+  const personalHtml='<section class="dashboard-section dashboard-personal-view" id="my-view-personal"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">My view: '+esc(state.currentUserName||'Select a user')+'</span><span class="dashboard-section-note">Your active tickets and deadlines</span><span class="dashboard-section-note personal-overwrite-note">Show on board overwrites your filters</span></div><div class="personal-user-change"><label for="personal-user-mapping">Change user</label>'+dashboardPersonalUserOptions()+'</div></div>'+dashboardPersonalViewHtml(risksActive)+'</section>';
+  board.insertAdjacentHTML('beforeend','<div class="my-view">'+personalHtml+myViewTableHtml()+'</div>');
+  const tableScroller=board.querySelector('.my-view-table-scroll');
+  if(myViewScrollObserver){
+    myViewScrollObserver.disconnect();
+    myViewScrollObserver.observe(tableScroller);
+    myViewScrollObserver.observe(tableScroller.querySelector('table'));
+  }
+  tableScroller.addEventListener('scroll',updateMyViewScrollControls,{passive:true});
+  board.querySelectorAll('[data-my-view-scroll]').forEach(button=>button.addEventListener('click',()=>{
+    const direction=button.dataset.myViewScroll==='right'?1:-1;
+    tableScroller.scrollBy({left:direction*Math.max(240,Math.round(tableScroller.clientWidth*.75)),behavior:'smooth'});
+  }));
+  requestAnimationFrame(updateMyViewScrollControls);
+  attachEvents();
+  const personalUserSelect=board.querySelector('#personal-user-mapping');
+  if(personalUserSelect) personalUserSelect.addEventListener('change',()=>{
+    const accountId=personalUserSelect.value;
+    if(!accountId){ state.currentUserAccountId=''; state.currentUserName=''; state.personalUserOverride=true; }
+    else {
+      const option=personalUserSelect.options[personalUserSelect.selectedIndex];
+      state.currentUserAccountId=accountId; state.currentUserName=option ? option.textContent : accountId; state.personalUserOverride=true;
+    }
+    resetMyViewSort();
+    savePreferences({personalUserAccountId:state.currentUserAccountId,personalUserName:state.currentUserName});
+    render();
+  });
+  board.querySelectorAll('[data-personal-filter]').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const filter=btn.dataset.personalFilter;
+      // These actions are only offered for due-date metrics. Always replace the
+      // current search and filters with the selected user's due-date filter.
+      const meId=state.currentUserAccountId||'';
+      state.searchTerm='';
+      if(searchEl) searchEl.value='';
+      state.showCompleted=false;
+      state.includeWithRemarkable=true;
+      state.personalTicketFilter='';
+      state.filterUser=meId;
+      state.filterDue=filter==='overdue'?'overdue':filter==='next7'?'next7':filter==='nextMonth'?'nextMonth':'all';
+      state.showDashboard=false;
+      state.showMyView=false;
+      state.showMilestones=false;
+      state.lockedKey=null;
+      state.selectionHistory=[];
+      state.showBlocked=false;
+      savedFullBoardView=null;
+      saveFilterPreferences();
+      updateFilterControls();
+      render();
+      // Ensure the visible filter controls reflect the filters applied by this action.
+      populateFilterUsers();
+      updateFilterControls();
+    });
+  });
+  board.querySelector('#my-view-remarkable')?.addEventListener('change',e=>{
+    state.includeWithRemarkable=e.target.checked;
+    saveFilterPreferences();
+    updateFilterControls();
+    render();
+  });
+  board.querySelectorAll('[data-my-view-sort]').forEach(btn=>btn.addEventListener('click',()=>{
+    const field=btn.dataset.myViewSort;
+    if(!MY_VIEW_SORT_FIELDS.includes(field)) return;
+    const current=state.myViewSort;
+    state.myViewSort={field,direction:current.field===field && current.direction==='asc'?'desc':'asc'};
+    render();
+  }));
+  board.querySelector('#my-view-save-sort')?.addEventListener('click',async()=>{
+    const id=state.currentUserAccountId;
+    if(!id) return;
+    const previous=state.myViewSavedSorts;
+    state.myViewSavedSorts={...previous,[id]:{...state.myViewSort}};
+    const success=await savePreferences({myViewSavedSorts:state.myViewSavedSorts});
+    if(success){render();}
+    else{
+      state.myViewSavedSorts=previous;
+      const message=board.querySelector('.my-view-sort-status');
+      if(message) message.textContent='Unable to save sorting. Try again.';
+    }
+  });
+  board.querySelectorAll('[data-my-view-key]').forEach(row=>{
+    const open=e=>{
+      if(e?.target?.closest?.('[data-stop-propagation], a, button, select, .priority-picker, .priority-menu')) return;
+      const key=row.dataset.myViewKey;
+      if(!key) return;
+      state.showMyView=false;
+      state.showDashboard=false;
+      state.showMilestones=false;
+      state.lockedKey=key;
+      state.selectionHistory=[];
+      state.showBlocked=false;
+      state.dashboardReturnSection='my-view';
+      state.returnMilestoneKey=null;
+      state.revealSelectedKey=key;
+      render();
+    };
+    row.addEventListener('click',open);
+    row.addEventListener('keydown',e=>{if(e.key==='Enter' && e.target===row){e.preventDefault();open(e);}});
+  });
+  statusText.textContent='My view';
+  requestAnimationFrame(()=>{
+    const saved=state.scrollPositions['my-view']||{};
+    document.getElementById('app').scrollTop=saved.appTop||0;
+  });
 }
 
 // ── Milestone overview ───────────────────────────────────────────────────
@@ -4971,11 +5557,15 @@ function milestoneChainItems(milestoneKey){
     .sort((a,b) => (a.chainLevel - b.chainLevel) || a.key.localeCompare(b.key));
 }
 
+let ticketPreviewReturnFocus=null;
 function closeTicketPreviewModal(){
+  const returnFocus=ticketPreviewReturnFocus;
+  ticketPreviewReturnFocus=null;
   const backdrop = document.getElementById('ticket-preview-backdrop');
   if(backdrop) backdrop.remove();
   const modal = document.getElementById('ticket-preview-modal');
   if(modal) modal.remove();
+  if(returnFocus?.isConnected) returnFocus.focus({preventScroll:true});
 }
 
 function refreshJiraData(){
@@ -4992,6 +5582,7 @@ function refreshTicketPreview(){
 
 function openTicketPreviewModal(key, url, summary){
   closeTicketPreviewModal();
+  ticketPreviewReturnFocus=document.activeElement;
 
   const backdrop=document.createElement('div');
   backdrop.id='ticket-preview-backdrop';
@@ -5076,21 +5667,18 @@ function milestoneCardHtml(i){
       (i.status ? '<span class="status-badge" style="' + statusStyle(i.status) + '">' + esc(i.status) + '</span>' : '') +
     '</div>' + epicHtml +
     '<div class="summary">' + esc(i.summary) + '</div>' +
-    '<div class="card-meta">' + dueDateHtml(i) + '</div>' +
+    '<div class="card-meta">' + lazyAssigneeSelectHtml(i) + dueDateHtml(i) + '</div>' +
   '</article>';
 }
 
+function sortedMilestoneBlockers(milestoneKey){
+  return milestoneChainItems(milestoneKey).sort((a,b)=>
+    (a.chainLevel-b.chainLevel) || priorityRank(a.priority)-priorityRank(b.priority) ||
+    (a.dueDate||'9999-12-31').localeCompare(b.dueDate||'9999-12-31') || a.key.localeCompare(b.key));
+}
 function milestoneOverviewHtml(milestones){
-  function assigneeInitials(name){
-    const clean = String(name || '').trim();
-    if(!clean || clean.toLowerCase() === 'unassigned') return '';
-    const parts = clean.split(/\s+/).filter(Boolean);
-    if(parts.length === 1) return parts[0].slice(0,2).toUpperCase();
-    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
-  }
-
   function blockerItems(i){
-    const blockers = milestoneChainItems(i.key);
+    const blockers = sortedMilestoneBlockers(i.key);
     const count = blockers.length;
     const groups = new Map();
     blockers.forEach(b => {
@@ -5103,21 +5691,17 @@ function milestoneOverviewHtml(milestones){
           const label = level === 0 ? 'Unblocked' : 'Level ' + level;
           return '<div class="milestone-blocked-group">' +
             '<div class="milestone-blocked-level">' + label + '</div>' +
-            groups.get(level).sort((a,b) => {
-              const pa = priorityRank(a.priority);
-              const pb = priorityRank(b.priority);
-              return pa === pb ? a.key.localeCompare(b.key) : pa - pb;
-            }).map(b =>
-              '<div class="milestone-blocked-item' + (isCompletedStatus(b.status) ? ' completed' : '') +
-                '" data-milestone-chain="' + esc(b.key) + '" title="' + esc(b.key + ' - ' + (b.summary || '')) + '">' +
+            groups.get(level).map(b =>
+              '<div class="milestone-blocked-item dashboard-ticket' + (isCompletedStatus(b.status) ? ' completed' : '') +
+                '" data-key="' + esc(b.key) + '" data-milestone-chain="' + esc(b.key) + '" title="' + esc(b.key + ' - ' + (b.summary || '')) + '">' +
                 '<span class="milestone-blocked-content">' +
                   '<span class="milestone-blocked-priority">' + priorityIconHtml(b.priority) + '</span>' +
                   '<a class="milestone-blocked-key" href="' + esc(b.url || (CFG.jiraBaseUrl + '/browse/' + b.key)) +
                   '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' +
                   esc(b.key) + '">' + esc(b.key) + '</a>' +
-                  ' - ' + esc(b.summary || '') +
+                  '<span class="milestone-blocked-summary">' + esc(b.summary || '') + '</span>' +
                 '</span>' +
-                (assigneeInitials(b.assignee) ? '<span class="milestone-blocked-assignee" title="Assigned to ' + esc(b.assignee) + '">' + esc(assigneeInitials(b.assignee)) + '</span>' : '<span class="milestone-blocked-assignee unassigned" title="Unassigned">U</span>') +
+                '<span class="milestone-blocked-editor">' + lazyAssigneeSelectHtml(b) + dueDateHtml(b) + '</span>' +
               '</div>'
             ).join('') +
           '</div>';
@@ -5126,7 +5710,7 @@ function milestoneOverviewHtml(milestones){
     return '<div class="milestone-blocked">' +
       '<div class="milestone-blocked-head">' +
         '<span class="milestone-blocked-title">Blocked by</span>' +
-        '<span class="milestone-blocked-count">' + count + '</span>' +
+        '<div class="milestone-blocked-actions"><button type="button" class="milestone-blocked-copy" data-copy-milestone="'+esc(i.key)+'" title="Copy blockers for '+esc(i.key)+' as a table" aria-label="Copy blockers for '+esc(i.key)+' as a table"'+(count?'':' disabled')+'><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><span class="milestone-blocked-count">' + count + '</span></div>' +
       '</div>' +
       '<div class="milestone-blocked-list">' + list + '</div>' +
     '</div>';
@@ -5140,7 +5724,8 @@ function milestoneOverviewHtml(milestones){
     '<div class="milestone-row">' +
       (milestones.length
         ? milestones.map(i => '<div class="milestone-item">' +
-            '<div class="milestone-overview-card" data-milestone-card="' + esc(i.key) + '" data-milestone-chain="' + esc(i.key) + '">' + milestoneCardHtml(i) + '</div>' +
+            '<div class="milestone-overview-card" data-milestone-card="' + esc(i.key) + '" data-milestone-chain="' + esc(i.key) + '">' + milestoneCardHtml(i) +
+              '<button type="button" class="milestone-gantt-launch" data-gantt-milestone="' + esc(i.key) + '" data-stop-propagation="1" title="Open Gantt timeline for ' + esc(i.key) + '" aria-label="Open Gantt timeline for ' + esc(i.key) + '"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4v16M3 7h18M3 12h18M3 17h18"/><path d="M7 5v4h5V5M14 10v4h6v-4M8 15v4h8v-4"/></svg></button></div>' +
             blockerItems(i) +
           '</div>').join('')
         : '<div class="empty">No milestone tickets</div>') +
@@ -5148,10 +5733,85 @@ function milestoneOverviewHtml(milestones){
   '</div>';
 }
 
+// Copy milestone blockers as an actual HTML table (for Outlook/Gmail) with
+// a tab-separated text alternative for plain-text editors.
+function milestoneBlockersClipboardContent(milestoneKey){
+  const milestone=state.issues.find(i=>i.key===milestoneKey);
+  const blockers=sortedMilestoneBlockers(milestoneKey);
+  const columns=['Level','Key','Summary','Priority','Assignee','Due date','Status'];
+  const records=blockers.map(b=>[
+    b.chainLevel===0?'Unblocked':'Level '+b.chainLevel,
+    b.key,b.summary||'',b.priority||'Unspecified',b.assignee||'Unassigned',
+    b.dueDate?formatDueDate(b.dueDate):'No due date',b.status||''
+  ]);
+  const textValue=String(milestone?.summary||milestoneKey)+' ('+milestoneKey+') — Blocked by\n'+
+    columns.join('\t')+'\n'+records.map(r=>r.map(v=>String(v).replace(/[\t\r\n]+/g,' ')).join('\t')).join('\n');
+  const css='border:1px solid #cbd5e1;padding:7px 10px;text-align:left;font:12px Arial,sans-serif;vertical-align:top;';
+  const headerCells=columns.map(c=>'<th style="'+css+'background:#e2e8f0;color:#172033;font-weight:bold;">'+esc(c)+'</th>').join('');
+  const rows=records.map((r,n)=>'<tr>'+r.map((value,idx)=>{
+    const url=idx===1?((state.issues.find(i=>i.key===value)?.url)||CFG.jiraBaseUrl+'/browse/'+value):'';
+    const content=url?'<a href="'+esc(url)+'" style="color:#4338ca;text-decoration:underline;">'+esc(value)+'</a>':esc(value);
+    return '<td style="'+css+'background:'+(n%2?'#f8fafc':'#ffffff')+';">'+content+'</td>';
+  }).join('')+'</tr>').join('');
+  const name=milestone?.summary||milestoneKey;
+  const html='<div style="font:13px Arial,sans-serif;color:#172033;"><p style="font-weight:bold;margin:0 0 8px;">'+esc(name)+' ('+esc(milestoneKey)+') — Blocked by ('+blockers.length+')</p>'+
+    '<table style="border-collapse:collapse;width:100%;max-width:900px;">' +
+    '<thead><tr>'+headerCells+'</tr></thead><tbody>'+rows+'</tbody></table></div>';
+  return {html,text:textValue};
+}
+async function copyMilestoneBlockers(milestoneKey,button){
+  const {html,text}=milestoneBlockersClipboardContent(milestoneKey);
+  const previousLabel=button.getAttribute('aria-label');
+  let copied=false;
+  // Prefer both MIME types: pasting into an email retains the styled table.
+  if(navigator.clipboard?.write && typeof ClipboardItem!=='undefined'){
+    try{
+      await navigator.clipboard.write([new ClipboardItem({
+        'text/html':new Blob([html],{type:'text/html'}),
+        'text/plain':new Blob([text],{type:'text/plain'})
+      })]);
+      copied=true;
+    }catch(err){console.warn('Rich clipboard write unavailable; trying selection copy.',err);}
+  }
+  if(!copied){
+    // The selection fallback copies the HTML table in browsers that disallow
+    // ClipboardItem, without requiring the user to select any page contents.
+    const temp=document.createElement('div');
+    temp.contentEditable='true';
+    temp.style.cssText='position:fixed;left:-99999px;top:0;width:900px;';
+    temp.innerHTML=html;
+    document.body.appendChild(temp);
+    const selection=window.getSelection();
+    const oldRange=selection?.rangeCount?selection.getRangeAt(0).cloneRange():null;
+    try{
+      const range=document.createRange();range.selectNodeContents(temp);
+      selection.removeAllRanges();selection.addRange(range);
+      copied=document.execCommand('copy');
+    }catch(err){console.warn('Table selection copy unavailable.',err);}
+    finally{
+      selection?.removeAllRanges();
+      if(oldRange) selection?.addRange(oldRange);
+      temp.remove();
+    }
+  }
+  if(!copied && navigator.clipboard?.writeText){
+    try{await navigator.clipboard.writeText(text);copied=true;}catch(err){console.warn('Plain-text clipboard failed.',err);}
+  }
+  button.title=copied?'Blockers copied as a table':'Could not copy blockers';
+  button.setAttribute('aria-label',copied?'Blockers copied': 'Copy failed; try again');
+  button.classList.toggle('copied',copied);
+  setTimeout(()=>{
+    if(!button.isConnected) return;
+    button.title='Copy blockers as an email table';
+    button.setAttribute('aria-label',previousLabel||'Copy blockers as a table');
+    button.classList.remove('copied');
+  },2500);
+}
+
 function renderMilestoneOverview(flashKey){
   const milestones = state.displayIssues
     .filter(i => (i.labels || []).some(label => String(label).toLowerCase() === 'milestone'))
-    .sort((a,b) => a.key.localeCompare(b.key));
+    .sort((a,b) => (!a.dueDate ? 0:1)-(!b.dueDate ? 0:1) || (a.dueDate||'').localeCompare(b.dueDate||'') || a.key.localeCompare(b.key));
 
   const existing = board.querySelector('.milestone-overview');
   if(existing) existing.remove();
@@ -5162,9 +5822,30 @@ function renderMilestoneOverview(flashKey){
   // Milestone elements are rendered separately from the normal board event
   // wiring, so attach the controls they contain here as well.
   attachTicketKeyModalHandlers(board);
+  board.querySelectorAll('[data-gantt-milestone]').forEach(btn=>{
+    btn.addEventListener('click',e=>{
+      e.preventDefault();e.stopPropagation();
+      openMilestoneGantt(btn.dataset.ganttMilestone,btn);
+    });
+  });
+  board.querySelectorAll('[data-copy-milestone]').forEach(btn=>{
+    btn.addEventListener('click',e=>{
+      e.preventDefault();e.stopPropagation();
+      copyMilestoneBlockers(btn.dataset.copyMilestone,btn);
+    });
+  });
 
-  // The milestone overview has its own renderer, so the normal attachEvents()
-  // due-date handler does not run for these buttons. Wire them explicitly.
+  // Milestone items do not use the normal board click handlers: wire just
+  // their editors so clicking an input never navigates to the dependency map.
+  board.querySelectorAll('select[data-field="assignee"]').forEach(select=>{
+    ['pointerdown','focus','keydown'].forEach(type=>select.addEventListener(type,()=>populateAssigneeSelect(select)));
+    select.addEventListener('change',e=>{
+      e.stopPropagation();
+      const item=select.closest('.card, .dashboard-ticket');
+      if(item){select.classList.toggle('unassigned',!select.value);stageIssueChange(item.dataset.key, 'assignee',select.value);}
+    });
+    select.addEventListener('click',e=>e.stopPropagation());
+  });
   board.querySelectorAll('[data-due-date-key]').forEach(btn => {
     btn.addEventListener('click', e => {
       e.preventDefault();
@@ -5276,14 +5957,16 @@ function render(){
   // Remove the previous SVG dimensions first: otherwise its old width can be
   // included in the next board measurement and preserve stale horizontal space.
   resetDependencyLineCanvas();
-  [...board.querySelectorAll('.column, .milestone-overview, .dashboard, .no-active-user, .no-results')].forEach(x => x.remove());
+  [...board.querySelectorAll('.column, .milestone-overview, .dashboard, .my-view, .no-active-user, .no-results')].forEach(x => x.remove());
   if(state.completedDownloadStatus === 'ready' || !state.showCompleted) hideCompletedDownloadNotice();
   board.classList.toggle('milestone-board', state.showMilestones);
   board.classList.toggle('dashboard-board', state.showDashboard);
+  board.classList.toggle('my-view-board', state.showMyView);
   document.getElementById('app').classList.toggle('milestone-mode', state.showMilestones);
   document.getElementById('app').classList.toggle('dashboard-mode', state.showDashboard);
-  if(toggleCompletedBtn) toggleCompletedBtn.classList.toggle('dashboard-hidden', state.showDashboard);
-  dependencyStatus.classList.toggle('view-hidden', state.showDashboard || state.showMilestones);
+  document.getElementById('app').classList.toggle('my-view-mode', state.showMyView);
+  if(toggleCompletedBtn) toggleCompletedBtn.classList.toggle('dashboard-hidden', state.showDashboard || state.showMyView);
+  dependencyStatus.classList.toggle('view-hidden', state.showDashboard || state.showMilestones || state.showMyView);
   // Rebuild display data honoring the completed toggle
   computeDisplayData();
   console.debug('Dependency graph render', {issues:state.displayIssues.length, edges:state.displayEdges.length, selected:state.lockedKey});
@@ -5291,8 +5974,24 @@ function render(){
   // Sync filter controls
   populateFilterUsers();
   updateFilterControls();
-  document.querySelectorAll('.view-switch').forEach(btn => btn.classList.toggle('active', btn.dataset.view === (state.showDashboard ? 'dashboard' : state.showMilestones ? 'milestone' : 'default')));
+  document.querySelectorAll('.view-switch').forEach(btn => btn.classList.toggle('active', btn.dataset.view === (state.showDashboard ? 'dashboard' : state.showMyView ? 'my-view' : state.showMilestones ? 'milestone' : 'default')));
 
+  if(state.showMyView){
+    hideMiniMap();
+    state.lockedKey=null;
+    state.selectionHistory=[];
+    state.showBlocked=false;
+    syncSharedViewUrl();
+    document.getElementById('app').classList.remove('locked');
+    searchWrap.style.visibility='hidden';
+    if(filterMenu) filterMenu.classList.remove('open');
+    if(filtersBtn) filtersBtn.style.visibility='hidden';
+    if(clearFiltersBtn) clearFiltersBtn.style.visibility='hidden';
+    deselectBtn.classList.remove('visible');
+    if(milestoneBackBtn) milestoneBackBtn.classList.remove('visible');
+    renderMyView();
+    return;
+  }
   if(state.showDashboard){
     state.lockedKey = null;
     state.selectionHistory = [];
@@ -5306,7 +6005,7 @@ function render(){
     deselectBtn.classList.remove('visible');
     if(milestoneBackBtn){ milestoneBackBtn.classList.remove('visible'); milestoneBackBtn.innerHTML=''; }
     renderDashboard();
-    statusText.textContent = 'Dashboard';
+    statusText.textContent = 'Project overview';
     return;
   }
 
@@ -5353,6 +6052,7 @@ function render(){
   if(milestoneBackBtn){
     const backMilestone = state.returnMilestoneKey ? state.displayIssues.find(i => i.key === state.returnMilestoneKey) : null;
     const dashboardBackLabels = {
+      'my-view':'My view',
       'unblocking':'Unblocking opportunities',
       'high-priority-risk':'High-priority risk',
       'overdue':'Overdue tickets',
@@ -6209,6 +6909,7 @@ function attachTicketKeyModalHandlers(root=document){
       const card=link.closest('.card, .dashboard-ticket');
       const summary=issue?.summary || (card ? (card.querySelector('.summary')?.textContent.trim() || '') : '') || link.title || '';
       openTicketPreviewModal(key,href,summary);
+      ticketPreviewReturnFocus=link;
     });
   });
 }
@@ -6240,7 +6941,7 @@ document.querySelectorAll('[data-action="escape"]').forEach(btn => {
       state.scrollPositions[mode] = {appLeft:0, appTop:0, columns:{}};
     });
 
-    if(state.showMilestones || state.showDashboard || state.showBlocked || state.lockedKey){
+    if(state.showMilestones || state.showDashboard || state.showMyView || state.showBlocked || state.lockedKey){
       // Home returns to the normal board view, but it must not change filters.
       // If a card was selected, restore the filters that were active before the
       // selection temporarily hid them for the dependency-chain view.
@@ -6252,6 +6953,7 @@ document.querySelectorAll('[data-action="escape"]').forEach(btn => {
       // Home always returns to the configured starting board view.
       state.showMilestones = state.startingView === 'milestone';
       state.showDashboard = state.startingView === 'dashboard';
+      state.showMyView = state.startingView === 'my-view';
       state.showBlocked = false;
       state.lockedKey = null;
       state.selectionHistory = [];
@@ -6492,6 +7194,15 @@ function attachEvents(root=board, partial=false){
     });
   });
 
+  // A selected chain's root ticket can be viewed as its own Gantt timeline.
+  root.querySelectorAll('[data-gantt-chain]').forEach(btn=>{
+    btn.addEventListener('click',e=>{
+      e.preventDefault();e.stopPropagation();
+      if(!state.lockedKey || state.lockedKey!==btn.dataset.ganttChain) return;
+      openMilestoneGantt(btn.dataset.ganttChain,btn);
+    });
+  });
+
   // ── Milestone banner ─────────────────────────────────────────────────────
   // The card itself selects the normal dependency chain. The dedicated banner
   // is the separate navigation target for opening the milestone overview.
@@ -6597,6 +7308,7 @@ function attachEvents(root=board, partial=false){
       const menu=option.closest('.priority-menu');
       if(menu) menu.querySelectorAll('.priority-option').forEach(x=>x.classList.toggle('selected',x===option));
       closePriorityPicker(picker);
+      if(state.showMyView && picker.closest('.my-view-row')) render();
     });
   });
 
@@ -6746,6 +7458,7 @@ async function load(resetSelection){
         const sharedIssue=state.issues.find(i => String(i.key).toUpperCase() === pendingSharedView.key);
         if(sharedIssue){
           state.showDashboard=false;
+          state.showMyView=false;
           state.showMilestones=false;
           state.lockedKey=sharedIssue.key;
           state.showBlocked=!!pendingSharedView.showBlocked;
@@ -6756,12 +7469,16 @@ async function load(resetSelection){
       }
       if(startupViewPending){
         state.showDashboard = state.startingView === 'dashboard';
+        state.showMyView = state.startingView === 'my-view';
         state.showMilestones = state.startingView === 'milestone';
         startupViewPending=false;
       }
     }
     await render(); updateSaveButton();
     if(loadGeneration!==state.loadGeneration) return;
+    // Close & refresh from a Jira issue preview leaves the user in the same
+    // Gantt, rebuilt against the refreshed Jira graph and current preferences.
+    refreshOpenGanttAfterJiraLoad();
     // The optional Sitebuilder message must not hold a fully rendered Jira
     // board behind the loading overlay when the remote feed is slow.
     if(startupMessagePromise){
@@ -6788,6 +7505,9 @@ document.getElementById('refresh').addEventListener('click', () => {
   load(true);
 });
 function goBackFromSelection(){
+  if(state.dashboardReturnSection==='my-view' && state.selectionHistory.length===0){
+    state.dashboardReturnSection=null;state.showMyView=true;state.lockedKey=null;state.showBlocked=false;render();return;
+  }
   if(state.selectionHistory.length){
     const previous = state.selectionHistory.pop();
     state.lockedKey = previous.key || null;
@@ -6857,7 +7577,8 @@ milestoneBackBtn.addEventListener('click', () => {
     state.dashboardReturnSection=null;
     state.returnMilestoneKey=null;
     state.showMilestones=false;
-    state.showDashboard=true;
+    state.showDashboard=sectionId!=='my-view';
+    state.showMyView=sectionId==='my-view';
     state.lockedKey=null;
     state.selectionHistory=[];
     state.showBlocked=false;
@@ -6885,11 +7606,12 @@ milestoneBackBtn.addEventListener('click', () => {
 document.querySelectorAll('.view-switch').forEach(btn => {
   btn.addEventListener('click', () => {
     const view=btn.dataset.view;
-    const currentView=state.showDashboard?'dashboard':state.showMilestones?'milestone':'default';
+    const currentView=state.showDashboard?'dashboard':state.showMyView?'my-view':state.showMilestones?'milestone':'default';
     if(currentView==='default' && view!=='default'){
       savedFullBoardView={lockedKey:state.lockedKey,selectionHistory:JSON.parse(JSON.stringify(state.selectionHistory||[])),showBlocked:state.showBlocked,filterUser:state.filterUser,filterDue:state.filterDue,includeWithRemarkable:state.includeWithRemarkable,searchTerm:state.searchTerm,scrollPositions:JSON.parse(JSON.stringify(state.scrollPositions||{}))};
     }
     state.showDashboard=view==='dashboard';
+    state.showMyView=view==='my-view';
     state.showMilestones=view==='milestone';
     if(view==='default' && savedFullBoardView){
       Object.assign(state,savedFullBoardView);
@@ -7047,6 +7769,261 @@ window.addEventListener('resize', () => { scheduleDependencyLines(); scheduleMin
 // Do not redraw dependency SVG paths while the app scrolls. In the selected
 // view the board, cards and SVG move together, so rebuilding the paths on
 // every scroll frame only causes flicker.
+
+// ── Milestone Gantt (read-only; its dates reflect the current board snapshot) ──
+let ganttCurrent=null;
+let ganttReturnFocus=null;
+let ganttDayWidth=12;
+const GANTT_DAY_MS=86400000;
+function ganttDate(value){
+  const match=/^(\d{4})-(\d{2})-(\d{2})/.exec(String(value||''));
+  if(!match) return null;
+  const ms=Date.UTC(+match[1],+match[2]-1,+match[3]);
+  const date=new Date(ms);
+  return date.toISOString().slice(0,10)===match[0]?ms:null;
+}
+function ganttDateKey(ms){return new Date(ms).toISOString().slice(0,10);}
+function ganttDateLabel(ms){return new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'}).format(new Date(ms));}
+function ganttIssueColour(status){
+  if(isCompletedStatus(status))return '#16a34a';
+  const value=String(status||'').toLowerCase();
+  if(value.includes('block'))return '#dc2626';
+  if(value.includes('review'))return '#9333ea';
+  if(value==='with remarkable')return '#d97706';
+  if(value.includes('progress')||value.includes('doing')||value.includes('active')||value.includes('development'))return '#2563eb';
+  return '#64748b';
+}
+function buildMilestoneGantt(milestoneKey){
+  const milestone=state.displayByKey?.get(milestoneKey) || state.displayIssues.find(i=>i.key===milestoneKey);
+  if(!milestone)return null;
+  const blockers=milestoneChainItems(milestoneKey);
+  const all=[...blockers,milestone];
+  const keys=new Set(all.map(i=>i.key));
+  const edges=state.displayEdges.filter(e=>keys.has(e.from)&&keys.has(e.to));
+  const byKey=new Map(all.map(i=>[i.key,i]));
+  const rows=all.map(i=>{
+    const jiraStart=ganttDate(i.startDate);
+    const created=ganttDate(i.created);
+    const blockerDue=edges.filter(e=>e.to===i.key).map(e=>ganttDate(byKey.get(e.from)?.dueDate)).filter(n=>n!==null);
+    const lastBlocker=blockerDue.length?Math.max(...blockerDue):null;
+    const start=jiraStart!==null?jiraStart:lastBlocker!==null?lastBlocker+GANTT_DAY_MS:created;
+    const end=ganttDate(i.dueDate);
+    const source=jiraStart!==null?'Jira start date':lastBlocker!==null?'Latest blocker due + 1 day':created!==null?'Jira creation date':'Missing start date';
+    const reason=end===null?'No due date':start===null?'No start or creation date':start>end?'Start falls after due date':'';
+    return {key:i.key,summary:i.summary||'',status:i.status||'',assignee:i.assignee||'Unassigned',
+      milestone:i.key===milestoneKey,source,start:start===null?null:ganttDateKey(start),
+      end:end===null?null:ganttDateKey(end),reason,color:ganttIssueColour(i.status),level:i.chainLevel||0};
+  });
+  const scheduled=rows.filter(r=>!r.reason&&r.start&&r.end);
+  const unscheduled=rows.filter(r=>r.reason||!r.start||!r.end);
+  const isMilestone=(milestone.labels||[]).some(label=>String(label).toLowerCase()==='milestone');
+  return {milestone:{key:milestone.key,summary:milestone.summary||'',isMilestone},isMilestone,rows,scheduled,unscheduled,edges};
+}
+function ganttBarTooltip(r){
+  return r.key+' — '+r.summary+'\nStatus: '+(r.status||'Unspecified')+'\nStart: '+ganttDateLabel(ganttDate(r.start))+' ('+r.source+')\nDue: '+ganttDateLabel(ganttDate(r.end));
+}
+function updateGanttControls(){
+  ganttDayWidth=[6,12,20].includes(state.ganttScale) ? state.ganttScale : 12;
+  document.querySelectorAll('[data-gantt-scale]').forEach(btn=>{
+    const active=Number(btn.dataset.ganttScale)===ganttDayWidth;
+    btn.classList.toggle('active',active);
+    btn.setAttribute('aria-pressed',String(active));
+  });
+  const dependencyToggle=document.getElementById('gantt-show-dependencies');
+  if(dependencyToggle) dependencyToggle.checked=state.ganttShowDependencies!==false;
+  const completedLegend=document.getElementById('gantt-legend-completed');
+  if(completedLegend) completedLegend.hidden=!state.showCompleted;
+  const dependencyLegend=document.getElementById('gantt-legend-dependencies');
+  if(dependencyLegend) dependencyLegend.hidden=state.ganttShowDependencies===false;
+}
+function renderGanttChart(){
+  const chart=document.getElementById('gantt-chart');
+  const info=document.getElementById('gantt-counts');
+  if(!chart||!ganttCurrent)return;
+  const d=ganttCurrent,rows=d.scheduled;
+  const drawDependencies=state.ganttShowDependencies!==false;
+  info.textContent=rows.length+' scheduled · '+d.unscheduled.length+' unscheduled · '+
+    d.edges.length+' dependencies'+(drawDependencies?'':' (hidden)')+' · '+
+    (state.showCompleted?'including':'excluding')+' completed';
+  const maxDate=rows.length?Math.max(...rows.map(r=>ganttDate(r.end))):null;
+  const minDate=rows.length?Math.min(...rows.map(r=>ganttDate(r.start))):null;
+  const padDays=3;
+  const origin=minDate===null?ganttDate(localDateKey(new Date())):minDate-padDays*GANTT_DAY_MS;
+  const final=maxDate===null?origin+30*GANTT_DAY_MS:maxDate+padDays*GANTT_DAY_MS;
+  const days=Math.ceil((final-origin)/GANTT_DAY_MS)+1;
+  const labelWidth=420,headHeight=64,timelineWidth=days*ganttDayWidth;
+  const totalWidth=labelWidth+timelineWidth;
+  const monthHead=[],dayHead=[],weeks=[];
+  let lastMonth='';
+  for(let day=0;day<days;day++){
+    const ms=origin+day*GANTT_DAY_MS,dt=new Date(ms);
+    const month=dt.getUTCFullYear()+'-'+dt.getUTCMonth();
+    if(month!==lastMonth){
+      lastMonth=month;
+      monthHead.push('<span class="gantt-month-label" style="left:'+(day*ganttDayWidth)+'px">'+
+        esc(new Intl.DateTimeFormat('en-GB',{month:'short',year:'numeric',timeZone:'UTC'}).format(dt))+'</span>');
+    }
+    if(dt.getUTCDay()===1)weeks.push('<span class="gantt-week-line" style="left:'+(day*ganttDayWidth)+'px"></span>');
+    // Compact: months only. Normal: day 5/10/15/... . Expanded: every day.
+    if((ganttDayWidth===12&&dt.getUTCDate()%5===0)||ganttDayWidth===20){
+      dayHead.push('<span class="gantt-day-label" style="left:'+((day+.5)*ganttDayWidth)+'px">'+dt.getUTCDate()+'</span>');
+    }
+  }
+  const today=ganttDate(localDateKey(new Date()));
+  const todayLeft=today>=origin&&today<=final?(today-origin)/GANTT_DAY_MS*ganttDayWidth:null;
+  const todayMarkup=todayLeft!==null?'<div class="gantt-today" style="left:'+(labelWidth+todayLeft)+'px" title="Today"></div>':'';
+  const rowMarkup=rows.map(r=>{
+    const from=(ganttDate(r.start)-origin)/GANTT_DAY_MS*ganttDayWidth;
+    const length=((ganttDate(r.end)-ganttDate(r.start))/GANTT_DAY_MS+1)*ganttDayWidth;
+    const bar=r.milestone?'<span class="gantt-diamond" style="left:'+(from+length-ganttDayWidth/2)+'px;background:#b45309" title="'+esc(ganttBarTooltip(r))+'"></span>':
+      '<span class="gantt-bar" style="left:'+from+'px;width:'+Math.max(5,length-2)+'px;background:'+r.color+'" title="'+esc(ganttBarTooltip(r))+'"></span>';
+    return '<div class="gantt-task-row">'+
+      '<div class="gantt-task-label"><a href="'+esc(CFG.jiraBaseUrl+'/browse/'+r.key)+'" target="_blank" rel="noopener noreferrer" data-issue-key="'+esc(r.key)+'">'+esc(r.key)+'</a>'+
+      (r.milestone?'<span class="gantt-milestone-tag">'+(d.isMilestone?'MILESTONE':'SELECTED')+'</span>':'')+
+      '<span class="gantt-task-summary" title="'+esc(r.summary)+'">'+esc(r.summary)+'</span>'+
+      '<span class="gantt-task-dates">'+esc(ganttDateLabel(ganttDate(r.start)))+' – '+esc(ganttDateLabel(ganttDate(r.end)))+' · '+esc(r.source)+'</span></div>'+
+      '<div class="gantt-task-track" style="width:'+timelineWidth+'px">'+bar+'</div></div>';
+  }).join('');
+  chart.innerHTML='<div class="gantt-canvas" style="width:'+totalWidth+'px">'+
+    '<div class="gantt-timeline-heading" style="height:'+headHeight+'px">'+
+      '<div class="gantt-heading-label">ISSUE / TASK <small>Start · Due · Calculation</small></div>'+
+      '<div class="gantt-heading-scale" style="width:'+timelineWidth+'px">'+monthHead.join('')+dayHead.join('')+'</div></div>'+
+    '<div class="gantt-task-area" style="width:'+totalWidth+'px">'+
+      '<div class="gantt-calendar-overlay" style="left:'+labelWidth+'px;width:'+timelineWidth+'px">'+weeks.join('')+'</div>'+
+      '<svg class="gantt-links-svg" style="left:'+labelWidth+'px" width="'+timelineWidth+'" aria-hidden="true"><defs><marker id="gantt-arrow" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto"><path d="M0 0 L5 2.5 L0 5 Z" fill="#475569"/></marker></defs></svg>'+
+      rowMarkup+todayMarkup+'</div></div>';
+
+  // Label text is allowed to wrap to any number of lines. Measure the actual
+  // rendered row heights before positioning dependency arrows, so neither the
+  // summary nor the connector positions are truncated by a fixed row height.
+  const rowElements=[...chart.querySelectorAll('.gantt-task-row')];
+  const scheduledKeys=new Map(rows.map((r,n)=>[r.key,{r,n}]));
+  const svg=chart.querySelector('.gantt-links-svg');
+  const area=chart.querySelector('.gantt-task-area');
+  const actualHeight=area.offsetHeight;
+  svg.setAttribute('height',String(actualHeight));
+  svg.setAttribute('viewBox','0 0 '+timelineWidth+' '+actualHeight);
+  let arrows='';
+  if(drawDependencies){
+    d.edges.forEach(link=>{
+      const a=scheduledKeys.get(link.from),b=scheduledKeys.get(link.to);
+      if(!a||!b)return;
+      const x1=((ganttDate(a.r.end)-origin)/GANTT_DAY_MS+.5)*ganttDayWidth;
+      const x2=((ganttDate(b.r.start)-origin)/GANTT_DAY_MS+.5)*ganttDayWidth;
+      const y1=rowElements[a.n].offsetTop+rowElements[a.n].offsetHeight/2;
+      const y2=rowElements[b.n].offsetTop+rowElements[b.n].offsetHeight/2;
+      const turn=x2>x1+18?Math.min(x1+18,(x1+x2)/2):x1+14;
+      arrows+='<path d="M'+x1+' '+y1+' H'+turn+' V'+y2+' H'+(x2-3)+'" fill="none" stroke="#475569" stroke-width="1.5" marker-end="url(#gantt-arrow)" opacity=".75"/>';
+    });
+  }
+  svg.insertAdjacentHTML('beforeend',arrows);
+  attachTicketKeyModalHandlers(chart);
+
+  const missing=document.getElementById('gantt-unscheduled');
+  const missingRows=d.unscheduled.map(r=>'<div class="gantt-unscheduled-item">'+
+    '<a href="'+esc(CFG.jiraBaseUrl+'/browse/'+r.key)+'" target="_blank" rel="noopener noreferrer" data-issue-key="'+esc(r.key)+'">'+esc(r.key)+'</a>'+
+    '<span title="'+esc(r.summary)+'">'+esc(r.summary)+'</span>'+
+    '<strong>'+esc(r.reason||'No valid schedule')+'</strong></div>').join('');
+  missing.innerHTML='<div class="gantt-unscheduled-heading">Unscheduled ('+d.unscheduled.length+')</div>'+
+    (missingRows||'<div class="gantt-unscheduled-empty">All tickets have a valid start and due date.</div>')+
+    '<p class="gantt-schedule-notes">Start: Jira start date → day after latest direct blocker due date → Jira creation date. Tickets without a due date or with start after due date appear here.</p>';
+  attachTicketKeyModalHandlers(missing);
+}
+function closeMilestoneGantt(){
+  const overlay=document.getElementById('gantt-overlay');
+  if(!overlay||overlay.hidden)return;
+  if(document.getElementById('ticket-preview-modal'))closeTicketPreviewModal();
+  overlay.hidden=true;
+  document.body.classList.remove('gantt-open');
+  ganttCurrent=null;
+  if(ganttReturnFocus?.isConnected)ganttReturnFocus.focus({preventScroll:true});
+  ganttReturnFocus=null;
+}
+function openMilestoneGantt(key,button){
+  const data=buildMilestoneGantt(key);
+  if(!data)return;
+  ganttCurrent=data;
+  ganttReturnFocus=button||document.activeElement;
+  const overlay=document.getElementById('gantt-overlay');
+  const kind=data.isMilestone?'Milestone timeline':'Selected chain timeline';
+  overlay.querySelector('.gantt-eyebrow').textContent=kind;
+  document.getElementById('gantt-title').textContent=data.milestone.key+' · '+data.milestone.summary;
+  document.getElementById('gantt-export-status').textContent='';
+  overlay.hidden=false;
+  document.body.classList.add('gantt-open');
+  updateGanttControls();
+  renderGanttChart();
+  document.getElementById('gantt-close').focus();
+}
+function refreshOpenGanttAfterJiraLoad(){
+  if(!ganttCurrent||document.getElementById('gantt-overlay').hidden)return;
+  const previousKey=ganttCurrent.milestone.key;
+  const updated=buildMilestoneGantt(previousKey);
+  if(!updated)return;
+  const viewport=document.getElementById('gantt-chart');
+  const left=viewport.scrollLeft,top=viewport.scrollTop;
+  ganttCurrent=updated;
+  document.getElementById('gantt-title').textContent=updated.milestone.key+' · '+updated.milestone.summary;
+  updateGanttControls();
+  renderGanttChart();
+  viewport.scrollLeft=left;viewport.scrollTop=top;
+  document.getElementById('gantt-export-status').textContent='Refreshed from Jira.';
+}
+async function exportMilestoneGanttPdf(){
+  if(!ganttCurrent)return;
+  const btn=document.getElementById('gantt-export');
+  const status=document.getElementById('gantt-export-status');
+  btn.disabled=true;status.textContent='Generating complete PDF…';
+  try{
+    const response=await fetch('/api/gantt-pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({milestone:ganttCurrent.milestone,rows:ganttCurrent.rows,edges:state.ganttShowDependencies!==false?ganttCurrent.edges:[]})});
+    if(!response.ok){
+      const err=await response.json().catch(()=>({}));
+      throw new Error(err.error||'PDF generation failed ('+response.status+')');
+    }
+    const pdf=await response.blob(),url=URL.createObjectURL(pdf);
+    const link=document.createElement('a');
+    link.href=url;link.download=ganttCurrent.milestone.key+'_gantt.pdf';
+    document.body.appendChild(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),30000);
+    status.textContent='PDF download started.';
+  }catch(err){status.textContent='PDF error: '+err.message;}
+  finally{btn.disabled=false;}
+}
+function initMilestoneGantt(){
+  document.getElementById('gantt-close').addEventListener('click',closeMilestoneGantt);
+  document.getElementById('gantt-export').addEventListener('click',exportMilestoneGanttPdf);
+  document.getElementById('gantt-overlay').addEventListener('click',e=>{if(e.target.id==='gantt-overlay')closeMilestoneGantt();});
+  document.querySelectorAll('[data-gantt-scale]').forEach(btn=>btn.addEventListener('click',()=>{
+    state.ganttScale=Number(btn.dataset.ganttScale)||12;
+    savePreferences({ganttScale:state.ganttScale});
+    const viewport=document.getElementById('gantt-chart');
+    const left=viewport.scrollLeft,top=viewport.scrollTop;
+    updateGanttControls();renderGanttChart();
+    viewport.scrollLeft=left;viewport.scrollTop=top;
+  }));
+  document.getElementById('gantt-show-dependencies').addEventListener('change',e=>{
+    state.ganttShowDependencies=e.target.checked;
+    savePreferences({ganttShowDependencies:state.ganttShowDependencies});
+    const viewport=document.getElementById('gantt-chart');
+    const left=viewport.scrollLeft,top=viewport.scrollTop;
+    updateGanttControls();renderGanttChart();
+    viewport.scrollLeft=left;viewport.scrollTop=top;
+  });
+  document.addEventListener('keydown',e=>{
+    if(document.getElementById('gantt-overlay').hidden)return;
+    // A Jira preview is a nested dialog; Escape closes that first, not the Gantt.
+    if(document.getElementById('ticket-preview-modal'))return;
+    if(e.key==='Escape'){e.preventDefault();e.stopImmediatePropagation();closeMilestoneGantt();}
+    if(e.key==='Tab'){
+      const focusables=[...document.getElementById('gantt-overlay').querySelectorAll('button:not([disabled]),a[href]')].filter(el=>el.getClientRects().length);
+      if(!focusables.length)return;
+      const first=focusables[0],last=focusables[focusables.length-1];
+      if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}
+      else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+    }
+  },true);
+}
+initMilestoneGantt();
 
 updateJiraModalSetting();
 checkForRequiredUpdate().then(updateRequired => {
