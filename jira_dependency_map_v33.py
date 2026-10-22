@@ -90,7 +90,7 @@ PREFERENCES_FILE=os.path.join(PREFERENCES_DIR,"preferences.txt")
 DEFAULT_PREFERENCES={
     "showCompleted":False,"filterUser":"","filterDue":"all","includeWithRemarkable":True,
     "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default","personalUserAccountId":"","personalUserName":"","myViewSorts":{},
-    "ganttScale":12,"ganttShowDependencies":True,
+    "ganttScale":12,"ganttShowDependencies":True,"ganttNarrow":False,
 }
 _preferences_lock=threading.Lock()
 
@@ -107,6 +107,7 @@ def _normalise_preferences(data):
     out["showMiniMap"]=out["showMiniMap"] is not False
     out["ganttScale"]=out["ganttScale"] if out["ganttScale"] in (6,12,20) and type(out["ganttScale"]) is int else 12
     out["ganttShowDependencies"]=out["ganttShowDependencies"] is not False
+    out["ganttNarrow"]=out["ganttNarrow"] is True
     out["startingView"]=out["startingView"] if out["startingView"] in {"default","my-view","dashboard","milestone"} else "default"
     out["personalUserAccountId"]=str(out["personalUserAccountId"] or "")
     out["personalUserName"]=str(out["personalUserName"] or "").strip()
@@ -1346,6 +1347,13 @@ def _gantt_pdf_bytes(payload):
     import io,re
     if not isinstance(payload,dict): raise ValueError('Invalid Gantt PDF request.')
     milestone=payload.get('milestone') or {}
+    # Match the current board controls. Validate incoming PDF settings because
+    # this route also accepts requests from outside the normal browser UI.
+    scale=payload.get('scale',12)
+    if type(scale) is not int or scale not in (6,12,20):
+        raise ValueError('Invalid Gantt PDF timeline scale.')
+    narrow=payload.get('narrow') is True
+    scale_name={6:'Compact',12:'Normal',20:'Expanded'}[scale]
     records=payload.get('rows') or []
     links=payload.get('edges') or []
     if not isinstance(records,list) or not isinstance(links,list) or len(records)>1800 or len(links)>10000:
@@ -1372,9 +1380,12 @@ def _gantt_pdf_bytes(payload):
     scheduled=[r for r in rows if r['start'] is not None and r['end'] is not None and r['end']>=r['start']]
     unscheduled=[r for r in rows if r['start'] is None or r['end'] is None or r['end']<r['start']]
     page_w,page_h=1190.55,841.89   # A3 landscape, points
-    margin=40.; left_w=360.; chart_left=margin+left_w
-    chart_w=page_w-margin-chart_left; day_w=5.0
-    row_h=23.; table_top=632.; table_bottom=88.
+    margin=40.; left_w=275. if narrow else 360.
+    chart_left=margin+left_w
+    # Match screen zoom proportions while respecting legibility on A3 paper.
+    chart_w=page_w-margin-chart_left; day_w={6:3.,12:5.,20:10.}[scale]
+    row_h=19. if narrow else 28.
+    table_top=632.; table_bottom=88.
     per_page=max(1,int((table_top-table_bottom)/row_h))
     capacity=max(1,int(chart_w/day_w))
     dates=[d for r in scheduled for d in (r['start'],r['end'])]
@@ -1399,6 +1410,12 @@ def _gantt_pdf_bytes(payload):
     def txt(x,y,label,size=10,bold=False,shade='#172033',max_chars=100):
         safe=_gantt_pdf_escape(str(label)[:max_chars])
         return f'BT /{"F2" if bold else "F1"} {size} Tf {poscolor(shade)} rg 1 0 0 1 {x:.2f} {y:.2f} Tm ({safe}) Tj ET\n'
+    def fit_label(value,max_width,size=9,bold=False):
+        # Helvetica has a proportional font. Conservative approximate glyph
+        # widths keep text within the label column without clipping the chart.
+        value=str(value or '').replace('\n',' ').replace('\r',' ')
+        limit=max(1,int(max_width/(size*(.67 if bold else .61))))
+        return value if len(value)<=limit else value[:max(1,limit-1)].rstrip()+'…'
     def rect(x,y,w,h,c,stroke=None):
         op=f'{poscolor(c)} rg {x:.2f} {y:.2f} {w:.2f} {h:.2f} re f\n'
         if stroke: op+=f'{poscolor(stroke)} RG 0.5 w {x:.2f} {y:.2f} {w:.2f} {h:.2f} re S\n'
@@ -1419,14 +1436,14 @@ def _gantt_pdf_bytes(payload):
         cmds.append(txt(margin,page_h-47,('MILESTONE GANTT  /  ' if is_milestone else 'SELECTED CHAIN GANTT  /  ')+key,12,True,'#bfdbfe'))
         cmds.append(txt(margin,page_h-78,title,20,True,'#ffffff',102))
         cmds.append(txt(page_w-270,page_h-49,'Page '+str(page_no)+' of '+str(total_pages),11,True,'#ffffff'))
-        detail='Scheduled '+str(len(scheduled))+'  |  Unscheduled '+str(len(unscheduled))+'  |  Dates from Jira and dependency fallbacks'
+        detail='Scheduled '+str(len(scheduled))+'  |  Unscheduled '+str(len(unscheduled))+'  |  '+scale_name+' timeline  |  '+('Narrow' if narrow else 'Standard')+' labels'
         cmds.append(txt(margin,page_h-137,detail,10,False,'#475569'))
         if mode=='timeline':
             cmds.append(txt(margin,page_h-162,'Timeline: '+begin.strftime('%d %b %Y')+' - '+finish.strftime('%d %b %Y')+f'  (date segment {part}/{slices})',10,True))
         else:
             cmds.append(txt(margin,page_h-162,'Unscheduled tasks  |  Missing due date, usable start date or invalid date range',10,True))
         cmds.append(rect(margin,table_top+15,left_w,32,'#f1f5f9'))
-        cmds.append(txt(margin+8,table_top+26,'ISSUE / SUMMARY',10,True))
+        cmds.append(txt(margin+8,table_top+26,'ISSUE / SUMMARY'+(' (NARROW)' if narrow else ''),10,True))
         if mode=='timeline':
             cmds.append(rect(chart_left,table_top+15,chart_w,32,'#e0f2fe'))
             cursor=begin
@@ -1435,6 +1452,9 @@ def _gantt_pdf_bytes(payload):
                 if cursor.day==1 or cursor==begin:
                     label=cursor.strftime('%b %Y')
                     cmds.append(txt(x+3,table_top+26,label,9,True,'#0369a1'))
+                # The printed date ticks mirror the three on-screen modes.
+                if (scale==12 and cursor.day%5==0) or scale==20:
+                    cmds.append(txt(x+1,table_top+18,str(cursor.day),8,False,'#475569'))
                 if cursor.weekday()==0:
                     cmds.append(line(x,table_bottom,x,table_top+15,'#e2e8f0',.45))
                 cursor+=timedelta(days=1)
@@ -1447,8 +1467,13 @@ def _gantt_pdf_bytes(payload):
             row_centers[r['key']]=cy
             if idx%2==1: cmds.append(rect(margin,y,page_w-2*margin,row_h,'#f8fafc'))
             cmds.append(line(margin,y,page_w-margin,y,'#e2e8f0',.45))
-            cmds.append(txt(margin+8,y+12,r['key']+(('  [Milestone]' if is_milestone else '  [Selected]') if r['milestone'] else '')+'  |  '+r['status'],9,True,'#172033',46))
-            cmds.append(txt(margin+8,y+2,r['summary'],8,False,'#64748b',77))
+            key_label=r['key']+(('  [Milestone]' if is_milestone else '  [Selected]') if r['milestone'] else '')
+            if narrow:
+                one_line=key_label+'  |  '+r['summary']
+                cmds.append(txt(margin+8,cy-3,fit_label(one_line,left_w-16,9,False),9,False,'#172033'))
+            else:
+                cmds.append(txt(margin+8,y+17,fit_label(key_label+'  |  '+r['status'],left_w-16,9,True),9,True,'#172033'))
+                cmds.append(txt(margin+8,y+5,fit_label(r['summary'],left_w-16,8),8,False,'#64748b'))
             if mode=='timeline':
                 a=max(r['start'],begin); b=min(r['end'],finish)
                 if b>=a:
@@ -1464,8 +1489,11 @@ def _gantt_pdf_bytes(payload):
                     pass
             else:
                 dates='Start: '+(r['start'].isoformat() if r['start'] else 'missing') + '   Due: '+(r['end'].isoformat() if r['end'] else 'missing')
-                cmds.append(txt(chart_left+9,y+12,r['reason'] or 'Missing schedule data',9,True,'#b45309',110))
-                cmds.append(txt(chart_left+9,y+2,dates+'  |  '+r['status'],8,False,'#64748b',110))
+                if narrow:
+                    cmds.append(txt(chart_left+9,cy-3,fit_label(r['reason'] or 'Missing schedule data',chart_w-18,9,True),9,True,'#b45309'))
+                else:
+                    cmds.append(txt(chart_left+9,y+17,r['reason'] or 'Missing schedule data',9,True,'#b45309',110))
+                    cmds.append(txt(chart_left+9,y+5,dates+'  |  '+r['status'],8,False,'#64748b',110))
         if mode=='timeline':
             visible={r['key']:r for r in page_rows}
             for parent,child in all_edges:
@@ -1639,20 +1667,22 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 #toggle-completed.dashboard-hidden{display:none!important}
 .btn-toggle-milestones{padding-left:11px;padding-right:11px}
 .btn-toggle-milestones.active{background:rgba(56,189,248,.16);border-color:rgba(56,189,248,.45);color:#bae6fd}
-#board.milestone-board{display:block;width:max-content;min-width:100%;padding-bottom:10px;}
+/* Milestones fill the viewport without creating a second, full-page vertical
+   scrollbar. Only each milestone's own blocker list scrolls vertically. */
+#board.milestone-board{display:block;width:max-content;min-width:100%;height:100%;max-height:100%;min-height:0;padding:18px 28px 14px;}
 #board.milestone-board #lines{display:none!important}
-.milestone-overview{width:max-content;min-width:100%;padding:0;display:flex;flex-direction:column;gap:18px}
+.milestone-overview{width:max-content;min-width:100%;height:100%;min-height:0;padding:0;display:flex;flex-direction:column;gap:12px}
 .milestone-overview-header{display:flex;align-items:center;justify-content:space-between;padding:0 2px}
 .milestone-overview-title{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted)}
 .milestone-overview-count{font-size:12px;background:#e0f2fe;border-radius:999px;padding:3px 9px;color:#0369a1;font-weight:800}
-.milestone-row{display:flex;gap:14px;overflow:visible;padding:2px 2px 14px}
-.milestone-item{width:600px;min-width:600px;display:flex;flex-direction:column;gap:7px}
+.milestone-row{display:flex;flex:1;min-height:0;gap:14px;overflow:visible;padding:2px 2px 0;align-items:stretch}
+.milestone-item{width:600px;min-width:600px;height:100%;max-height:100%;min-height:0;overflow:hidden;display:flex;flex-direction:column;gap:7px}
 .milestone-item .card{width:100%;}
-.milestone-blocked{border:1px solid var(--border);border-radius:9px;background:#fff;padding:9px 10px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
-.milestone-blocked-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}
+.milestone-blocked{border:1px solid var(--border);border-radius:9px;background:#fff;padding:9px 10px;box-shadow:0 1px 2px rgba(15,23,42,.04);display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}
+.milestone-blocked-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px;flex-shrink:0}
 .milestone-blocked-title{font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:800;color:#9a6700}
 .milestone-blocked-count{font-size:10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:999px;padding:2px 6px;color:#9a6700;font-weight:800}
-.milestone-blocked-list{display:flex;flex-direction:column;gap:4px;max-height:calc(100vh - 335px);overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
+.milestone-blocked-list{display:flex;flex-direction:column;gap:4px;flex:1;min-height:0;max-height:none;overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
 .milestone-blocked-group{display:flex;flex-direction:column;gap:4px}
 .milestone-blocked-group + .milestone-blocked-group{margin-top:7px}
 .milestone-blocked-level{font-size:9px;text-transform:uppercase;letter-spacing:.05em;font-weight:800;color:#94a3b8;padding:2px 1px}
@@ -1791,8 +1821,11 @@ body.gantt-open .ticket-preview-modal{z-index:25031}
   min-width:0;
   padding-bottom:20px;
 }
-#app.milestone-mode{overflow-x:auto;overflow-y:auto}
+#app.milestone-mode{overflow-x:auto;overflow-y:hidden;overscroll-behavior-y:contain}
 #app.milestone-mode #board-minimap{display:none!important}
+/* The full-board dependency SVG should not participate in layout or painting
+   on views which cannot display its connections. */
+#app:not(.locked) #lines,#app.milestone-mode #lines,#app.dashboard-mode #lines,#app.my-view-mode #lines,body.gantt-open #lines{display:none!important}
 #app.dashboard-mode{overflow-x:hidden;overflow-y:auto}
 #app.dashboard-mode #board{min-width:0;display:block;overflow:visible}
 
@@ -2587,7 +2620,7 @@ body.gantt-open{overflow:hidden}
 .gantt-chart-wrap{min-height:140px;flex:1;overflow:auto;overscroll-behavior:contain;background:#fff}
 .gantt-canvas{--gantt-left:420px;position:relative;min-width:100%;}
 .gantt-timeline-heading{display:flex;position:sticky;top:0;z-index:12;background:#e2e8f0;border-bottom:1px solid #cbd5e1}
-.gantt-heading-label{position:sticky;left:0;z-index:14;flex:0 0 420px;width:420px;display:flex;flex-direction:column;justify-content:center;padding:9px 12px;font-size:11px;font-weight:850;color:#334155;background:#e2e8f0;border-right:1px solid #cbd5e1}
+.gantt-heading-label{position:sticky;left:0;z-index:14;flex:0 0 var(--gantt-left);width:var(--gantt-left);display:flex;flex-direction:column;justify-content:center;padding:9px 12px;font-size:11px;font-weight:850;color:#334155;background:#e2e8f0;border-right:1px solid #cbd5e1}
 .gantt-heading-label small{font-size:10px;font-weight:500;color:#64748b}
 .gantt-heading-scale{position:relative;flex:0 0 auto;background:linear-gradient(#dbeafe,#eff6ff)}
 .gantt-month-label{position:absolute;top:7px;white-space:nowrap;font-size:11px;font-weight:800;color:#1e40af;border-left:1px solid #93c5fd;padding-left:5px}
@@ -2595,13 +2628,24 @@ body.gantt-open{overflow:hidden}
 .gantt-task-area{position:relative}
 .gantt-task-row{position:relative;display:flex;min-height:66px;border-bottom:1px solid #e2e8f0}
 .gantt-task-row:nth-of-type(even){background:#f8fafc}
-.gantt-task-label{position:sticky;left:0;z-index:11;box-sizing:border-box;width:420px;flex:0 0 420px;background:inherit;border-right:1px solid #cbd5e1;padding:6px 12px;white-space:normal;overflow-wrap:anywhere;font-size:11px;line-height:15px}
+.gantt-task-label{position:sticky;left:0;z-index:11;box-sizing:border-box;width:var(--gantt-left);flex:0 0 var(--gantt-left);background:inherit;border-right:1px solid #cbd5e1;padding:6px 12px;white-space:normal;overflow-wrap:anywhere;font-size:11px;line-height:15px}
 .gantt-task-row:nth-of-type(even) .gantt-task-label{background:#f8fafc}
 .gantt-task-row:nth-of-type(odd) .gantt-task-label{background:#fff}
 .gantt-task-label>a{color:#4338ca;font-weight:800;text-decoration:none}
 .gantt-task-label>a:hover{text-decoration:underline}
 .gantt-task-summary{display:block;white-space:normal;overflow-wrap:anywhere;color:#475569;margin:2px 0}
-.gantt-task-dates{display:block;color:#64748b;font-size:9px;white-space:normal;overflow-wrap:anywhere}
+ .gantt-task-dates{display:block;color:#64748b;font-size:9px;white-space:normal;overflow-wrap:anywhere}
+/* Narrow: a single-line key and summary, with less horizontal label space. */
+.gantt-canvas.gantt-narrow .gantt-task-row{min-height:34px}
+.gantt-canvas.gantt-narrow .gantt-task-label{display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden;min-width:0}
+.gantt-canvas.gantt-narrow .gantt-task-label>a,.gantt-canvas.gantt-narrow .gantt-milestone-tag{flex:0 0 auto}
+.gantt-canvas.gantt-narrow .gantt-task-summary{min-width:0;flex:1;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:0;overflow-wrap:normal}
+.gantt-canvas.gantt-narrow .gantt-task-dates,.gantt-canvas.gantt-narrow .gantt-heading-label small{display:none}
+/* Pointer-events stay off: hovering the timeline must not stop ticket links or bar tooltips. */
+.gantt-hover-guide{position:absolute;top:0;bottom:0;width:0;border-left:1px solid rgba(220,38,38,.48);box-shadow:0 0 2px rgba(220,38,38,.12);pointer-events:none;z-index:10}
+.gantt-heading-scale .gantt-hover-guide{z-index:20}
+.gantt-hover-guide[hidden],.gantt-hover-date[hidden]{display:none!important}
+.gantt-hover-date{position:absolute;top:44px;z-index:21;transform:translateX(-50%);pointer-events:none;white-space:nowrap;border:1px solid #fecaca;border-radius:3px;background:#fff7f7;color:#991b1b;padding:1px 4px;font-size:10px;font-weight:700;line-height:14px;box-shadow:0 1px 2px #0001}
 .gantt-milestone-tag{font-size:8px;color:#92400e;background:#fef3c7;border-radius:3px;padding:2px 4px;margin-left:5px;font-weight:800}
 .gantt-task-track{position:relative;flex:0 0 auto}
 .gantt-calendar-overlay{pointer-events:none;position:absolute;top:0;bottom:0;z-index:0}
@@ -2927,7 +2971,7 @@ body.gantt-open{overflow:hidden}
       <div class="gantt-header-main"><div class="gantt-eyebrow">Milestone timeline</div><h2 id="gantt-title"></h2><div id="gantt-counts" class="gantt-counts"></div></div>
       <div class="gantt-actions"><span id="gantt-export-status" class="gantt-export-status" role="status" aria-live="polite"></span><button type="button" class="gantt-action gantt-export" id="gantt-export">↓ Download PDF</button><button type="button" class="gantt-action" id="gantt-close">Close ×</button></div>
     </div>
-    <div class="gantt-toolbar"><div class="gantt-scale-buttons" role="group" aria-label="Timeline zoom"><button type="button" class="gantt-scale" data-gantt-scale="6">Compact</button><button type="button" class="gantt-scale active" data-gantt-scale="12">Normal</button><button type="button" class="gantt-scale" data-gantt-scale="20">Expanded</button></div><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-show-dependencies" checked> Show dependencies</label><div class="gantt-legend"><span><b style="background:#2563eb"></b>In progress</span><span id="gantt-legend-completed"><b style="background:#16a34a"></b>Completed</span><span><b style="background:#d97706"></b>With Remarkable</span><span><i class="gantt-legend-milestone"></i>Milestone</span><span id="gantt-legend-dependencies">→ Dependencies</span><span style="color:#ef4444">│ Today</span></div></div>
+    <div class="gantt-toolbar"><div class="gantt-scale-buttons" role="group" aria-label="Timeline zoom"><button type="button" class="gantt-scale" data-gantt-scale="6">Compact</button><button type="button" class="gantt-scale active" data-gantt-scale="12">Normal</button><button type="button" class="gantt-scale" data-gantt-scale="20">Expanded</button></div><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-show-dependencies" checked> Show dependencies</label><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-narrow"> Narrow</label><div class="gantt-legend"><span><b style="background:#2563eb"></b>In progress</span><span id="gantt-legend-completed"><b style="background:#16a34a"></b>Completed</span><span><b style="background:#d97706"></b>With Remarkable</span><span><i class="gantt-legend-milestone"></i>Milestone</span><span id="gantt-legend-dependencies">→ Dependencies</span><span style="color:#ef4444">│ Today</span></div></div>
     <div id="gantt-chart" class="gantt-chart-wrap" aria-label="Milestone Gantt timeline"></div>
     <div id="gantt-unscheduled" class="gantt-unscheduled"></div>
   </section>
@@ -2974,7 +3018,7 @@ const state = {
   showMyView:false,
   myViewSavedSorts:{}, myViewSort:{field:'priority',direction:'asc'},
   startingView:'default',
-  showMiniMap:true, customJql:'', useJiraModal:false, ganttScale:12, ganttShowDependencies:true, currentUserName:'', currentUserAccountId:'', personalUserOverride:false, personalTicketFilter:'',
+  showMiniMap:true, customJql:'', useJiraModal:false, ganttScale:12, ganttShowDependencies:true, ganttNarrow:false, currentUserName:'', currentUserAccountId:'', personalUserOverride:false, personalTicketFilter:'',
   displayIssues:[], displayEdges:[], displayLevels:0,
   hoverKey:null, hoverLockKey:null,
   returnMilestoneKey:null,
@@ -3038,6 +3082,7 @@ async function loadPreferences(){
     state.showMiniMap=saved.showMiniMap!==false;
     state.ganttScale=[6,12,20].includes(saved.ganttScale) ? saved.ganttScale : 12;
     state.ganttShowDependencies=saved.ganttShowDependencies!==false;
+    state.ganttNarrow=saved.ganttNarrow===true;
     state.startingView=['default','my-view','dashboard','milestone'].includes(saved.startingView) ? saved.startingView : 'default';
     state.myViewSavedSorts=(saved.myViewSorts && typeof saved.myViewSorts==='object' && !Array.isArray(saved.myViewSorts)) ? saved.myViewSorts : {};
     if(saved.personalUserAccountId || saved.personalUserName){
@@ -3065,7 +3110,7 @@ async function savePreferences(updates){
         includeWithRemarkable:state.includeWithRemarkable!==false,
         customJql:state.customJql||'', useJiraModal:!!state.useJiraModal,
         showMiniMap:state.showMiniMap!==false, startingView:state.startingView || 'default',
-        ganttScale:state.ganttScale, ganttShowDependencies:state.ganttShowDependencies!==false,
+        ganttScale:state.ganttScale, ganttShowDependencies:state.ganttShowDependencies!==false, ganttNarrow:state.ganttNarrow===true,
         personalUserAccountId:state.currentUserAccountId||'', personalUserName:state.currentUserName||'',
         myViewSorts:state.myViewSavedSorts||{}
       }),cache:'no-store'
@@ -3956,6 +4001,15 @@ function captureBoardScroll(){
     columns[level]=entry;
   });
   saved.columns=columns;
+  if(mode==='milestone'){
+    const lists={};
+    board.querySelectorAll('.milestone-item').forEach(item=>{
+      const key=item.querySelector('[data-milestone-card]')?.dataset.milestoneCard;
+      const list=item.querySelector('.milestone-blocked-list');
+      if(key && list) lists[key]=list.scrollTop;
+    });
+    saved.milestoneLists=lists;
+  }
 }
 
 function restoreBoardScroll(){
@@ -5159,7 +5213,7 @@ function dashboardOverviewHtml(){
     '<section class="dashboard-section dashboard-overview" id="overview"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">Overview</span><span class="dashboard-section-note">Board health and immediate signals</span></div></div>'+ 
       '<div class="dashboard-stats">'+
         '<div class="dashboard-stat dashboard-summary-link dashboard-health-stat '+risks.boardHealthStatus+'" data-dashboard-nav="attention" role="button" tabindex="0"><div class="dashboard-health-score-line"><div class="dashboard-stat-value">'+score+'%</div><span class="dashboard-health-status">'+statusLabel+'</span></div><div class="dashboard-stat-label">Board health</div><div class="dashboard-stat-help">Health combines overdue, unassigned, missing due dates, circular dependencies and chain-date risks.</div><div class="dashboard-health-breakdown">'+healthDetail+'</div></div>'+ 
-        '<div class="dashboard-stat dashboard-summary-link dashboard-attention-stat risk"><div class="dashboard-stat-value">'+attentionTotal+'</div><div class="dashboard-stat-label">Needs attention</div><div class="dashboard-stat-help">Each risk area links directly to its section below.</div><div class="dashboard-attention-summary">'+attentionHtml+'</div></div>'+ 
+        '<div class="dashboard-stat dashboard-attention-stat risk"><div class="dashboard-stat-value">'+attentionTotal+'</div><div class="dashboard-stat-label">Needs attention</div><div class="dashboard-stat-help">Each risk area links directly to its section below.</div><div class="dashboard-attention-summary">'+attentionHtml+'</div></div>'+ 
         '<div class="dashboard-upcoming-stack">'+
           '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="7"><div class="dashboard-stat-value">'+dueSoon.length+'</div><div class="dashboard-stat-label">Due next 7 days</div><div class="dashboard-stat-help">Upcoming active work that needs attention soon.</div></div>'+ 
           '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="month"><div class="dashboard-stat-value">'+dueMonth.length+'</div><div class="dashboard-stat-label">Due next month</div><div class="dashboard-stat-help">Active work due within the next 31 days.</div></div>'+ 
@@ -5898,11 +5952,19 @@ function renderMilestoneOverview(flashKey){
   requestAnimationFrame(() => {
     const savedMilestoneScroll = state.scrollPositions.milestone || {};
     app.scrollLeft = savedMilestoneScroll.appLeft || 0;
-    app.scrollTop = savedMilestoneScroll.appTop || 0;
+    // Milestones have horizontal page scrolling, but vertical scrolling is
+    // confined to the individual blocker lists.
+    app.scrollTop = 0;
+    const listOffsets=savedMilestoneScroll.milestoneLists || {};
+    board.querySelectorAll('.milestone-item').forEach(item=>{
+      const key=item.querySelector('[data-milestone-card]')?.dataset.milestoneCard;
+      const list=item.querySelector('.milestone-blocked-list');
+      if(key && list) list.scrollTop=listOffsets[key] || 0;
+    });
     if(flashKey){
       const target = board.querySelector('.milestone-overview-card[data-milestone-card="' + CSS.escape(flashKey) + '"]');
       if(target){
-        target.scrollIntoView({behavior:'smooth',block:'center',inline:'center'});
+        target.scrollIntoView({behavior:'smooth',block:'nearest',inline:'center'});
         target.classList.remove('milestone-flash');
         void target.offsetWidth;
         target.classList.add('milestone-flash');
@@ -5918,12 +5980,29 @@ function renderMilestoneOverview(flashKey){
 // ── Render ────────────────────────────────────────────────────────────────
 let boardRenderEpoch=0;
 let linesRenderFrame=0;
+function dependencyLinesAreVisible(){
+  const app=document.getElementById('app');
+  return !!(state.lockedKey && !state.showMilestones && !state.showDashboard &&
+    !state.showMyView && app?.classList.contains('locked') &&
+    !board.classList.contains('milestone-board') &&
+    !board.classList.contains('dashboard-board') &&
+    !board.classList.contains('my-view-board') &&
+    document.getElementById('gantt-overlay')?.hidden !== false &&
+    board.querySelector(':scope > .column'));
+}
 function scheduleDependencyLines(){
-  if(linesRenderFrame) cancelAnimationFrame(linesRenderFrame);
+  // Avoid even starting an animation frame for the full board, milestones,
+  // dashboard or My View. Their SVG is intentionally empty and hidden.
+  if(!dependencyLinesAreVisible()){
+    if(linesRenderFrame){cancelAnimationFrame(linesRenderFrame);linesRenderFrame=0;}
+    return;
+  }
+  // Coalesce rapid resize events into a single path rebuild per frame.
+  if(linesRenderFrame) return;
   const epoch=boardRenderEpoch;
   linesRenderFrame=requestAnimationFrame(()=>{
     linesRenderFrame=0;
-    if(epoch===boardRenderEpoch) drawLines();
+    if(epoch===boardRenderEpoch && dependencyLinesAreVisible()) drawLines();
   });
 }
 function render(){
@@ -6492,11 +6571,10 @@ function clampBoardScroll(){
 }
 
 function drawLines(){
+  // Inactive views must not measure cards, rebuild SVG paths or clamp their
+  // scroll positions: all of those force layout and can cause visible lag.
+  if(!dependencyLinesAreVisible()) return;
   resetDependencyLineCanvas();
-  if(!state.lockedKey) {
-    clampBoardScroll();
-    return;
-  }
 
   // Measure only the rendered columns. Measuring board.scrollWidth while the
   // previous SVG is still sized can create a self-sustaining overflow width.
@@ -6519,14 +6597,8 @@ function drawLines(){
   lines.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
 
   const ns = 'http://www.w3.org/2000/svg';
-  const defs = document.createElementNS(ns, 'defs');
-  defs.innerHTML = '<marker id="arrow" markerWidth="4" markerHeight="4" refX="3.5" refY="2" orient="auto">'
-    + '<path d="M0,0 L4,2 L0,4 z" class="arrow"/></marker>';
-  lines.appendChild(defs);
-
-  const colEls = [...document.querySelectorAll('.column')];
+  const colEls = [...board.querySelectorAll(':scope > .column')];
   if(!colEls.length) return;
-  const colOf = el => { const c = el.closest('.column'); return c ? colEls.indexOf(c) : -1; };
 
   const lockedChain = activeSelectionChain(state.lockedKey);
   let edges = (state.displayEdges || []).filter(e =>
@@ -6548,54 +6620,50 @@ function drawLines(){
   }
   if(!edges.length) return;
 
-  const cards = new Map();
-  document.querySelectorAll('.card').forEach(c => cards.set(c.dataset.key, c));
-
-  const entry = el => {
-    const r = el.getBoundingClientRect();
-    return {x:r.left - br.left, y:r.top + 30 - br.top};
-  };
-  const exit_ = el => {
-    const r = el.getBoundingClientRect();
-    return {x:r.right - br.left, y:r.top + 30 - br.top};
-  };
-
+  // Read card/column geometry once before writing paths to the DOM. Reading
+  // a rect after each SVG append previously forced repeated layout work on
+  // large selected chains.
+  const colIndexes=new Map(colEls.map((column,index)=>[column,index]));
+  const colRects=colEls.map(column=>column.getBoundingClientRect());
+  const cards=new Map();
+  board.querySelectorAll('.column .card').forEach(card=>{
+    const rect=card.getBoundingClientRect();
+    cards.set(card.dataset.key,{
+      column:colIndexes.get(card.closest('.column')),
+      left:rect.left-br.left,right:rect.right-br.left,
+      viewportRight:rect.right,y:rect.top+30-br.top
+    });
+  });
+  const paths=document.createDocumentFragment();
   // Route the vertical leg through the whitespace gap immediately after the
-  // source column. This keeps the line out of cards in the columns.
-  edges.forEach(e => {
-    const source = cards.get(e.from);
-    const target = cards.get(e.to);
+  // source column. Internal cycles bend through the right-hand gutter.
+  edges.forEach(e=>{
+    const source=cards.get(e.from),target=cards.get(e.to);
     if(!source || !target) return;
-
-    const fromCol = colOf(source);
-    const toCol = colOf(target);
-    if(fromCol < 0 || toCol < 0 || toCol < fromCol) return;
-
-    const s=exit_(source);
+    const fromCol=source.column,toCol=target.column;
+    if(fromCol==null || toCol==null || toCol<fromCol) return;
     const sameColumn=fromCol===toCol;
-    const t=sameColumn?exit_(target):entry(target);
-    const nextCol=colEls[fromCol+1];
-    const sr=source.getBoundingClientRect();
-    const nr=nextCol?.getBoundingClientRect();
-    // Internal cycle edges bend through the right-hand gutter instead of
-    // drawing across cards or being silently dropped.
+    const sx=source.right,sy=source.y;
+    const tx=sameColumn?target.right:target.left,ty=target.y;
+    const nextRect=colRects[fromCol+1];
     const routeX=sameColumn
-      ? s.x+16+(e.from.length+e.to.length)%3*4
-      : nr ? ((sr.right+nr.left)/2)-br.left : s.x+20;
-
-    const d='M '+s.x+' '+s.y
-      +' L '+routeX+' '+s.y
-      +' L '+routeX+' '+t.y
-      +' L '+t.x+' '+t.y;
-
+      ? sx+16+(e.from.length+e.to.length)%3*4
+      : nextRect?((source.viewportRight+nextRect.left)/2)-br.left:sx+20;
+    const d='M '+sx+' '+sy+' L '+routeX+' '+sy+
+      ' L '+routeX+' '+ty+' L '+tx+' '+ty;
     const path=document.createElementNS(ns,'path');
     path.setAttribute('d',d);
     path.setAttribute('class',sameColumn?'line highlighted-line cycle-line':'line highlighted-line');
-    path.dataset.from = e.from;
-    path.dataset.to = e.to;
-    path.setAttribute('marker-end', 'url(#arrow)');
-    lines.appendChild(path);
+    path.dataset.from=e.from;
+    path.dataset.to=e.to;
+    path.setAttribute('marker-end','url(#arrow)');
+    paths.appendChild(path);
   });
+  const defs=document.createElementNS(ns,'defs');
+  defs.innerHTML='<marker id="arrow" markerWidth="4" markerHeight="4" refX="3.5" refY="2" orient="auto">'+
+    '<path d="M0,0 L4,2 L0,4 z" class="arrow"/></marker>';
+  lines.appendChild(defs);
+  lines.appendChild(paths);
   clampBoardScroll();
 }
 
@@ -7760,7 +7828,7 @@ window.addEventListener('beforeunload', e => {
 
 if(typeof ResizeObserver!=='undefined'){
   const lineResizeObserver=new ResizeObserver(()=>{
-    if(state.lockedKey && !state.showDashboard && !state.showMilestones) scheduleDependencyLines();
+    if(dependencyLinesAreVisible()) scheduleDependencyLines();
   });
   lineResizeObserver.observe(board);
   lineResizeObserver.observe(document.getElementById('app'));
@@ -7831,6 +7899,8 @@ function updateGanttControls(){
   });
   const dependencyToggle=document.getElementById('gantt-show-dependencies');
   if(dependencyToggle) dependencyToggle.checked=state.ganttShowDependencies!==false;
+  const narrowToggle=document.getElementById('gantt-narrow');
+  if(narrowToggle)narrowToggle.checked=state.ganttNarrow===true;
   const completedLegend=document.getElementById('gantt-legend-completed');
   if(completedLegend) completedLegend.hidden=!state.showCompleted;
   const dependencyLegend=document.getElementById('gantt-legend-dependencies');
@@ -7851,7 +7921,7 @@ function renderGanttChart(){
   const origin=minDate===null?ganttDate(localDateKey(new Date())):minDate-padDays*GANTT_DAY_MS;
   const final=maxDate===null?origin+30*GANTT_DAY_MS:maxDate+padDays*GANTT_DAY_MS;
   const days=Math.ceil((final-origin)/GANTT_DAY_MS)+1;
-  const labelWidth=420,headHeight=64,timelineWidth=days*ganttDayWidth;
+  const labelWidth=state.ganttNarrow===true?300:420,headHeight=64,timelineWidth=days*ganttDayWidth;
   const totalWidth=labelWidth+timelineWidth;
   const monthHead=[],dayHead=[],weeks=[];
   let lastMonth='';
@@ -7884,12 +7954,13 @@ function renderGanttChart(){
       '<span class="gantt-task-dates">'+esc(ganttDateLabel(ganttDate(r.start)))+' – '+esc(ganttDateLabel(ganttDate(r.end)))+' · '+esc(r.source)+'</span></div>'+
       '<div class="gantt-task-track" style="width:'+timelineWidth+'px">'+bar+'</div></div>';
   }).join('');
-  chart.innerHTML='<div class="gantt-canvas" style="width:'+totalWidth+'px">'+
+  chart.innerHTML='<div class="gantt-canvas'+(state.ganttNarrow===true?' gantt-narrow':'')+'" data-origin="'+origin+'" data-days="'+days+'" data-label-width="'+labelWidth+'" style="width:'+totalWidth+'px;--gantt-left:'+labelWidth+'px">'+
     '<div class="gantt-timeline-heading" style="height:'+headHeight+'px">'+
       '<div class="gantt-heading-label">ISSUE / TASK <small>Start · Due · Calculation</small></div>'+
-      '<div class="gantt-heading-scale" style="width:'+timelineWidth+'px">'+monthHead.join('')+dayHead.join('')+'</div></div>'+
+      '<div class="gantt-heading-scale" style="width:'+timelineWidth+'px">'+monthHead.join('')+dayHead.join('')+'<div class="gantt-hover-guide" hidden></div><div class="gantt-hover-date" hidden></div></div></div>'+
     '<div class="gantt-task-area" style="width:'+totalWidth+'px">'+
       '<div class="gantt-calendar-overlay" style="left:'+labelWidth+'px;width:'+timelineWidth+'px">'+weeks.join('')+'</div>'+
+      '<div class="gantt-hover-guide" hidden></div>'+
       '<svg class="gantt-links-svg" style="left:'+labelWidth+'px" width="'+timelineWidth+'" aria-hidden="true"><defs><marker id="gantt-arrow" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto"><path d="M0 0 L5 2.5 L0 5 Z" fill="#475569"/></marker></defs></svg>'+
       rowMarkup+todayMarkup+'</div></div>';
 
@@ -7936,6 +8007,9 @@ function closeMilestoneGantt(){
   overlay.hidden=true;
   document.body.classList.remove('gantt-open');
   ganttCurrent=null;
+  // Refresh the selected chain's connections if its layout changed while
+  // the full-screen Gantt was open; no hidden redraws run under the overlay.
+  scheduleDependencyLines();
   if(ganttReturnFocus?.isConnected)ganttReturnFocus.focus({preventScroll:true});
   ganttReturnFocus=null;
 }
@@ -7975,7 +8049,7 @@ async function exportMilestoneGanttPdf(){
   const status=document.getElementById('gantt-export-status');
   btn.disabled=true;status.textContent='Generating complete PDF…';
   try{
-    const response=await fetch('/api/gantt-pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({milestone:ganttCurrent.milestone,rows:ganttCurrent.rows,edges:state.ganttShowDependencies!==false?ganttCurrent.edges:[]})});
+    const response=await fetch('/api/gantt-pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({milestone:ganttCurrent.milestone,rows:ganttCurrent.rows,edges:state.ganttShowDependencies!==false?ganttCurrent.edges:[],scale:state.ganttScale,narrow:state.ganttNarrow===true})});
     if(!response.ok){
       const err=await response.json().catch(()=>({}));
       throw new Error(err.error||'PDF generation failed ('+response.status+')');
@@ -7989,9 +8063,43 @@ async function exportMilestoneGanttPdf(){
   }catch(err){status.textContent='PDF error: '+err.message;}
   finally{btn.disabled=false;}
 }
+function hideGanttHoverGuide(){
+  const chart=document.getElementById('gantt-chart');
+  if(!chart)return;
+  chart.querySelectorAll('.gantt-hover-guide,.gantt-hover-date').forEach(el=>{el.hidden=true;});
+}
+function updateGanttHoverGuide(e){
+  const chart=document.getElementById('gantt-chart');
+  const canvas=chart?.querySelector('.gantt-canvas');
+  if(!canvas||!ganttCurrent)return;
+  // The issue column is sticky, so exclude its visible area even when
+  // horizontal scrolling has moved the underlying timeline beneath it.
+  const viewportX=e.clientX-chart.getBoundingClientRect().left;
+  const labelWidth=Number(canvas.dataset.labelWidth);
+  if(viewportX<labelWidth){hideGanttHoverGuide();return;}
+  // Scrolling affects the pointer's date but not the content coordinates.
+  const x=viewportX+chart.scrollLeft;
+  const days=Number(canvas.dataset.days);
+  const day=Math.floor((x-labelWidth)/ganttDayWidth);
+  if(day<0||day>=days){hideGanttHoverGuide();return;}
+  const guideX=(day+.5)*ganttDayWidth;
+  const headingGuide=canvas.querySelector('.gantt-heading-scale .gantt-hover-guide');
+  const areaGuide=canvas.querySelector('.gantt-task-area .gantt-hover-guide');
+  const dateLabel=canvas.querySelector('.gantt-hover-date');
+  if(!headingGuide||!areaGuide||!dateLabel)return;
+  headingGuide.style.left=guideX+'px';headingGuide.hidden=false;
+  areaGuide.style.left=(labelWidth+guideX)+'px';areaGuide.hidden=false;
+  dateLabel.style.left=guideX+'px';
+  dateLabel.textContent=ganttDateLabel(Number(canvas.dataset.origin)+day*GANTT_DAY_MS);
+  dateLabel.hidden=false;
+}
 function initMilestoneGantt(){
   document.getElementById('gantt-close').addEventListener('click',closeMilestoneGantt);
   document.getElementById('gantt-export').addEventListener('click',exportMilestoneGanttPdf);
+  const ganttViewport=document.getElementById('gantt-chart');
+  ganttViewport.addEventListener('pointermove',updateGanttHoverGuide);
+  ganttViewport.addEventListener('pointerleave',hideGanttHoverGuide);
+  ganttViewport.addEventListener('scroll',hideGanttHoverGuide,{passive:true});
   document.getElementById('gantt-overlay').addEventListener('click',e=>{if(e.target.id==='gantt-overlay')closeMilestoneGantt();});
   document.querySelectorAll('[data-gantt-scale]').forEach(btn=>btn.addEventListener('click',()=>{
     state.ganttScale=Number(btn.dataset.ganttScale)||12;
@@ -8001,6 +8109,14 @@ function initMilestoneGantt(){
     updateGanttControls();renderGanttChart();
     viewport.scrollLeft=left;viewport.scrollTop=top;
   }));
+  document.getElementById('gantt-narrow').addEventListener('change',e=>{
+    state.ganttNarrow=e.target.checked;
+    savePreferences({ganttNarrow:state.ganttNarrow});
+    const viewport=document.getElementById('gantt-chart');
+    const left=viewport.scrollLeft,top=viewport.scrollTop;
+    updateGanttControls();renderGanttChart();
+    viewport.scrollLeft=left;viewport.scrollTop=top;
+  });
   document.getElementById('gantt-show-dependencies').addEventListener('change',e=>{
     state.ganttShowDependencies=e.target.checked;
     savePreferences({ganttShowDependencies:state.ganttShowDependencies});
