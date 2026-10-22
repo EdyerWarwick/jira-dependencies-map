@@ -2012,6 +2012,16 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dashboard-compact-main>span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dashboard-compact-main strong{font-size:11px;flex:0 0 auto}
 .dashboard-compact-badges{display:flex;gap:5px;align-items:center;flex:0 0 auto}
+/* Priority distribution: same labels/icons as the priority picker, with each
+   fill representing its share of all active tickets (not its rank). */
+.dashboard-priority-row{display:grid;grid-template-columns:minmax(96px,122px) minmax(0,1fr) 76px;gap:12px;cursor:default}
+.dashboard-priority-row:hover{background:#f8fafc;border-color:#e2e8f0;box-shadow:none}
+.dashboard-priority-label{min-width:0;white-space:nowrap}
+.dashboard-priority-bar{display:block;height:9px;min-width:0;overflow:hidden;background:#e2e8f0;border-radius:999px}
+.dashboard-priority-bar-fill{display:block;height:100%;min-width:2px;background:#6366f1;border-radius:999px}
+.dashboard-priority-count{display:flex;align-items:baseline;justify-content:flex-end;gap:6px;white-space:nowrap;color:#4338ca;font-size:11px}
+.dashboard-priority-count small{font-size:10px;color:#64748b;font-weight:650}
+@media(max-width:420px){.dashboard-priority-row{grid-template-columns:minmax(82px,106px) minmax(0,1fr) 65px;gap:7px}.dashboard-priority-count{gap:3px}}
 .dashboard-milestone-risk-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(270px,330px);gap:16px}
 .dashboard-milestone-risk-main{min-width:0}
 .dashboard-milestone-risk-metrics{display:grid;grid-template-columns:94px 88px minmax(82px,1fr);align-items:center;gap:10px;justify-items:start;font-size:11px;font-weight:800;white-space:nowrap}
@@ -4608,7 +4618,24 @@ function dashboardPriorityDistribution(issues){
   const active=issues.filter(i=>!isCompletedStatus(i.status));
   const groups=new Map();
   active.forEach(i=>{const p=String(i.priority||'Unspecified'); groups.set(p,(groups.get(p)||0)+1);});
-  return [...groups.entries()].sort((a,b)=>b[1]-a[1]);
+  // Follow the same order as the card's priority-menu, irrespective of counts.
+  // Unrecognised Jira priorities (including Unspecified) come afterwards.
+  return [...groups.entries()].sort((a,b)=>priorityRank(a[0])-priorityRank(b[0]) || a[0].localeCompare(b[0]));
+}
+function dashboardPriorityDistributionHtml(items){
+  if(!items.length) return '<div class="dashboard-empty">No active tickets.</div>';
+  const total=items.reduce((sum,x)=>sum+x[1],0);
+  return '<div class="dashboard-compact-list">'+items.map(([priority,count])=>{
+    const percent=total?count/total*100:0;
+    const displayPercent=percent.toLocaleString('en-GB',{maximumFractionDigits:1});
+    const icon=priority==='Unspecified'?priorityIconHtml(null):priorityIconHtml(priority);
+    return '<div class="dashboard-compact-row dashboard-priority-row">'+
+      '<span class="dashboard-compact-main dashboard-priority-label">'+icon+'<strong>'+esc(priority)+'</strong></span>'+
+      '<span class="dashboard-priority-bar" role="progressbar" aria-label="'+esc(priority)+' share of active tickets" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+percent.toFixed(1)+'" aria-valuetext="'+esc(displayPercent)+'% of active tickets">'+
+        '<span class="dashboard-priority-bar-fill" style="width:'+percent.toFixed(2)+'%"></span></span>'+
+      '<span class="dashboard-priority-count"><strong>'+count+'</strong><small>'+displayPercent+'%</small></span>'+ 
+    '</div>';
+  }).join('')+'</div>';
 }
 function dashboardCompletedHtml(items){
   if(!items.length) return '<div class="dashboard-empty">No completed tickets are available in the current dataset.</div>';
@@ -4743,7 +4770,7 @@ function dashboardOverviewHtml(){
         dashboardSummarySection('Workload by assignee',dashboardWorkloadHtml(workload),'workload-by-assignee','Select a person to filter the main board')+
       '</div>'+ 
       '<div class="dashboard-section-group" id="priority-distribution"><div class="dashboard-group-head"><h2>Priority distribution</h2><span>Active tickets by Jira priority</span></div>'+ 
-        dashboardSummarySection('Priority distribution','<div class="dashboard-compact-list">'+priorityDistribution.map(x=>'<div class="dashboard-compact-row" style="cursor:default"><span class="dashboard-compact-main"><strong>'+esc(x[0])+'</strong></span><span class="dashboard-impact">'+x[1]+'</span></div>').join('')+'</div>','priority-distribution-content','Active tickets by Jira priority')+
+        dashboardSummarySection('Priority distribution',dashboardPriorityDistributionHtml(priorityDistribution),'priority-distribution-content','Active tickets by Jira priority')+
       '</div>'+ 
     '</div>'+ 
     '<div class="dashboard-section-group" id="attention"><div class="dashboard-group-head"><h2>Needs attention</h2><span>Risks that should be reviewed first</span></div>'+ 
