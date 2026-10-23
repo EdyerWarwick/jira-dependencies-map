@@ -89,7 +89,7 @@ PREFERENCES_DIR=os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduse
 PREFERENCES_FILE=os.path.join(PREFERENCES_DIR,"preferences.txt")
 DEFAULT_PREFERENCES={
     "showCompleted":False,"filterUser":"","filterDue":"all","includeWithRemarkable":True,
-    "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default","personalUserAccountId":"","personalUserName":"","myViewSorts":{},
+    "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default","personalUserAccountId":"","personalUserName":"","myViewSorts":{},"dashboardTabSorts":{},
     "ganttScale":12,"ganttShowDependencies":True,"ganttNarrow":False,
 }
 _preferences_lock=threading.Lock()
@@ -122,6 +122,18 @@ def _normalise_preferences(data):
                 if field in valid_sort_fields and direction in {"asc","desc"}:
                     cleaned[user_id]={"field":field,"direction":direction}
     out["myViewSorts"]=cleaned
+    dashboard_fields={"priority","dueDate","key","summary","epic","status","blockers","blocked","assignee","riskScore"}
+    dashboard_tabs={"needs-attention","upcoming-7","upcoming-31","overdue","missing-due","unassigned","biggest-unblockers","chain-risks","circular","in-development"}
+    dashboard_sorts={}
+    raw_dashboard_sorts=out.get("dashboardTabSorts")
+    if isinstance(raw_dashboard_sorts,dict):
+        for tab, sorting in raw_dashboard_sorts.items():
+            if tab in dashboard_tabs and isinstance(sorting,dict):
+                field=sorting.get("field")
+                direction=sorting.get("direction")
+                if field in dashboard_fields and direction in {"asc","desc"}:
+                    dashboard_sorts[tab]={"field":field,"direction":direction}
+    out["dashboardTabSorts"]=dashboard_sorts
     return out
 
 def _read_preferences():
@@ -685,7 +697,7 @@ def _jira_schedule_fields():
         return list(result)
 
 def _base_issue_fields():
-    return ["summary","status","priority","assignee","duedate","created","issuelinks","parent","customfield_10014","labels"] + _jira_schedule_fields()
+    return ["summary","description","status","priority","assignee","duedate","created","issuelinks","parent","customfield_10014","labels"] + _jira_schedule_fields()
 
 
 def _completed_jql(jql):
@@ -811,6 +823,27 @@ def _extract_epic(fields):
 # Graph logic
 # ---------------------------------------------------------------------------
 
+def _jira_description_present(value):
+    if value is None or value == "" or value == {} or value == []:
+        return False
+    if isinstance(value,str):
+        return bool(value.strip())
+    if isinstance(value,dict) and value.get("type")=="doc":
+        # Empty rich-text paragraphs are visually blank in Jira too.
+        def contains_content(node):
+            if isinstance(node,list):
+                return any(contains_content(item) for item in node)
+            if not isinstance(node,dict):
+                return False
+            if str(node.get("text") or "").strip():
+                return True
+            if node.get("type") in ("media", "mediaSingle", "mediaGroup", "inlineCard", "blockCard", "mention", "emoji", "rule"):
+                return True
+            return contains_content(node.get("content") or [])
+        return contains_content(value.get("content") or [])
+    return bool(value)
+
+
 def parse_dependency_graph(raw):
     # Keep Done/Completed for historical relationships. Exclude cancelled
     # statuses, and treat Jira-search-missing linked issues as unverified.
@@ -829,6 +862,7 @@ def parse_dependency_graph(raw):
             "dueDate":f.get("duedate") or None,
             "startDate":next((str(f.get(field) or "")[:10] for field in _jira_schedule_fields_cache or () if f.get(field)),None),
             "created":str(f.get("created") or "")[:10] or None,
+            "hasDescription":_jira_description_present(f.get("description")),
             "labels":f.get("labels") or [],
             "epic":_extract_epic(f),
             "url":f"{JIRA_BASE_URL}/browse/{key}",
@@ -961,6 +995,7 @@ def serialize_graph(raw, jql=None):
             "key":k,"summary":v["summary"],"status":v["status"],"priority":v["priority"],"assignee":v.get("assignee") or "Unassigned","assigneeAccountId":v.get("assigneeAccountId"),
             "labels":v.get("labels") or [],
             "dueDate":v.get("dueDate"),"startDate":v.get("startDate"),"created":v.get("created"),
+            "hasDescription":v.get("hasDescription",False),
             "epic":v.get("epic"),"url":v["url"],
             "blockers":sorted(v["blockers"]),"blocked":sorted(v["blocked"]),
             "externalBlockers":sorted(v["externalBlockers"],key=lambda x:x["key"]),
@@ -2268,10 +2303,10 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .dashboard-health-stat.green .dashboard-health-status{background:#dcfce7;color:#166534}
 .dashboard-health-stat.amber .dashboard-health-status{background:#fef3c7;color:#92400e}
 .dashboard-health-stat.red .dashboard-health-status{background:#fee2e2;color:#b91c1c}
-.dashboard-health-breakdown{margin-top:9px;border-top:1px solid #e2e8f0;padding-top:7px}
-.dashboard-health-row{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:10px}
-.dashboard-health-row-label{font-weight:750;color:#334155;white-space:nowrap}
-.dashboard-health-row-detail{color:#94a3b8;flex:1;min-width:0}
+.dashboard-health-breakdown{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 14px;margin-top:9px;border-top:1px solid #e2e8f0;padding-top:7px}
+.dashboard-health-row{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:2px 7px;min-width:0;padding:3px 0;font-size:10px}
+.dashboard-health-row-label{font-weight:750;color:#334155;min-width:0;overflow-wrap:break-word}
+.dashboard-health-row-detail{color:#94a3b8;white-space:nowrap;flex:0 0 auto}
 .dashboard-health-row strong{font-size:10px;white-space:nowrap;color:#64748b}
 .dashboard-health-stat.red .dashboard-health-row strong{color:#b91c1c}
 .dashboard-health-stat.amber .dashboard-health-row strong{color:#92400e}
@@ -2664,6 +2699,57 @@ body.gantt-open{overflow:hidden}
 .gantt-schedule-notes{margin-top:9px}
 @media(max-width:700px){#gantt-overlay{padding:0}.gantt-modal{border-radius:0}.gantt-header{padding:10px}.gantt-header h2{font-size:14px}.gantt-unscheduled-item{grid-template-columns:70px minmax(0,1fr)}.gantt-unscheduled-item strong{grid-column:2}}
 
+
+/* Project overview: tab-specific sortable/paginated My View tables. */
+.dashboard-table-tabs{top:0;flex-wrap:nowrap;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin;padding:10px 1px;scroll-margin-top:15px}
+.dashboard-table-tabs button{flex:0 0 auto;white-space:nowrap}
+.dashboard-table-section{scroll-margin-top:60px}
+/* Shared fixed column tracks keep every standard column at the same x-position
+   across all tabs. Risk columns extend to the right only on Needs Attention. */
+/* Fill the visible table region, while retaining the stable minimum column tracks
+   and horizontal scrolling at narrower browser widths. */
+.dashboard-table-section .my-view-table{table-layout:fixed;width:max(100%,1374px);min-width:100%}
+.dashboard-table-section .my-view-table.has-risk-columns{width:max(100%,1739px);min-width:100%}
+.dashboard-table-section .my-view-row td{min-width:0;max-width:none;box-sizing:border-box;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;height:44px}
+.dashboard-table-section .my-view-row .my-view-summary{min-width:0;max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dashboard-table-section .my-view-row .my-view-parent a{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
+.dashboard-table-section .my-view-row .status-badge{display:inline-block;max-width:100%;box-sizing:border-box;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
+/* Populating the lazy native select must never resize its table column. */
+.dashboard-table-section .dashboard-assignee-select{display:block;box-sizing:border-box;width:100%;min-width:0;max-width:100%;height:25px;margin:0;padding:2px 19px 2px 7px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.dashboard-table-section .dashboard-reason-cell{min-width:0;max-width:none}
+.dashboard-reason-list{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dashboard-risk-score{font-weight:850;color:#b91c1c;font-variant-numeric:tabular-nums}
+.dashboard-risk-reason{display:inline-flex;margin:2px 4px 2px 0;padding:3px 6px;border-radius:5px;background:#fff1f2;color:#9f1239;font-size:10px;white-space:nowrap}
+.dashboard-clear-attention-filter{margin-top:7px;border:1px solid #fda4af;border-radius:20px;background:#fff1f2;color:#9f1239;padding:4px 10px;font-size:11px;cursor:pointer}
+.dashboard-table-pagination{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding-top:12px;color:#64748b;font-size:11px}
+/* The pagination bar remains at the bottom of the visible dashboard while
+   its table is in view; it scrolls away at the end of the table section. */
+.dashboard-table-section .dashboard-table-pagination.bottom{
+  position:sticky;bottom:0;z-index:19;
+  background:#fff;border-top:1px solid #dbe2ea;
+  margin:12px -15px -15px;padding:10px 15px 12px;
+  border-radius:0 0 10px 10px;
+  box-shadow:0 -5px 14px rgba(15,23,42,.07);
+}
+.dashboard-table-pagination>div{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.dashboard-table-pagination .dashboard-page-number{margin:0 5px;white-space:nowrap}
+.dashboard-table-pagination .dashboard-page-count{white-space:nowrap;font-variant-numeric:tabular-nums}
+.dashboard-table-pagination button{padding:6px 10px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;font:inherit;font-weight:750;cursor:pointer}
+.dashboard-table-pagination button:hover:not(:disabled){background:#eef2ff;color:#4338ca}
+.dashboard-table-pagination button:disabled{opacity:.45;cursor:default}
+.dashboard-workload-panel .dashboard-section-group{min-width:0;margin:0}
+.dashboard-attention-stat .dashboard-stat-value{font-size:clamp(18px,2vw,23px);font-variant-numeric:tabular-nums;white-space:nowrap}
+.milestone-overview-card .card-top{align-items:center;flex-wrap:wrap}
+.milestone-overview-card .milestone-card-top-right{display:flex;align-items:center;justify-content:flex-end;flex-wrap:nowrap;gap:5px;min-width:0;max-width:100%}
+.milestone-overview-card .milestone-card-top-right .epic-badge{margin:0;max-width:230px;min-width:0;box-sizing:border-box;line-height:17px;height:25px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto}
+.milestone-overview-card .milestone-card-top-right .status-badge{display:inline-flex;align-items:center;box-sizing:border-box;height:25px;line-height:19px;margin:0;white-space:nowrap}
+.milestone-overview-card .card-meta{padding-right:0}
+.milestone-chain-meta{display:flex;align-items:center;gap:14px;margin-top:9px;padding-top:9px;border-top:1px solid #e2e8f0}
+.milestone-chain-meta .my-view-count{font-size:11px}
+.milestone-chain-meta .milestone-gantt-launch{position:static;flex:0 0 28px;margin-left:auto}
+@media(max-width:900px){.dashboard-table-tabs{top:0}.dashboard-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-stat.dashboard-attention-stat{grid-column:span 2}}
+@media(max-width:600px){.dashboard-stats{grid-template-columns:1fr}.dashboard-stat.dashboard-attention-stat,.dashboard-health-stat{grid-column:span 1}.dashboard-table-pagination{align-items:flex-start}.dashboard-table-pagination>div{gap:4px}}
+
 </style>
 </head>
 <body>
@@ -3017,6 +3103,7 @@ const state = {
   showDashboard:false,
   showMyView:false,
   myViewSavedSorts:{}, myViewSort:{field:'priority',direction:'asc'},
+  dashboardSavedSorts:{},dashboardDraftSorts:{},dashboardTab:'needs-attention',dashboardPages:{},dashboardAttentionFilter:'',
   startingView:'default',
   showMiniMap:true, customJql:'', useJiraModal:false, ganttScale:12, ganttShowDependencies:true, ganttNarrow:false, currentUserName:'', currentUserAccountId:'', personalUserOverride:false, personalTicketFilter:'',
   displayIssues:[], displayEdges:[], displayLevels:0,
@@ -3085,6 +3172,8 @@ async function loadPreferences(){
     state.ganttNarrow=saved.ganttNarrow===true;
     state.startingView=['default','my-view','dashboard','milestone'].includes(saved.startingView) ? saved.startingView : 'default';
     state.myViewSavedSorts=(saved.myViewSorts && typeof saved.myViewSorts==='object' && !Array.isArray(saved.myViewSorts)) ? saved.myViewSorts : {};
+    state.dashboardSavedSorts=(saved.dashboardTabSorts && typeof saved.dashboardTabSorts==='object' && !Array.isArray(saved.dashboardTabSorts)) ? saved.dashboardTabSorts : {};
+    state.dashboardDraftSorts={...state.dashboardSavedSorts};
     if(saved.personalUserAccountId || saved.personalUserName){
       state.currentUserAccountId=saved.personalUserAccountId||'';
       state.currentUserName=saved.personalUserName||'';
@@ -3112,7 +3201,7 @@ async function savePreferences(updates){
         showMiniMap:state.showMiniMap!==false, startingView:state.startingView || 'default',
         ganttScale:state.ganttScale, ganttShowDependencies:state.ganttShowDependencies!==false, ganttNarrow:state.ganttNarrow===true,
         personalUserAccountId:state.currentUserAccountId||'', personalUserName:state.currentUserName||'',
-        myViewSorts:state.myViewSavedSorts||{}
+        myViewSorts:state.myViewSavedSorts||{}, dashboardTabSorts:state.dashboardSavedSorts||{}
       }),cache:'no-store'
     });
     if(!response.ok) throw new Error('Preferences API returned '+response.status);
@@ -4883,13 +4972,13 @@ function dashboardGraphTraversal(issues){
 }
 
 function dashboardRiskInfo(issues){
-  const active=issues.filter(i => !isCompletedStatus(i.status));
+  // Project overview always uses ALL active tickets, independently of filters,
+  // including With Remarkable. A ticket is counted once in Needs attention.
+  const active=issues.filter(i=>!isCompletedStatus(i.status));
   const overdue=active.filter(i=>isDueDateOverdue(i.dueDate));
   const unassigned=active.filter(i=>!i.assigneeAccountId);
   const noDueDate=active.filter(i=>!i.dueDate);
-
-  // Flag a ticket when a downstream ticket is due before an upstream ticket.
-  // Compare every reachable upstream/downstream pair, not just direct links.
+  const noDescription=active.filter(i=>i.hasDescription===false);
   const graph=dashboardGraphTraversal(issues);
   const chainDateRiskKeys=new Set();
   const chainDateRiskDetails=new Map();
@@ -4906,42 +4995,41 @@ function dashboardRiskInfo(issues){
     });
   });
   const chainDateRisks=active.filter(i=>chainDateRiskKeys.has(i.key));
-
-  // Use the same iterative cycle detector as the board, preventing stack
-  // overflow on deep chains and consistent counts for overlapping cycles.
   const circularKeys=calculateGraphLayout(active,state.edges).cycleKeys;
   const circularDependencies=active.filter(i=>circularKeys.has(i.key));
-
-  const totalActive=active.length;
-  // Front-load urgent delivery risks so the first occurrence has an immediate,
-  // visible impact, then increase the deduction on a square-root curve as more
-  // tickets are affected. Other hygiene deductions remain proportional.
-  function frontLoadedDeduction(count,total,maxPoints,firstHitPoints){
-    if(!count || !total) return 0;
-    if(total<=1 || count>=total) return maxPoints;
-    const additionalShare=Math.sqrt((count-1)/(total-1));
-    return Math.min(maxPoints,firstHitPoints+(maxPoints-firstHitPoints)*additionalShare);
-  }
-  const overdueDeduction=frontLoadedDeduction(overdue.length,totalActive,55,8);
-  const unassignedDeduction=totalActive ? (unassigned.length/totalActive)*20 : 0;
-  const noDueDateDeduction=totalActive ? (noDueDate.length/totalActive)*15 : 0;
-  const circularDeduction=totalActive ? (circularDependencies.length/totalActive)*7 : 0;
-  const chainDateDeduction=frontLoadedDeduction(chainDateRisks.length,totalActive,10,5);
-  const boardHealthScore=totalActive ? Math.max(0,Math.min(100,100-overdueDeduction-unassignedDeduction-noDueDateDeduction-circularDeduction-chainDateDeduction)) : 100;
-  const boardHealthStatus=boardHealthScore>=90 ? 'green' : boardHealthScore>=70 ? 'amber' : 'red';
-
-  return {
-    active,overdue,unassigned,noDueDate,chainDateRisks,chainDateRiskKeys,chainDateRiskDetails,
-    circularDependencies,circularKeys,
-    boardHealthScore,boardHealthStatus,
-    boardHealthBreakdown:{
-      overdue:{weight:55,count:overdue.length,deduction:overdueDeduction},
-      unassigned:{weight:20,count:unassigned.length,deduction:unassignedDeduction},
-      noDueDate:{weight:15,count:noDueDate.length,deduction:noDueDateDeduction},
-      circular:{weight:7,count:circularDependencies.length,deduction:circularDeduction},
-      chainDates:{weight:10,count:chainDateRisks.length,deduction:chainDateDeduction}
+  const today=new Date();today.setHours(0,0,0,0);
+  const ticketRisks=new Map();
+  const attention=[];
+  active.forEach(issue=>{
+    const reasons=[];
+    let score=0;
+    if(isDueDateOverdue(issue.dueDate)){
+      const due=new Date(issue.dueDate+'T00:00:00');
+      // Add 5 points for each completed calendar month since the due date.
+      let months=(today.getFullYear()-due.getFullYear())*12+today.getMonth()-due.getMonth();
+      if(today.getDate()<due.getDate()) months--;
+      months=Math.max(0,months);
+      const points=30+5*months;
+      reasons.push({id:'overdue',label:'Overdue'+(months?' ('+months+' month'+(months===1?'':'s')+')':''),points});
+      score+=points;
     }
-  };
+    if(!issue.assigneeAccountId){reasons.push({id:'unassigned',label:'Unassigned',points:10});score+=10;}
+    if(!issue.dueDate){reasons.push({id:'missing-due',label:'Missing due date',points:15});score+=15;}
+    if(chainDateRiskKeys.has(issue.key)){reasons.push({id:'chain-risks',label:'Chain date risk',points:20});score+=20;}
+    if(circularKeys.has(issue.key)){reasons.push({id:'circular',label:'Circular dependency',points:25});score+=25;}
+    if(issue.hasDescription===false){reasons.push({id:'missing-description',label:'Missing description',points:5});score+=5;}
+    ticketRisks.set(issue.key,{score,reasons});
+    if(score>0) attention.push(issue);
+  });
+  // Healthy tickets are the baseline: widespread issues must affect Board Health
+  // even when each issue has only a small risk score. Deduct additional points
+  // for severity, without disproportionately penalising larger projects.
+  const averageRisk=active.length ? active.reduce((sum,i)=>sum+Math.min(100,ticketRisks.get(i.key).score),0)/active.length : 0;
+  const affectedRate=active.length ? attention.length/active.length : 0;
+  const boardHealthScore=Math.max(0,Math.min(100,100*(1-affectedRate)-averageRisk*.25));
+  const boardHealthStatus=boardHealthScore>=90?'green':boardHealthScore>=70?'amber':'red';
+  return {active,overdue,unassigned,noDueDate,noDescription,chainDateRisks,chainDateRiskKeys,chainDateRiskDetails,
+    circularDependencies,circularKeys,attention,ticketRisks,averageRisk,boardHealthScore,boardHealthStatus};
 }
 function lazyAssigneeSelectHtml(i, dashboard=false){
   // The current selection must be present immediately for value/keyboard
@@ -5166,185 +5254,255 @@ function dashboardPersonalViewHtml(activeIssues){
     metric('Due in the next 31 days',nextMonth.length,selectedName+'’s tickets due today through the next 31 days','nextMonth')+
     '</div>';
 }
+const DASHBOARD_TABS=[
+  ['needs-attention','Needs attention'],['upcoming-7','Upcoming 7 days'],['upcoming-31','Upcoming 31 days'],
+  ['overdue','Overdue'],['missing-due','Missing Due Date'],['unassigned','Unassigned tickets'],
+  ['biggest-unblockers','Biggest unblockers'],['chain-risks','Dependency chain date risks'],
+  ['circular','Circular Dependencies'],['in-development','In development'],
+  ['workload-priorities','Workload and Priorities']
+];
+const DASHBOARD_TABLE_FIELDS=[['key','Key'],['summary','Summary'],['priority','Priority'],['dueDate','Due date'],
+  ['epic','Parent (epic)'],['assignee','Assignee'],['status','Status'],['blockers','Blockers'],['blocked','Blocked']];
+function dashboardDefaultSort(tab){
+  if(tab==='needs-attention') return {field:'riskScore',direction:'desc'};
+  if(tab==='biggest-unblockers') return {field:'blocked',direction:'desc'};
+  if(tab==='missing-due') return {field:'priority',direction:'asc'};
+  return {field:'dueDate',direction:'asc'};
+}
+function dashboardSortForTab(tab){return state.dashboardDraftSorts?.[tab]||state.dashboardSavedSorts?.[tab]||dashboardDefaultSort(tab);}
+function dashboardSortChanged(tab){
+  const saved=state.dashboardSavedSorts?.[tab]||dashboardDefaultSort(tab);
+  const current=dashboardSortForTab(tab);
+  return saved.field!==current.field||saved.direction!==current.direction;
+}
+function dashboardTableData(risks,tab){
+  const active=risks.active;
+  switch(tab){
+    case 'needs-attention':return risks.attention.filter(i=>state.dashboardAttentionFilter!=='missing-description'||i.hasDescription===false);
+    case 'upcoming-7':return dashboardDueSoon(active,7);
+    case 'upcoming-31':return dashboardDueSoon(active,31);
+    case 'overdue':return risks.overdue;
+    case 'missing-due':return risks.noDueDate;
+    case 'unassigned':return risks.unassigned;
+    case 'biggest-unblockers':{
+      const graph=dashboardGraphTraversal(active);
+      // This preset is deliberately limited to the 20 largest downstream chains.
+      return [...active].filter(i=>graph.downstreamCount(i.key)>0)
+        .sort((a,b)=>graph.downstreamCount(b.key)-graph.downstreamCount(a.key)||a.key.localeCompare(b.key)).slice(0,20);
+    }
+    case 'chain-risks':return risks.chainDateRisks;
+    case 'circular':return risks.circularDependencies;
+    case 'in-development':return active.filter(isWithRemarkableStatus);
+    default:return [];
+  }
+}
+function dashboardCompareTable(a,b,tab,risks,graph){
+  const sort=dashboardSortForTab(tab);
+  function value(i,field){
+    if(field==='priority') return priorityRank(i.priority);
+    if(field==='dueDate') return i.dueDate||'';
+    if(field==='epic') return (i.epic?.summary||i.epic?.key||'').toLowerCase();
+    if(field==='assignee') return (i.assigneeAccountId?i.assignee:'').toLowerCase();
+    if(field==='blockers') return graph.upstreamCount(i.key);
+    if(field==='blocked') return graph.downstreamCount(i.key);
+    if(field==='riskScore') return risks.ticketRisks.get(i.key)?.score||0;
+    return String(i[field]||'').toLowerCase();
+  }
+  const compare=(field,direction)=>{
+    const x=value(a,field),y=value(b,field);
+    if(field==='dueDate' && (!x||!y) && x!==y) return !x?1:-1;
+    const cmp=typeof x==='number'?x-y:String(x).localeCompare(String(y),undefined,{numeric:true});
+    return (direction==='desc'?-1:1)*cmp;
+  };
+  return compare(sort.field,sort.direction) ||
+    (sort.field==='dueDate'||sort.field==='riskScore'||(tab==='biggest-unblockers'&&sort.field==='blocked')?compare('dueDate','asc'):sort.field==='priority'?compare('dueDate','asc'):0) ||
+    (sort.field==='riskScore'||tab==='biggest-unblockers'?compare('priority','asc'):0) ||
+    a.key.localeCompare(b.key);
+}
+function dashboardTableHtml(risks,tab){
+  const graph=dashboardGraphTraversal(risks.active);
+  const data=dashboardTableData(risks,tab).sort((a,b)=>dashboardCompareTable(a,b,tab,risks,graph));
+  const pageSize=30;
+  const pageCount=Math.max(1,Math.ceil(data.length/pageSize));
+  const page=Math.max(1,Math.min(pageCount,state.dashboardPages?.[tab]||1));
+  state.dashboardPages[tab]=page;
+  const start=(page-1)*pageSize;
+  const rows=data.slice(start,start+pageSize);
+  const activeSort=dashboardSortForTab(tab);
+  const headers=tab==='needs-attention'?[...DASHBOARD_TABLE_FIELDS,['riskScore','Risk score'],['riskReasons','Risk reasons']]:DASHBOARD_TABLE_FIELDS;
+  const headerHtml=headers.map(([field,label])=>{
+    if(field==='riskReasons') return '<th scope="col">'+label+'</th>';
+    const active=activeSort.field===field;
+    return '<th scope="col" aria-sort="'+(active?(activeSort.direction==='asc'?'ascending':'descending'):'none')+'"><button type="button" data-dashboard-sort="'+field+'" class="'+(active?'active':'')+'">'+label+' <span aria-hidden="true">'+(active?(activeSort.direction==='asc'?'▲':'▼'):'↕')+'</span></button></th>';
+  }).join('');
+  const colWidths=[104,300,92,170,218,184,140,83,83];
+  const colgroup='<colgroup>'+colWidths.map(w=>'<col style="width:'+w+'px">').join('')+
+    (tab==='needs-attention'?'<col style="width:95px"><col style="width:270px">':'')+'</colgroup>';
+  const rowHtml=rows.map(i=>{
+    const epic=i.epic;
+    const epicLabel=epic?(epic.summary?epic.summary+' ('+epic.key+')':epic.key):'';
+    const epicHtml=epic?'<a href="'+esc(epic.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(epic.key)+'" title="'+esc(epicLabel)+'">'+esc(epicLabel)+'</a>':'—';
+    const risk=risks.ticketRisks.get(i.key)||{score:0,reasons:[]};
+    const riskColumns=tab==='needs-attention'?'<td><strong class="dashboard-risk-score">'+risk.score+'</strong></td><td class="dashboard-reason-cell"><span class="dashboard-reason-list" title="'+esc(risk.reasons.map(x=>x.label+' (+'+x.points+')').join(', '))+'">'+risk.reasons.map(x=>'<span class="dashboard-risk-reason" title="+'+x.points+' points">'+esc(x.label)+'</span>').join('')+'</span></td>':'';
+    return '<tr class="my-view-row dashboard-ticket" data-key="'+esc(i.key)+'" data-dashboard-row-key="'+esc(i.key)+'" tabindex="0" title="Open dependency chain for '+esc(i.key)+'">'+
+      '<td><a class="dashboard-ticket-key" href="'+esc(i.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(i.key)+'">'+esc(i.key)+'</a></td>'+
+      '<td class="my-view-summary" title="'+esc(i.summary||'')+'">'+esc(i.summary||'')+'</td>'+
+      '<td><div class="my-view-priority" title="'+esc(i.priority||'Unspecified')+'">'+dashboardPriorityHtml(i)+'</div></td>'+
+      '<td>'+dueDateHtml(i)+'</td>'+
+      '<td class="my-view-parent">'+epicHtml+'</td>'+
+      '<td>'+dashboardAssigneeOptions(i)+'</td>'+
+      '<td><span class="status-badge" style="'+statusStyle(i.status)+'">'+esc(i.status||'—')+'</span></td>'+
+      '<td><span class="my-view-count upstream">'+graph.upstreamCount(i.key)+'</span></td>'+
+      '<td><span class="my-view-count downstream">'+graph.downstreamCount(i.key)+'</span></td>'+
+      riskColumns+'</tr>';
+  }).join('');
+  const title=DASHBOARD_TABS.find(x=>x[0]===tab)?.[1]||'Tickets';
+  const filterNote=state.dashboardAttentionFilter==='missing-description'&&tab==='needs-attention'
+    ? '<button class="dashboard-clear-attention-filter" type="button">Missing descriptions only ×</button>':'';
+  const sortStatus=dashboardSortChanged(tab)?'Sorting not saved':state.dashboardSavedSorts?.[tab]?'Sorting saved':'Default sorting';
+  const pagination=data.length>pageSize?'<nav class="dashboard-table-pagination bottom" aria-label="Table pagination" data-dashboard-page-count="'+pageCount+'"><span class="dashboard-page-count">Showing '+(start+1)+'–'+Math.min(start+pageSize,data.length)+' of '+data.length+'</span><div><button type="button" data-dashboard-page="first"'+(page===1?' disabled':'')+' aria-label="First page">« First</button><button type="button" data-dashboard-page="prev"'+(page===1?' disabled':'')+'>Previous</button><span class="dashboard-page-number">Page '+page+' of '+pageCount+'</span><button type="button" data-dashboard-page="next"'+(page===pageCount?' disabled':'')+'>Next</button><button type="button" data-dashboard-page="last"'+(page===pageCount?' disabled':'')+' aria-label="Last page">Last »</button></div></nav>':'';
+  return '<section class="my-view-table-section dashboard-table-section" id="dashboard-table-panel"><div class="my-view-table-heading"><div><h2>'+esc(title)+' <span class="dashboard-section-count">('+data.length+')</span></h2><p>Active tickets · Select a row to open its dependency chain · Click a column heading to sort</p>'+filterNote+'</div><div class="my-view-sort-actions"><span class="my-view-sort-status">'+sortStatus+'</span><button type="button" class="my-view-save-sort" id="dashboard-save-sort"'+(!dashboardSortChanged(tab)?' disabled':'')+'>Save sort</button></div></div>'+
+    '<div class="my-view-scroll-controls" hidden><span class="my-view-scroll-hint">Scroll to see more columns</span><button type="button" class="my-view-scroll-button" data-my-view-scroll="left" aria-label="Scroll table left">&#8592;</button><button type="button" class="my-view-scroll-button" data-my-view-scroll="right" aria-label="Scroll table right">&#8594;</button></div>'+
+    '<div class="my-view-table-scroll" role="region" aria-label="'+esc(title)+' table, horizontally scrollable" tabindex="0"><table class="my-view-table'+(tab==='needs-attention'?' has-risk-columns':'')+'">'+colgroup+'<thead><tr>'+headerHtml+'</tr></thead><tbody>'+
+    (rowHtml||'<tr><td class="my-view-empty" colspan="'+headers.length+'">No matching active tickets.</td></tr>')+'</tbody></table></div>'+pagination+'</section>';
+}
 function dashboardOverviewHtml(){
-  const risks=dashboardRiskInfo(state.displayIssues||[]);
-  const h=risks.boardHealthBreakdown;
-  const score=Math.round(risks.boardHealthScore);
-  const statusLabel=risks.boardHealthStatus==='green'?'Healthy':risks.boardHealthStatus==='amber'?'Needs attention':'At risk';
+  const risks=dashboardRiskInfo(state.issues||[]);
+  const tab=DASHBOARD_TABS.some(x=>x[0]===state.dashboardTab)?state.dashboardTab:'needs-attention';
   const dueSoon=dashboardDueSoon(risks.active,7);
   const dueMonth=dashboardDueSoon(risks.active,31);
-  const highPriorityRisk=dashboardHighPriorityRisk(risks.active,risks);
-  const bottlenecks=dashboardDependencyBottlenecks(risks.active);
   const workload=dashboardWorkload(risks.active);
+  const priorityDistribution=dashboardPriorityDistribution(risks.active);
   const topWorkload=workload.filter(x=>x.accountId).slice(0,6);
   const assignedPeopleCount=new Set(risks.active.filter(i=>i.assigneeAccountId).map(i=>i.assigneeAccountId)).size;
-  const milestones=dashboardMilestones(risks.active);
-  const blockedTickets=risks.active.filter(i=>(i.blockers||[]).length);
-  const priorityDistribution=dashboardPriorityDistribution(risks.active);
-  // Include every active With Remarkable ticket, even if the Full board filter
-  // currently hides them from state.displayIssues.
-  const inDevelopment=(state.issues||[]).filter(i=>!isCompletedStatus(i.status) && isWithRemarkableStatus(i));
-  const completed=(state.issues||[]).filter(i=>isCompletedStatus(i.status)).sort((a,b)=>String(b.updated||'').localeCompare(String(a.updated||''))).slice(0,8);
+  const count=risks.attention.length;
+  const activeCount=risks.active.length;
+  const attentionPercent=activeCount?Math.round(count/activeCount*100):0;
   const attentionItems=[
-    ['high-priority-risk','High-priority risk',highPriorityRisk.length],
     ['overdue','Overdue tickets',risks.overdue.length],
-    ['chain-risks','Dependency chain date risks',risks.chainDateRisks.length],
     ['unassigned','Unassigned tickets',risks.unassigned.length],
     ['missing-due','Missing due dates',risks.noDueDate.length],
+    ['chain-risks','Dependency chain date risks',risks.chainDateRisks.length],
     ['circular','Circular dependencies',risks.circularDependencies.length],
-    ['blocked-tickets','Blocked tickets',blockedTickets.length]
+    ['missing-description','Missing descriptions',risks.noDescription.length]
   ];
-  const attentionTotal=attentionItems.reduce((sum,x)=>sum+x[2],0);
-  const attentionHtml=attentionItems.map(x=>'<button type="button" class="dashboard-attention-item" data-dashboard-nav="'+x[0]+'"><span>'+esc(x[1])+'</span><strong>'+x[2]+'</strong></button>').join('');
-  const topWorkloadHtml=topWorkload.length
-    ? topWorkload.map((x,idx)=>'<div class="dashboard-top-workload-row"><strong>'+((idx+1)+'. ') + esc(x.name)+'</strong><span class="dashboard-top-workload-count">'+x.count+'</span></div>').join('')
-    : '<div class="dashboard-empty">No assigned active tickets.</div>';
-  const hRows=[
-    {label:'Overdue tickets',detail:risks.overdue.length+' affected · max '+h.overdue.weight+' pts',deduction:h.overdue.deduction},
-    {label:'Unassigned tickets',detail:risks.unassigned.length+' affected · max '+h.unassigned.weight+' pts',deduction:h.unassigned.deduction},
-    {label:'Missing due dates',detail:risks.noDueDate.length+' affected · max '+h.noDueDate.weight+' pts',deduction:h.noDueDate.deduction},
-    {label:'Circular dependencies',detail:risks.circularDependencies.length+' affected · max '+h.circular.weight+' pts',deduction:h.circular.deduction},
-    {label:'Chain date risks',detail:risks.chainDateRisks.length+' affected · max '+h.chainDates.weight+' pts',deduction:h.chainDates.deduction}
-  ];
-  const healthDetail=hRows.map(row=>'<div class="dashboard-health-row"><span class="dashboard-health-row-label">'+esc(row.label)+'</span><span class="dashboard-health-row-detail">'+esc(row.detail)+'</span><strong>'+(row.deduction>0?'−'+row.deduction.toFixed(1)+' pts':'0 pts')+'</strong></div>').join('');
-  const nav=[['overview','Overview'],['milestones','Milestones'],['unblocking','Unblocking opportunities'],['upcoming','Upcoming'],['workload','Workload'],['priority-distribution','Priority distribution'],['in-development','In Development'],['attention','Needs attention']];
-  return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Project overview</div><div class="dashboard-subtitle">What is at risk, what is causing it, and what should be acted on first.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+ 
-    '<nav class="dashboard-nav" aria-label="Project overview sections">'+nav.map(x=>'<button type="button" data-dashboard-nav="'+x[0]+'">'+x[1]+'</button>').join('')+'</nav>'+ 
-    '<section class="dashboard-section dashboard-overview" id="overview"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">Overview</span><span class="dashboard-section-note">Board health and immediate signals</span></div></div>'+ 
-      '<div class="dashboard-stats">'+
-        '<div class="dashboard-stat dashboard-summary-link dashboard-health-stat '+risks.boardHealthStatus+'" data-dashboard-nav="attention" role="button" tabindex="0"><div class="dashboard-health-score-line"><div class="dashboard-stat-value">'+score+'%</div><span class="dashboard-health-status">'+statusLabel+'</span></div><div class="dashboard-stat-label">Board health</div><div class="dashboard-stat-help">Health combines overdue, unassigned, missing due dates, circular dependencies and chain-date risks.</div><div class="dashboard-health-breakdown">'+healthDetail+'</div></div>'+ 
-        '<div class="dashboard-stat dashboard-attention-stat risk"><div class="dashboard-stat-value">'+attentionTotal+'</div><div class="dashboard-stat-label">Needs attention</div><div class="dashboard-stat-help">Each risk area links directly to its section below.</div><div class="dashboard-attention-summary">'+attentionHtml+'</div></div>'+ 
-        '<div class="dashboard-upcoming-stack">'+
-          '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="7"><div class="dashboard-stat-value">'+dueSoon.length+'</div><div class="dashboard-stat-label">Due next 7 days</div><div class="dashboard-stat-help">Upcoming active work that needs attention soon.</div></div>'+ 
-          '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="upcoming" data-dashboard-upcoming-tab="month"><div class="dashboard-stat-value">'+dueMonth.length+'</div><div class="dashboard-stat-label">Due next month</div><div class="dashboard-stat-help">Active work due within the next 31 days.</div></div>'+ 
-        '</div>'+ 
-        '<div class="dashboard-stat dashboard-summary-link" data-dashboard-nav="workload"><div class="dashboard-stat-value">'+assignedPeopleCount+' assignees</div><div class="dashboard-stat-label">Top workload</div><div class="dashboard-stat-help">Highest workload assignees by active ticket count.</div><div class="dashboard-top-workload">'+topWorkloadHtml+'</div></div>'+ 
-      '</div></section>'+ 
-    '<div class="dashboard-two-column dashboard-top-cards">'+
-      '<div class="dashboard-section-group" id="milestones"><div class="dashboard-group-head"><h2>Milestones</h2><span>Milestone health and delivery pressure</span></div>'+ 
-        dashboardSummarySection('Milestone risk',dashboardMilestoneHtml(milestones),'milestone-risk','Active milestones with due dates, overdue status or blocked work')+
-        dashboardSummarySection('Recently completed',dashboardCompletedHtml(completed),'recently-completed','Most recently updated completed tickets in the current dataset')+
-      '</div>'+ 
-      '<div class="dashboard-section-group" id="unblocking"><div class="dashboard-group-head"><h2>Unblocking opportunities</h2><span>Focus on work with the greatest downstream impact</span></div>'+ 
-        dashboardSummarySection('Biggest dependency bottlenecks',dashboardBottleneckHtml(bottlenecks),'bottlenecks','Top active tickets by number of downstream active tickets affected')+
-      '</div>'+ 
-    '</div>'+ 
-    '<div class="dashboard-section-group" id="upcoming"><div class="dashboard-group-head"><h2>Upcoming</h2><span>What needs attention next</span></div>'+ 
-      '<div class="dashboard-upcoming-tabs" role="tablist" aria-label="Upcoming timeframe">'+
-        '<button type="button" class="dashboard-upcoming-tab active" data-dashboard-upcoming-tab-button="7" role="tab" aria-selected="true">7 days</button>'+ 
-        '<button type="button" class="dashboard-upcoming-tab" data-dashboard-upcoming-tab-button="month" role="tab" aria-selected="false">Month</button>'+ 
-      '</div>'+ 
-      '<div class="dashboard-upcoming-panel" data-upcoming-panel="7">'+dashboardSection('Due in the next 7 days',dueSoon,risks,{id:'due-soon',note:'Includes today through the next seven days'})+'</div>'+ 
-      '<div class="dashboard-upcoming-panel" data-upcoming-panel="month" hidden>'+dashboardSection('Due in the next 31 days',dueMonth,risks,{id:'due-month',note:'Includes today through the next 31 days'})+'</div>'+ 
-    '</div>'+ 
-    '<div class="dashboard-two-column dashboard-bottom-cards">'+
-      '<div class="dashboard-section-group" id="workload"><div class="dashboard-group-head"><h2>Workload</h2><span>Active tickets by assignee</span></div>'+ 
-        dashboardSummarySection('Workload by assignee',dashboardWorkloadHtml(workload),'workload-by-assignee','Select a person to filter the main board')+
-      '</div>'+ 
-      '<div class="dashboard-section-group" id="priority-distribution"><div class="dashboard-group-head"><h2>Priority distribution</h2><span>Active tickets by Jira priority</span></div>'+ 
-        dashboardSummarySection('Priority distribution',dashboardPriorityDistributionHtml(priorityDistribution),'priority-distribution-content','Active tickets by Jira priority')+
-      '</div>'+ 
-    '</div>'+ 
-    '<div class="dashboard-section-group" id="in-development"><div class="dashboard-group-head"><h2>In Development</h2><span>All active tickets with status With Remarkable</span></div>'+ 
-      dashboardSection('With Remarkable',inDevelopment,risks,{id:'in-development-tickets',returnSection:'in-development-tickets',note:'Sorted by priority and due date'})+
-    '</div>'+ 
-    '<div class="dashboard-section-group" id="attention"><div class="dashboard-group-head"><h2>Needs attention</h2><span>Risks that should be reviewed first</span></div>'+ 
-      dashboardSection('High-priority risk',highPriorityRisk,risks,{id:'high-priority-risk',returnSection:'high-priority-risk',note:'Highest and Critical work that is overdue, due soon or has a chain-date risk'})+
-      dashboardSection('Overdue tickets',risks.overdue,risks,{id:'overdue',returnSection:'overdue',note:'Past their due date'})+
-      dashboardSection('Dependency chain date risks',risks.chainDateRisks,risks,{id:'chain-risks',returnSection:'chain-risks',note:'A downstream ticket is due before an earlier ticket in its chain'})+
-      dashboardSection('Unassigned tickets',risks.unassigned,risks,{id:'unassigned',returnSection:'unassigned',note:'Active work with no assignee'})+
-      dashboardSection('Missing due dates',risks.noDueDate,risks,{id:'missing-due',returnSection:'missing-due',note:'Active work without a due date'})+
-      dashboardSection('Circular dependencies',risks.circularDependencies,risks,{id:'circular',returnSection:'circular',note:'Dependency loops that need resolving'})+
-      dashboardSection('Blocked tickets',blockedTickets,risks,{id:'blocked-tickets',returnSection:'blocked-tickets',note:'Active tickets waiting on one or more blockers'})+
-    '</div>'+ 
-  '</div>';
+  const healthScore=Math.round(risks.boardHealthScore);
+  const healthLabel=risks.boardHealthStatus==='green'?'Healthy':risks.boardHealthStatus==='amber'?'Needs attention':'At risk';
+  const topWorkloadHtml=topWorkload.length?topWorkload.map((x,index)=>'<div class="dashboard-top-workload-row"><strong>'+((index+1)+'. ')+esc(x.name)+'</strong><span class="dashboard-top-workload-count">'+x.count+'</span></div>').join(''):'<div class="dashboard-empty">No assigned active tickets.</div>';
+  const riskTotals=attentionItems.map(([id,label,n])=>'<button type="button" class="dashboard-attention-item" data-dashboard-risk-link="'+id+'"><span>'+esc(label)+'</span><strong>'+n+'</strong></button>').join('');
+  const healthDetails=attentionItems.map(([id,label,n])=>'<div class="dashboard-health-row"><span class="dashboard-health-row-label">'+esc(label)+'</span><span class="dashboard-health-row-detail">'+n+' affected</span></div>').join('');
+  const tabs=DASHBOARD_TABS.map(([id,label])=>'<button type="button" role="tab" aria-selected="'+(tab===id?'true':'false')+'" data-dashboard-tab="'+id+'" class="'+(tab===id?'active':'')+'">'+esc(label)+'</button>').join('');
+  const mainPanel=tab==='workload-priorities'
+    ? '<div class="dashboard-two-column dashboard-workload-panel">'+
+        '<div class="dashboard-section-group">'+dashboardSummarySection('Workload by assignee',dashboardWorkloadHtml(workload),'workload-by-assignee','Select a person to filter the main board')+'</div>'+
+        '<div class="dashboard-section-group">'+dashboardSummarySection('Priority distribution',dashboardPriorityDistributionHtml(priorityDistribution),'priority-distribution-content','Active tickets by Jira priority')+'</div></div>'
+    : dashboardTableHtml(risks,tab);
+  return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Project overview</div><div class="dashboard-subtitle">Delivery risks, deadlines and priorities across all active tickets.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+
+    '<section class="dashboard-section dashboard-overview" id="overview"><div class="dashboard-stats">'+
+      '<div class="dashboard-stat dashboard-summary-link dashboard-health-stat '+risks.boardHealthStatus+'" role="button" tabindex="0" data-dashboard-risk-link="needs-attention"><div class="dashboard-health-score-line"><div class="dashboard-stat-value">'+healthScore+'%</div><span class="dashboard-health-status">'+healthLabel+'</span></div><div class="dashboard-stat-label">Board health</div><div class="dashboard-stat-help">Percentage of active tickets without risks, minus 25% of the average risk points. Includes all six risk areas.</div><div class="dashboard-health-breakdown">'+healthDetails+'</div></div>'+
+      '<div class="dashboard-stat dashboard-attention-stat risk"><div class="dashboard-stat-value">'+count.toLocaleString('en-GB')+' / '+activeCount.toLocaleString('en-GB')+' ('+attentionPercent+'%)</div><div class="dashboard-stat-label">Needs attention</div><div class="dashboard-stat-help">Unique active tickets with one or more risks. Select a category to see its tickets.</div><div class="dashboard-attention-summary">'+riskTotals+'</div></div>'+
+      '<div class="dashboard-upcoming-stack">'+
+        '<div class="dashboard-stat dashboard-summary-link" data-dashboard-risk-link="upcoming-7"><div class="dashboard-stat-value">'+dueSoon.length+'</div><div class="dashboard-stat-label">Due next 7 days</div></div>'+
+        '<div class="dashboard-stat dashboard-summary-link" data-dashboard-risk-link="upcoming-31"><div class="dashboard-stat-value">'+dueMonth.length+'</div><div class="dashboard-stat-label">Due next 31 days</div></div></div>'+
+      '<div class="dashboard-stat dashboard-summary-link" data-dashboard-risk-link="workload-priorities"><div class="dashboard-stat-value">'+assignedPeopleCount+' assignees</div><div class="dashboard-stat-label">Top workload</div><div class="dashboard-top-workload">'+topWorkloadHtml+'</div></div>'+
+    '</div></section>'+
+    '<nav class="dashboard-nav dashboard-table-tabs" role="tablist" aria-label="Project overview table views">'+tabs+'</nav>'+
+    '<div id="dashboard-table-area" role="tabpanel">'+mainPanel+'</div></div>';
 }
 function renderDashboard(){
   const start=performance.now();
-  board.insertAdjacentHTML('beforeend', dashboardOverviewHtml());
+  board.insertAdjacentHTML('beforeend',dashboardOverviewHtml());
   console.info('[Performance] Dashboard render',{milliseconds:Math.round(performance.now()-start)});
-  attachTicketKeyModalHandlers(board);
   attachEvents();
-
-  function setUpcomingTab(tab){
-    const value=tab==='month'?'month':'7';
-    board.querySelectorAll('[data-dashboard-upcoming-tab-button]').forEach(btn=>{
-      const active=btn.dataset.dashboardUpcomingTabButton===value;
-      btn.classList.toggle('active',active);
-      btn.setAttribute('aria-selected',active?'true':'false');
-    });
-    board.querySelectorAll('[data-upcoming-panel]').forEach(panel=>{
-      panel.hidden=panel.dataset.upcomingPanel!==value;
-    });
+  const app=document.getElementById('app');
+  const switchTab=(tab,attentionFilter='')=>{
+    if(!DASHBOARD_TABS.some(x=>x[0]===tab)) return;
+    // Switching tabs or selecting a risk must not jump the dashboard to the table.
+    // Keep the current scroll position even though render() rebuilds the view.
+    const previousTop=app.scrollTop;
+    const previousLeft=app.scrollLeft;
+    const tableLeft=board.querySelector('.dashboard-table-section .my-view-table-scroll')?.scrollLeft||0;
+    state.dashboardTab=tab;
+    state.dashboardAttentionFilter=attentionFilter;
+    state.dashboardPages[tab]=1;
+    render();
+    app.scrollTop=previousTop;
+    app.scrollLeft=previousLeft;
+    const restore=()=>{
+      app.scrollTop=previousTop;
+      app.scrollLeft=previousLeft;
+      const table=board.querySelector('.dashboard-table-section .my-view-table-scroll');
+      if(table) table.scrollLeft=tableLeft;
+      updateMyViewScrollControls();
+    };
+    restore();
+    requestAnimationFrame(restore);
+  };
+  board.querySelectorAll('[data-dashboard-tab]').forEach(btn=>btn.addEventListener('click',()=>switchTab(btn.dataset.dashboardTab)));
+  board.querySelectorAll('[data-dashboard-risk-link]').forEach(el=>{
+    const navigate=()=>{
+      const id=el.dataset.dashboardRiskLink;
+      switchTab(id==='missing-description'?'needs-attention':id,id==='missing-description'?'missing-description':'');
+    };
+    el.addEventListener('click',navigate);
+    if(el.getAttribute('role')==='button') el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();navigate();}});
+  });
+  board.querySelector('.dashboard-clear-attention-filter')?.addEventListener('click',()=>switchTab('needs-attention',''));
+  board.querySelectorAll('[data-dashboard-sort]').forEach(btn=>btn.addEventListener('click',()=>{
+    const tab=state.dashboardTab,field=btn.dataset.dashboardSort,current=dashboardSortForTab(tab);
+    const defaultDirection=['blocked','blockers','riskScore'].includes(field)?'desc':'asc';
+    state.dashboardDraftSorts={...state.dashboardDraftSorts,[tab]:{field,direction:current.field===field?(current.direction==='asc'?'desc':'asc'):defaultDirection}};
+    state.dashboardPages[tab]=1;
+    const top=app.scrollTop;render();requestAnimationFrame(()=>app.scrollTop=top);
+  }));
+  board.querySelector('#dashboard-save-sort')?.addEventListener('click',async()=>{
+    const tab=state.dashboardTab,previous=state.dashboardSavedSorts;
+    state.dashboardSavedSorts={...previous,[tab]:{...dashboardSortForTab(tab)}};
+    const success=await savePreferences({dashboardSavedSorts:state.dashboardSavedSorts});
+    if(success){const top=app.scrollTop;render();requestAnimationFrame(()=>app.scrollTop=top);}
+    else{state.dashboardSavedSorts=previous;const msg=board.querySelector('.my-view-sort-status');if(msg) msg.textContent='Unable to save sorting. Try again.';}
+  });
+  board.querySelectorAll('[data-dashboard-page]').forEach(btn=>btn.addEventListener('click',()=>{
+    const tab=state.dashboardTab;
+    const page=state.dashboardPages[tab]||1;
+    const last=Number(btn.closest('[data-dashboard-page-count]')?.dataset.dashboardPageCount)||1;
+    const action=btn.dataset.dashboardPage;
+    const next=action==='first'?1:action==='last'?last:page+(action==='next'?1:-1);
+    state.dashboardPages[tab]=Math.max(1,Math.min(last,next));
+    const top=app.scrollTop,left=app.scrollLeft;
+    const tableLeft=board.querySelector('.dashboard-table-section .my-view-table-scroll')?.scrollLeft||0;
+    render();
+    const restore=()=>{
+      app.scrollTop=top;app.scrollLeft=left;
+      const table=board.querySelector('.dashboard-table-section .my-view-table-scroll');
+      if(table) table.scrollLeft=tableLeft;
+      updateMyViewScrollControls();
+    };
+    restore();requestAnimationFrame(restore);
+  }));
+  const scroller=board.querySelector('.my-view-table-scroll');
+  if(scroller){
+    if(myViewScrollObserver){myViewScrollObserver.disconnect();myViewScrollObserver.observe(scroller);myViewScrollObserver.observe(scroller.querySelector('table'));}
+    scroller.addEventListener('scroll',updateMyViewScrollControls,{passive:true});
+    board.querySelectorAll('[data-my-view-scroll]').forEach(btn=>btn.addEventListener('click',()=>scroller.scrollBy({left:(btn.dataset.myViewScroll==='right'?1:-1)*Math.max(240,Math.round(scroller.clientWidth*.75)),behavior:'smooth'})));
+    requestAnimationFrame(updateMyViewScrollControls);
   }
-  board.querySelectorAll('[data-dashboard-upcoming-tab-button]').forEach(btn=>{
-    btn.addEventListener('click',()=>setUpcomingTab(btn.dataset.dashboardUpcomingTabButton));
-  });
-  board.querySelectorAll('[data-dashboard-nav]').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      if(btn.dataset.dashboardUpcomingTab) setUpcomingTab(btn.dataset.dashboardUpcomingTab);
-      const target=document.getElementById(btn.dataset.dashboardNav);
-      if(target) target.scrollIntoView({behavior:'smooth',block:'start'});
-    });
-  });
-  board.querySelectorAll('[data-dashboard-show-more]').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      const section=btn.closest('.dashboard-section');
-      if(!section) return;
-      const hidden=[...section.querySelectorAll('[data-dashboard-ticket-index][hidden]')].slice(0,10);
-      hidden.forEach(el=>el.hidden=false);
-      updateDashboardPagination(section);
-    });
-  });
-  board.querySelectorAll('[data-dashboard-show-all]').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      const section=btn.closest('.dashboard-section');
-      if(!section) return;
-      section.querySelectorAll('[data-dashboard-ticket-index][hidden]').forEach(el=>el.hidden=false);
-      updateDashboardPagination(section);
-    });
-  });
-  board.querySelectorAll('[data-dashboard-milestone]').forEach(el=>{
-    el.addEventListener('click',e=>{
-      if(e.target.closest('[data-stop-propagation]')) return;
-      const key=el.dataset.dashboardMilestone;
+  board.querySelectorAll('[data-dashboard-row-key]').forEach(row=>{
+    const open=e=>{
+      if(e?.target?.closest?.('[data-stop-propagation], a, button, select, .priority-picker, .priority-menu')) return;
+      const key=row.dataset.dashboardRowKey;
       if(!key) return;
-      state.showDashboard=false;
-      state.showMyView=false;
-      state.showMilestones=true;
-      state.lockedKey=null;
-      state.selectionHistory=[];
-      state.showBlocked=false;
-      state.returnMilestoneKey=null;
-      state.dashboardReturnSection=null;
-      state.milestoneFlashKey=key;
+      // Opening a chain must work even if a Full Board filter excluded this ticket.
+      state.filterUser='';state.filterDue='all';state.includeWithRemarkable=true;state.showCompleted=false;
+      state.searchTerm='';if(searchEl) searchEl.value='';
+      state.showDashboard=false;state.showMyView=false;state.showMilestones=false;
+      state.lockedKey=key;state.selectionHistory=[];state.showBlocked=false;
+      state.dashboardReturnSection='dashboard:'+state.dashboardTab;
+      state.revealSelectedKey=key;
       render();
-    });
-  });
-  board.querySelectorAll('[data-dashboard-unblocking]').forEach(el=>{
-    el.addEventListener('click',e=>{
-      if(e.target.closest('[data-stop-propagation]')) return;
-      const key=el.dataset.dashboardUnblocking;
-      if(!key) return;
-      state.showDashboard=false;
-      state.showMyView=false;
-      state.showMilestones=false;
-      state.lockedKey=key;
-      state.selectionHistory=[];
-      state.showBlocked=false;
-      state.returnMilestoneKey=null;
-      state.dashboardReturnSection='unblocking';
-      render();
-    });
-  });
-  board.querySelectorAll('[data-dashboard-key]').forEach(el=>{
-    el.addEventListener('click',e=>{
-      if(e.target.closest('[data-stop-propagation]')) return;
-      const key=el.dataset.dashboardKey;
-      if(!key) return;
-      const wrap=el.closest('[data-dashboard-return-section]');
-      state.showDashboard=false; state.showMilestones=false; state.lockedKey=key; state.selectionHistory=[]; state.showBlocked=false; state.dashboardReturnSection=wrap?.dataset.dashboardReturnSection||null; state.revealSelectedKey=key; render();
-    });
+    };
+    row.addEventListener('click',open);
+    row.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target===row){e.preventDefault();open(e);}});
   });
 }
 function updateDashboardPagination(section){
@@ -5718,10 +5876,15 @@ function milestoneCardHtml(i){
         '<span class="priority-picker" title="Priority">' + priorityIconHtml(i.priority) + '</span>' +
         '<a class="key" href="' + esc(i.url) + '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' + esc(i.key) + '">' + esc(i.key) + '</a>' +
       '</div>' +
-      (i.status ? '<span class="status-badge" style="' + statusStyle(i.status) + '">' + esc(i.status) + '</span>' : '') +
-    '</div>' + epicHtml +
+      '<div class="milestone-card-top-right">' + epicHtml + (i.status ? '<span class="status-badge" style="' + statusStyle(i.status) + '">' + esc(i.status) + '</span>' : '') + '</div>' +
+    '</div>' +
     '<div class="summary">' + esc(i.summary) + '</div>' +
     '<div class="card-meta">' + lazyAssigneeSelectHtml(i) + dueDateHtml(i) + '</div>' +
+    '<div class="milestone-chain-meta">' +
+      '<span class="my-view-count upstream" title="All active upstream blockers">← ' + dashboardGraphTraversal(state.issues||[]).upstreamCount(i.key) + ' blockers</span>' +
+      '<span class="my-view-count downstream" title="All active downstream blocked tickets">Blocked ' + dashboardGraphTraversal(state.issues||[]).downstreamCount(i.key) + ' →</span>' +
+      '<button type="button" class="milestone-gantt-launch" data-gantt-milestone="' + esc(i.key) + '" data-stop-propagation="1" title="Open Gantt timeline for ' + esc(i.key) + '" aria-label="Open Gantt timeline for ' + esc(i.key) + '"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4v16M3 7h18M3 12h18M3 17h18"/><path d="M7 5v4h5V5M14 10v4h6v-4M8 15v4h8v-4"/></svg></button>' +
+    '</div>' +
   '</article>';
 }
 
@@ -5779,7 +5942,7 @@ function milestoneOverviewHtml(milestones){
       (milestones.length
         ? milestones.map(i => '<div class="milestone-item">' +
             '<div class="milestone-overview-card" data-milestone-card="' + esc(i.key) + '" data-milestone-chain="' + esc(i.key) + '">' + milestoneCardHtml(i) +
-              '<button type="button" class="milestone-gantt-launch" data-gantt-milestone="' + esc(i.key) + '" data-stop-propagation="1" title="Open Gantt timeline for ' + esc(i.key) + '" aria-label="Open Gantt timeline for ' + esc(i.key) + '"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4v16M3 7h18M3 12h18M3 17h18"/><path d="M7 5v4h5V5M14 10v4h6v-4M8 15v4h8v-4"/></svg></button></div>' +
+              '</div>' +
             blockerItems(i) +
           '</div>').join('')
         : '<div class="empty">No milestone tickets</div>') +
@@ -6141,6 +6304,11 @@ function render(){
       'circular':'Circular dependencies',
       'blocked-tickets':'Blocked tickets'
     };
+    const isDashboardTabReturn=String(state.dashboardReturnSection||'').startsWith('dashboard:');
+    if(isDashboardTabReturn){
+      const tabId=state.dashboardReturnSection.slice('dashboard:'.length);
+      dashboardBackLabels[state.dashboardReturnSection]=DASHBOARD_TABS.find(([id])=>id===tabId)?.[1]||'Project overview';
+    }
     const dashboardBack = !!state.dashboardReturnSection && !!dashboardBackLabels[state.dashboardReturnSection];
     milestoneBackBtn.classList.toggle('visible', !!backMilestone || dashboardBack);
     milestoneBackBtn.innerHTML = dashboardBack
@@ -7573,6 +7741,11 @@ document.getElementById('refresh').addEventListener('click', () => {
   load(true);
 });
 function goBackFromSelection(){
+  if(String(state.dashboardReturnSection||'').startsWith('dashboard:') && state.selectionHistory.length===0){
+    const tab=state.dashboardReturnSection.slice('dashboard:'.length);
+    state.dashboardReturnSection=null;state.dashboardTab=tab;state.showDashboard=true;
+    state.showMyView=false;state.lockedKey=null;state.showBlocked=false;render();return;
+  }
   if(state.dashboardReturnSection==='my-view' && state.selectionHistory.length===0){
     state.dashboardReturnSection=null;state.showMyView=true;state.lockedKey=null;state.showBlocked=false;render();return;
   }
@@ -7646,6 +7819,7 @@ milestoneBackBtn.addEventListener('click', () => {
     state.returnMilestoneKey=null;
     state.showMilestones=false;
     state.showDashboard=sectionId!=='my-view';
+    if(sectionId.startsWith('dashboard:')) state.dashboardTab=sectionId.slice('dashboard:'.length);
     state.showMyView=sectionId==='my-view';
     state.lockedKey=null;
     state.selectionHistory=[];
@@ -7653,7 +7827,7 @@ milestoneBackBtn.addEventListener('click', () => {
     state.milestoneFlashKey=null;
     render();
     requestAnimationFrame(()=>{
-      const target=document.getElementById(sectionId);
+      const target=document.getElementById(sectionId.startsWith('dashboard:')?'dashboard-table-area':sectionId);
       if(target) target.scrollIntoView({behavior:'smooth',block:'start'});
     });
     return;
