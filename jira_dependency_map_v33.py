@@ -1173,7 +1173,10 @@ def api_faqs():
             if not isinstance(item,dict): continue
             title=str(item.get("title") or "").strip()
             body=str(item.get("parsedContentBody") or "").strip()
-            if title or body: faqs.append({"title":title,"parsedContentBody":body})
+            categories=item.get("categories") or []
+            if not isinstance(categories,list): categories=[]
+            categories=[str(category).strip() for category in categories if isinstance(category,str) and category.strip()]
+            if title or body: faqs.append({"title":title,"parsedContentBody":body,"categories":categories})
         return jsonify({"items":faqs})
     except Exception as e:
         print(f"[FAQs] ERROR: {type(e).__name__}: {e}",flush=True)
@@ -1817,6 +1820,10 @@ body.gantt-open .ticket-preview-modal{z-index:25031}
 .faqs-header h2{font-size:14px;color:#0f172a}.faqs-search-wrap{padding:12px 14px;border-bottom:1px solid #e2e8f0;flex:0 0 auto}
 #faqs-search{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:7px;font:inherit;outline-color:#6366f1}
 #faqs-list{flex:1 1 auto;overflow:auto;padding:12px 14px;min-height:0}
+.faq-section{margin-bottom:20px}
+.faq-section:last-child{margin-bottom:0}
+.faq-section[hidden],.faq-item[hidden]{display:none}
+.faq-section-title{font-size:13px;font-weight:800;color:#475569;padding:7px 2px 10px;margin:0;line-height:1.4;border-bottom:1px solid #e2e8f0;margin-bottom:10px}
 .faq-item{border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;overflow:hidden}
 .faq-question{list-style:none;display:block;cursor:pointer;padding:13px 38px 13px 14px;font-weight:750;color:#172033;position:relative}
 .faq-question::-webkit-details-marker{display:none}.faq-question:after{content:'+';position:absolute;right:14px;top:10px;font-size:20px;color:#64748b}.faq-item[open] .faq-question:after{content:'−'}
@@ -3528,7 +3535,6 @@ async function showAllStartupMessages(){
 const faqsModal=document.getElementById('faqs-modal');
 const faqsList=document.getElementById('faqs-list');
 const faqsSearch=document.getElementById('faqs-search');
-let cachedFaqs=null;
 function highlightFaqText(root, query){
   // Restore the original text before applying the current query, then merge
   // adjacent text nodes. This avoids progressively fragmenting the DOM as the
@@ -3552,13 +3558,29 @@ function highlightFaqText(root, query){
     node.replaceWith(frag);
   });
 }
+// Sitebuilder category tags (e.g. "3 Milestones and Gantt") control the
+// heading order; FAQ titles (e.g. "13. How do I…?") control question order.
+// Leading numbers are metadata, not part of the displayed text.
+function parseFaqOrder(value, isCategory=false){
+  const text=String(value||'').trim();
+  const match=isCategory ? text.match(/^(\d+)\s+(.+)$/s) : text.match(/^(\d+)\s*[.)]\s*(.+)$/s);
+  return match ? {order:Number(match[1]),label:match[2].trim()} : {order:Number.POSITIVE_INFINITY,label:text};
+}
 function filterFaqs(){
-  const query=faqsSearch.value.trim();let visible=0;
-  [...faqsList.querySelectorAll('.faq-item')].forEach(item=>{
-    const text=(item.dataset.searchText||'').toLocaleLowerCase();const match=!query||text.includes(query.toLocaleLowerCase());
-    item.hidden=!match;if(!match)return;visible++;item.open=!!query;
-    highlightFaqText(item.querySelector('.faq-question'),query);
-    highlightFaqText(item.querySelector('.faq-answer'),query);
+  const query=faqsSearch.value.trim();const needle=query.toLocaleLowerCase();let visible=0;
+  faqsList.querySelectorAll('.faq-section').forEach(section=>{
+    let shownInSection=0;
+    section.querySelectorAll('.faq-item').forEach(item=>{
+      const match=!needle||(item.dataset.searchText||'').includes(needle);
+      item.hidden=!match;
+      if(match){visible++;shownInSection++;}
+      item.open=!!needle&&match;
+      highlightFaqText(item.querySelector('.faq-question'),query);
+      highlightFaqText(item.querySelector('.faq-answer'),query);
+    });
+    section.hidden=shownInSection===0;
+    // Section headings are for organisation only, not search matches.
+    highlightFaqText(section.querySelector('.faq-section-title'),'');
   });
   let empty=faqsList.querySelector('.faqs-no-results');
   if(!visible&&query){if(!empty){empty=document.createElement('div');empty.className='faqs-empty faqs-no-results';faqsList.appendChild(empty);}empty.textContent='No FAQs match your search.';}else if(empty)empty.remove();
@@ -3566,10 +3588,50 @@ function filterFaqs(){
 function renderFaqs(items){
   faqsList.innerHTML='';
   if(!items.length){faqsList.innerHTML='<div class="faqs-empty">No FAQs are currently available.</div>';return;}
-  items.forEach(item=>{const details=document.createElement('details');details.className='faq-item';const question=document.createElement('summary');question.className='faq-question';question.textContent=item.title||'Untitled question';const answer=document.createElement('div');answer.className='faq-answer';answer.innerHTML=item.parsedContentBody||'';details.dataset.searchText=(question.textContent+' '+answer.textContent).toLocaleLowerCase();details.append(question,answer);faqsList.appendChild(details);});
+  const groups=new Map();
+  items.forEach((item,index)=>{
+    const title=parseFaqOrder(item.title);
+    const categories=(Array.isArray(item.categories)?item.categories:[])
+      .map(category=>parseFaqOrder(category,true))
+      .filter(category=>category.label)
+      .sort((a,b)=>a.order-b.order||a.label.localeCompare(b.label));
+    // One primary section per question, even if Sitebuilder has multiple tags.
+    const category=categories[0]||{order:Number.POSITIVE_INFINITY,label:'Other questions'};
+    const id=category.order+'::'+category.label;
+    if(!groups.has(id))groups.set(id,{...category,items:[]});
+    groups.get(id).items.push({title,body:item.parsedContentBody||'',index});
+  });
+  const orderedGroups=[...groups.values()].sort((a,b)=>a.order-b.order||a.label.localeCompare(b.label));
+  orderedGroups.forEach((group,groupIndex)=>{
+    const section=document.createElement('section');section.className='faq-section';
+    const heading=document.createElement('h3');heading.className='faq-section-title';
+    heading.id='faq-section-heading-'+groupIndex;heading.textContent=group.label;
+    section.setAttribute('aria-labelledby',heading.id);section.appendChild(heading);
+    group.items.sort((a,b)=>a.title.order-b.title.order||a.title.label.localeCompare(b.title.label,undefined,{numeric:true})||a.index-b.index);
+    group.items.forEach(item=>{
+      const details=document.createElement('details');details.className='faq-item';
+      const question=document.createElement('summary');question.className='faq-question';
+      question.textContent=item.title.label||'Untitled question';
+      const answer=document.createElement('div');answer.className='faq-answer';answer.innerHTML=item.body;
+      // Match the FAQ's question and answer, not its category heading.
+      details.dataset.searchText=(question.textContent+' '+answer.textContent).toLocaleLowerCase();
+      details.append(question,answer);section.appendChild(details);
+    });
+    faqsList.appendChild(section);
+  });
   filterFaqs();
 }
-async function openFaqs(){faqsModal.classList.add('open');faqsSearch.value='';faqsList.innerHTML='<div class="faqs-empty">Loading FAQs…</div>';faqsSearch.focus();try{if(!cachedFaqs){const r=await fetch('/api/faqs?ts='+Date.now(),{cache:'no-store'});const data=await r.json();if(!r.ok||!Array.isArray(data.items))throw new Error(data.error||'Unable to load FAQs');cachedFaqs=data.items;}renderFaqs(cachedFaqs);}catch(e){faqsList.innerHTML='<div class="faqs-empty">FAQs could not be loaded. Please try again later.</div>';console.error('[FAQs] Load failed:',e);}}
+async function openFaqs(){
+  faqsModal.classList.add('open');faqsSearch.value='';
+  faqsList.innerHTML='<div class="faqs-empty">Loading FAQs…</div>';faqsSearch.focus();
+  try{
+    // Always request the latest FAQ entries when reopening the modal.
+    const r=await fetch('/api/faqs?ts='+Date.now(),{cache:'no-store'});
+    const data=await r.json();
+    if(!r.ok||!Array.isArray(data.items))throw new Error(data.error||'Unable to load FAQs');
+    renderFaqs(data.items);
+  }catch(e){faqsList.innerHTML='<div class="faqs-empty">FAQs could not be loaded. Please try again later.</div>';console.error('[FAQs] Load failed:',e);}
+}
 document.getElementById('faqs-open').addEventListener('click',openFaqs);
 document.getElementById('faqs-close').addEventListener('click',()=>faqsModal.classList.remove('open'));
 faqsModal.addEventListener('click',e=>{if(e.target===faqsModal)faqsModal.classList.remove('open');});
