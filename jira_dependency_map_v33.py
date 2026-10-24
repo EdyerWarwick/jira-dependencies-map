@@ -1504,6 +1504,7 @@ def _gantt_pdf_bytes(payload):
         color=raw_color if re.fullmatch(r'#[0-9a-fA-F]{6}',raw_color) else '#64748b'
         rows.append({'key':key,'summary':str(item.get('summary') or '')[:300],
                      'status':str(item.get('status') or '')[:60],
+                     'assignee':str(item.get('assignee') or 'Unassigned')[:140],
                      'start':start,'end':end,'color':color,
                      'source':str(item.get('source') or '')[:70],
                      'reason':str(item.get('reason') or '')[:140],
@@ -1555,6 +1556,25 @@ def _gantt_pdf_bytes(payload):
         return f'{poscolor(c)} RG {width:.2f} w {x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S\n'
     def diamond(cx,cy,r,c):
         return f'{poscolor(c)} rg {cx:.2f} {cy+r:.2f} m {cx+r:.2f} {cy:.2f} l {cx:.2f} {cy-r:.2f} l {cx-r:.2f} {cy:.2f} l h f\n'
+    def assignee_badge(cx,cy,assignee):
+        name=str(assignee or '').strip()
+        unassigned=not name or name.casefold()=='unassigned'
+        parts=name.split()
+        initials='U' if unassigned else (parts[0][:1]+parts[-1][:1] if len(parts)>1 else parts[0][:1]).upper()
+        fill='#2563eb' if unassigned else '#e2e8f0'
+        foreground='#ffffff' if unassigned else '#334155'
+        r=7.3
+        # Four Bezier curves yield a circular badge, including in narrow mode.
+        k=.55228475*r
+        circle=(f'{poscolor(fill)} rg '
+                f'{cx+r:.2f} {cy:.2f} m '
+                f'{cx+r:.2f} {cy+k:.2f} {cx+k:.2f} {cy+r:.2f} {cx:.2f} {cy+r:.2f} c '
+                f'{cx-k:.2f} {cy+r:.2f} {cx-r:.2f} {cy+k:.2f} {cx-r:.2f} {cy:.2f} c '
+                f'{cx-r:.2f} {cy-k:.2f} {cx-k:.2f} {cy-r:.2f} {cx:.2f} {cy-r:.2f} c '
+                f'{cx+k:.2f} {cy-r:.2f} {cx+r:.2f} {cy-k:.2f} {cx+r:.2f} {cy:.2f} c f\n')
+        size=6.5
+        # Approximate the glyph width to centre both one- and two-letter badges.
+        return circle+txt(cx-len(initials)*size*.34,cy-size*.34,initials,size,True,foreground,2)
     content=[]
     total_pages=len(page_specs)
     all_edges={(str(e.get('from')),str(e.get('to'))) for e in links if isinstance(e,dict)}
@@ -1573,7 +1593,7 @@ def _gantt_pdf_bytes(payload):
         if mode=='timeline':
             cmds.append(txt(margin,page_h-162,'Timeline: '+begin.strftime('%d %b %Y')+' - '+finish.strftime('%d %b %Y')+f'  (date segment {part}/{slices})',10,True))
         else:
-            cmds.append(txt(margin,page_h-162,('Milestones without a due date' if is_overview else 'Unscheduled tasks  |  Missing due date, usable start date or invalid date range'),10,True))
+            cmds.append(txt(margin,page_h-162,('Milestones without valid start and due dates' if is_overview else 'Unscheduled tasks  |  Missing due date, usable start date or invalid date range'),10,True))
         cmds.append(rect(margin,table_top+15,left_w,32,'#f1f5f9'))
         cmds.append(txt(margin+8,table_top+26,'ISSUE / SUMMARY'+(' (NARROW)' if narrow else ''),10,True))
         if mode=='timeline':
@@ -1605,22 +1625,27 @@ def _gantt_pdf_bytes(payload):
             row_centers[r['key']]=cy
             if idx%2==1: cmds.append(rect(margin,y,page_w-2*margin,row_h,'#f8fafc'))
             cmds.append(line(margin,y,page_w-margin,y,'#e2e8f0',.45))
+            cmds.append(assignee_badge(margin+left_w-16,cy,r['assignee']))
             key_label=r['key']+(('  [Milestone]' if is_milestone else '  [Selected]') if r['milestone'] and not is_overview else '')
             if narrow:
                 one_line=key_label+'  |  '+r['summary']
-                cmds.append(txt(margin+8,cy-3,fit_label(one_line,left_w-16,9,False),9,False,'#172033'))
+                cmds.append(txt(margin+8,cy-3,fit_label(one_line,left_w-43,9,False),9,False,'#172033'))
             else:
-                cmds.append(txt(margin+8,y+17,fit_label(key_label+'  |  '+r['status'],left_w-16,9,True),9,True,'#172033'))
-                cmds.append(txt(margin+8,y+5,fit_label(r['summary'],left_w-16,8),8,False,'#64748b'))
+                heading=(key_label+'  |  '+r['start'].strftime('%d %b %y')+' - '+r['end'].strftime('%d %b %y')) if is_overview and mode=='timeline' else key_label+'  |  '+r['status']
+                cmds.append(txt(margin+8,y+17,fit_label(heading,left_w-43,9,True),9,True,'#172033'))
+                cmds.append(txt(margin+8,y+5,fit_label(r['summary'],left_w-43,8),8,False,'#64748b'))
             if mode=='timeline':
                 a=max(r['start'],begin); b=min(r['end'],finish)
                 if b>=a:
                     x=chart_left+((a-begin).days)*day_w+1
                     length=max(3,((b-a).days+1)*day_w-2)
-                    if r['milestone']:
-                        marker=r['end'] if begin<=r['end']<=finish else a
-                        mx=chart_left+((marker-begin).days+.5)*day_w
-                        cmds.append(diamond(mx,cy,6.5,'#b45309'))
+                    if r['milestone'] and not is_overview:
+                        # A milestone is a dated diamond at its due date, not
+                        # a bar that spans its start and end. Only render the
+                        # marker in the PDF date slice containing its due date.
+                        if begin<=r['end']<=finish:
+                            mx=chart_left+((r['end']-begin).days+.5)*day_w
+                            cmds.append(diamond(mx,cy,6.5,'#b45309'))
                     else:
                         cmds.append(rect(x,cy-5,length,10,r['color']))
                 if r['start']<begin or r['end']>finish:
@@ -1637,20 +1662,35 @@ def _gantt_pdf_bytes(payload):
             for parent,child in all_edges:
                 if parent not in visible or child not in visible: continue
                 a,b=visible[parent],visible[child]
-                # Draw connectors across rows only when both endpoints lie in this date segment.
-                if not(begin<=a['end']<=finish and begin<=b['start']<=finish):continue
-                x1=chart_left+((a['end']-begin).days+.5)*day_w
-                x2=chart_left+((b['start']-begin).days+.5)*day_w
+                # A visible milestone diamond takes incoming arrows at its
+                # left tip (its due date), rather than at the nominal task
+                # start. All other targets use the start of their task bar.
+                target_diamond=b['milestone'] and not is_overview
+                target_date=b['end'] if target_diamond else b['start']
+                # In multipage exports, only draw the link in a date segment
+                # containing both *visible* endpoints.
+                if not(begin<=a['end']<=finish and begin<=target_date<=finish):continue
+                x1=chart_left+((a['end']-begin).days+1)*day_w-1
+                if a['milestone'] and not is_overview:
+                    x1=chart_left+((a['end']-begin).days+.5)*day_w+6.5
+                x2=(chart_left+((target_date-begin).days+.5)*day_w-6.5 if target_diamond
+                    else chart_left+((target_date-begin).days)*day_w+1)
                 y1,y2=row_centers[parent],row_centers[child]
-                joint=x1+min(9,max(4,(x2-x1)/2)) if x2>x1 else x1+7
-                cmds.append(line(x1,y1,joint,y1,'#94a3b8',.8))
-                cmds.append(line(joint,y1,joint,y2,'#94a3b8',.8))
-                cmds.append(line(joint,y2,x2-2,y2,'#94a3b8',.8))
-                cmds.append(f'{poscolor("#64748b")} rg {x2:.2f} {y2:.2f} m {x2-5:.2f} {y2+2.5:.2f} l {x2-5:.2f} {y2-2.5:.2f} l h f\n')
+                if x2>x1+14:
+                    mid=(x1+x2)/2
+                    coords=[(x1,y1),(mid,y1),(mid,y2),(x2,y2)]
+                else:
+                    midy=(y1+y2)/2
+                    coords=[(x1,y1),(x1+7,y1),(x1+7,midy),
+                            (max(chart_left+1,x2-7),midy),
+                            (max(chart_left+1,x2-7),y2),(x2,y2)]
+                for (px,py),(qx,qy) in zip(coords,coords[1:]):
+                    cmds.append(line(px,py,qx,qy,'#94a3b8',.8))
+                cmds.append(f'{poscolor("#64748b")} rg {x2:.2f} {y2:.2f} m {x2-4.5:.2f} {y2+2.3:.2f} l {x2-4.5:.2f} {y2-2.3:.2f} l h f\n')
         cmds.append(line(margin,table_bottom,page_w-margin,table_bottom))
         if is_overview:
-            cmds.append(txt(margin,55,'Each diamond marks a milestone due date in Jira; no blocker tasks are included.',9,False,'#64748b'))
-            cmds.append(txt(margin,38,'Undated milestones appear separately. Only direct milestone dependencies are shown.',9,False,'#64748b'))
+            cmds.append(txt(margin,55,'Bars span the milestone start and due dates; blocker tasks are not included.',9,False,'#64748b'))
+            cmds.append(txt(margin,38,'Start: Jira start > first blocker after prior milestone > creation.',9,False,'#64748b'))
         else:
             cmds.append(txt(margin,55,'Start source: Jira start date > latest direct blocker due date + 1 day > Jira creation date.',9,False,'#64748b'))
             cmds.append(txt(margin,38,'PDF includes the upstream dependency chain; tasks without complete dates are listed separately.',9,False,'#64748b'))
@@ -1814,9 +1854,13 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 #board.milestone-board{display:block;width:max-content;min-width:100%;height:100%;max-height:100%;min-height:0;padding:18px 28px 14px;}
 #board.milestone-board #lines{display:none!important}
 .milestone-overview{width:max-content;min-width:100%;height:100%;min-height:0;padding:0;display:flex;flex-direction:column;gap:12px}
+/* The milestone cards form a very wide, horizontally scrolling board.
+   Anchor the header to the scrollport (not the far-right card) so its actions
+   remain on the visible right edge at every horizontal scroll position. */
+#app.milestone-mode .milestone-overview-header{position:sticky;left:28px;z-index:20;width:calc(100vw - 56px);max-width:calc(100vw - 56px);box-sizing:border-box;flex:0 0 auto;background:var(--bg)}
 .milestone-overview-header{display:flex;align-items:center;justify-content:space-between;padding:0 2px}
 .milestone-overview-title{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted)}
-.milestone-overview-tools{display:flex;align-items:center;gap:10px}
+.milestone-overview-tools{position:sticky;right:0;z-index:21;display:flex;align-items:center;gap:10px;flex:0 0 auto;margin-left:auto;background:var(--bg)}
 .milestone-project-gantt{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border-radius:7px;border:1px solid #818cf8;background:#eef2ff;color:#3730a3;font-size:11px;font-weight:800;cursor:pointer}
 .milestone-project-gantt:hover,.milestone-project-gantt:focus-visible{background:#e0e7ff}
 .milestone-project-gantt:disabled{opacity:.5;cursor:default}
@@ -2772,23 +2816,27 @@ body.gantt-open{overflow:hidden}
 .gantt-timeline-heading{display:flex;position:sticky;top:0;z-index:12;background:#e2e8f0;border-bottom:1px solid #cbd5e1}
 .gantt-heading-label{position:sticky;left:0;z-index:14;flex:0 0 var(--gantt-left);width:var(--gantt-left);display:flex;flex-direction:column;justify-content:center;padding:9px 12px;font-size:11px;font-weight:850;color:#334155;background:#e2e8f0;border-right:1px solid #cbd5e1}
 .gantt-heading-label small{font-size:10px;font-weight:500;color:#64748b}
-.gantt-heading-scale{position:relative;flex:0 0 auto;background:linear-gradient(#dbeafe,#eff6ff)}
-.gantt-month-label{position:absolute;top:7px;white-space:nowrap;font-size:11px;font-weight:800;color:#1e40af;border-left:1px solid #93c5fd;padding-left:5px}
+.gantt-heading-scale{position:relative;flex:0 0 auto;background:linear-gradient(#dbeafe,#eff6ff);overflow: hidden;}
+.gantt-month-label{background-color: #e1edfe;position:absolute;top:7px;white-space:nowrap;font-size:11px;font-weight:800;color:#1e40af;border-left:1px solid #93c5fd;padding-left:5px}
 .gantt-day-label{position:absolute;top:32px;transform:translateX(-50%);text-align:center;font-size:9px;line-height:14px;color:#475569;white-space:nowrap;pointer-events:none;user-select:none}
 .gantt-task-area{position:relative}
 .gantt-task-row{position:relative;display:flex;min-height:66px;border-bottom:1px solid #e2e8f0}
 .gantt-task-row:nth-of-type(even){background:#f8fafc}
-.gantt-task-label{position:sticky;left:0;z-index:11;box-sizing:border-box;width:var(--gantt-left);flex:0 0 var(--gantt-left);background:inherit;border-right:1px solid #cbd5e1;padding:6px 12px;white-space:normal;overflow-wrap:anywhere;font-size:11px;line-height:15px}
+.gantt-task-label{position:sticky;left:0;z-index:11;box-sizing:border-box;width:var(--gantt-left);flex:0 0 var(--gantt-left);display:flex;align-items:center;gap:10px;background:inherit;border-right:1px solid #cbd5e1;padding:6px 12px;white-space:normal;overflow-wrap:anywhere;font-size:11px;line-height:15px}
+.gantt-task-info{flex:1 1 auto;min-width:0}
+.gantt-assignee{display:flex;align-items:center;justify-content:center;align-self:center;flex:0 0 26px;width:26px;height:26px;box-sizing:border-box;border-radius:50%;background:#e2e8f0;color:#334155;border:1px solid #cbd5e1;font-size:10px;font-weight:800;line-height:1;white-space:nowrap;letter-spacing:-.2px}
+.gantt-assignee.unassigned{background:#2563eb;border-color:#1d4ed8;color:#fff}
 .gantt-task-row:nth-of-type(even) .gantt-task-label{background:#f8fafc}
 .gantt-task-row:nth-of-type(odd) .gantt-task-label{background:#fff}
-.gantt-task-label>a{color:#4338ca;font-weight:800;text-decoration:none}
-.gantt-task-label>a:hover{text-decoration:underline}
+.gantt-task-info>a{color:#4338ca;font-weight:800;text-decoration:none}
+.gantt-task-info>a:hover{text-decoration:underline}
 .gantt-task-summary{display:block;white-space:normal;overflow-wrap:anywhere;color:#475569;margin:2px 0}
  .gantt-task-dates{display:block;color:#64748b;font-size:9px;white-space:normal;overflow-wrap:anywhere}
 /* Narrow: a single-line key and summary, with less horizontal label space. */
 .gantt-canvas.gantt-narrow .gantt-task-row{min-height:34px}
-.gantt-canvas.gantt-narrow .gantt-task-label{display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden;min-width:0}
-.gantt-canvas.gantt-narrow .gantt-task-label>a,.gantt-canvas.gantt-narrow .gantt-milestone-tag{flex:0 0 auto}
+.gantt-canvas.gantt-narrow .gantt-task-label{white-space:nowrap;overflow:hidden;min-width:0}
+.gantt-canvas.gantt-narrow .gantt-task-info{display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden}
+.gantt-canvas.gantt-narrow .gantt-task-info>a,.gantt-canvas.gantt-narrow .gantt-milestone-tag{flex:0 0 auto}
 .gantt-canvas.gantt-narrow .gantt-task-summary{min-width:0;flex:1;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:0;overflow-wrap:normal}
 .gantt-canvas.gantt-narrow .gantt-task-dates,.gantt-canvas.gantt-narrow .gantt-heading-label small{display:none}
 /* Pointer-events stay off: hovering the timeline must not stop ticket links or bar tooltips. */
@@ -3172,7 +3220,7 @@ body.gantt-open{overflow:hidden}
       <div class="gantt-header-main"><div class="gantt-eyebrow">Milestone timeline</div><h2 id="gantt-title"></h2><div id="gantt-counts" class="gantt-counts"></div></div>
       <div class="gantt-actions"><span id="gantt-export-status" class="gantt-export-status" role="status" aria-live="polite"></span><button type="button" class="gantt-action gantt-export" id="gantt-export">↓ Download PDF</button><button type="button" class="gantt-action" id="gantt-close">Close ×</button></div>
     </div>
-    <div class="gantt-toolbar"><div class="gantt-scale-buttons" role="group" aria-label="Timeline zoom"><button type="button" class="gantt-scale" data-gantt-scale="6">Compact</button><button type="button" class="gantt-scale active" data-gantt-scale="12">Normal</button><button type="button" class="gantt-scale" data-gantt-scale="20">Expanded</button></div><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-show-dependencies" checked> Show dependencies</label><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-narrow"> Narrow</label><div class="gantt-legend"><span id="gantt-legend-active"><b style="background:#2563eb"></b>In progress</span><span id="gantt-legend-completed"><b style="background:#16a34a"></b>Completed</span><span id="gantt-legend-remarkable"><b style="background:#d97706"></b>With Remarkable</span><span><i class="gantt-legend-milestone"></i>Milestone</span><span id="gantt-legend-dependencies">→ Dependencies</span><span style="color:#ef4444">│ Today</span></div></div>
+    <div class="gantt-toolbar"><div class="gantt-scale-buttons" role="group" aria-label="Timeline zoom"><button type="button" class="gantt-scale" data-gantt-scale="6">Compact</button><button type="button" class="gantt-scale active" data-gantt-scale="12">Normal</button><button type="button" class="gantt-scale" data-gantt-scale="20">Expanded</button></div><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-show-dependencies" checked> Show dependencies</label><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-narrow"> Narrow</label><div class="gantt-legend"><span id="gantt-legend-active"><b style="background:#2563eb"></b>In progress</span><span id="gantt-legend-completed"><b style="background:#16a34a"></b>Completed</span><span id="gantt-legend-remarkable"><b style="background:#d97706"></b>With Remarkable</span><span id="gantt-legend-milestone"><i class="gantt-legend-milestone"></i>Milestone</span><span id="gantt-legend-dependencies">→ Dependencies</span><span style="color:#ef4444">│ Today</span></div></div>
     <div id="gantt-chart" class="gantt-chart-wrap" aria-label="Milestone Gantt timeline"></div>
     <div id="gantt-unscheduled" class="gantt-unscheduled"></div>
   </section>
@@ -8214,6 +8262,20 @@ function ganttIssueColour(status){
   if(value.includes('progress')||value.includes('doing')||value.includes('active')||value.includes('development'))return '#2563eb';
   return '#64748b';
 }
+// Share one date policy between individual-task and all-milestones Gantts.
+// Direct blockers can supply a start when Jira has no explicit start date;
+// they need not be included as visible rows in the all-milestones chart.
+function ganttScheduleForIssue(i,edges,byKey){
+  const jiraStart=ganttDate(i.startDate);
+  const created=ganttDate(i.created);
+  const blockerDue=edges.filter(e=>e.to===i.key).map(e=>ganttDate(byKey.get(e.from)?.dueDate)).filter(n=>n!==null);
+  const lastBlocker=blockerDue.length?Math.max(...blockerDue):null;
+  const start=jiraStart!==null?jiraStart:lastBlocker!==null?lastBlocker+GANTT_DAY_MS:created;
+  const end=ganttDate(i.dueDate);
+  const source=jiraStart!==null?'Jira start date':lastBlocker!==null?'Latest blocker due + 1 day':created!==null?'Jira creation date':'Missing start date';
+  const reason=end===null?'No due date':start===null?'No start or creation date':start>end?'Start falls after due date':'';
+  return {source,start:start===null?null:ganttDateKey(start),end:end===null?null:ganttDateKey(end),reason};
+}
 function buildMilestoneGantt(milestoneKey){
   const milestone=state.displayByKey?.get(milestoneKey) || state.displayIssues.find(i=>i.key===milestoneKey);
   if(!milestone)return null;
@@ -8223,22 +8285,66 @@ function buildMilestoneGantt(milestoneKey){
   const edges=state.displayEdges.filter(e=>keys.has(e.from)&&keys.has(e.to));
   const byKey=new Map(all.map(i=>[i.key,i]));
   const rows=all.map(i=>{
-    const jiraStart=ganttDate(i.startDate);
-    const created=ganttDate(i.created);
-    const blockerDue=edges.filter(e=>e.to===i.key).map(e=>ganttDate(byKey.get(e.from)?.dueDate)).filter(n=>n!==null);
-    const lastBlocker=blockerDue.length?Math.max(...blockerDue):null;
-    const start=jiraStart!==null?jiraStart:lastBlocker!==null?lastBlocker+GANTT_DAY_MS:created;
-    const end=ganttDate(i.dueDate);
-    const source=jiraStart!==null?'Jira start date':lastBlocker!==null?'Latest blocker due + 1 day':created!==null?'Jira creation date':'Missing start date';
-    const reason=end===null?'No due date':start===null?'No start or creation date':start>end?'Start falls after due date':'';
-    return {key:i.key,summary:i.summary||'',status:i.status||'',assignee:i.assignee||'Unassigned',
-      milestone:i.key===milestoneKey,source,start:start===null?null:ganttDateKey(start),
-      end:end===null?null:ganttDateKey(end),reason,color:ganttIssueColour(i.status),level:i.chainLevel||0};
+    const schedule=ganttScheduleForIssue(i,edges,byKey);
+    return {key:i.key,summary:i.summary||'',status:i.status||'',assignee:i.assignee||'Unassigned',assigneeAccountId:i.assigneeAccountId||null,
+      milestone:i.key===milestoneKey,...schedule,color:ganttIssueColour(i.status),level:i.chainLevel||0};
   });
   const scheduled=rows.filter(r=>!r.reason&&r.start&&r.end);
   const unscheduled=rows.filter(r=>r.reason||!r.start||!r.end);
   const isMilestone=(milestone.labels||[]).some(label=>String(label).toLowerCase()==='milestone');
   return {milestone:{key:milestone.key,summary:milestone.summary||'',isMilestone},isMilestone,rows,scheduled,unscheduled,edges};
+}
+// In the project plan, each milestone bar covers the work since the nearest
+// preceding milestone(s), not just the milestone's direct blockers. Only this
+// overview uses chain-based dates; individual task/milestone Gantts retain
+// ganttScheduleForIssue's existing scheduling policy.
+function ganttProjectMilestoneSchedule(issue,incoming,byKey){
+  // An explicit Jira start date always wins, even when the chain begins earlier.
+  const fallback=ganttScheduleForIssue(issue,[],byKey);
+  if(ganttDate(issue.startDate)!==null)return fallback;
+
+  const visited=new Set([issue.key]);
+  const tasks=new Set();
+  const queue=[issue.key];
+  for(let idx=0;idx<queue.length;idx++){
+    for(const link of (incoming.get(queue[idx])||[])){
+      const blocker=byKey.get(link.from);
+      if(!blocker||visited.has(blocker.key))continue;
+      visited.add(blocker.key);
+      if((blocker.labels||[]).some(label=>String(label).toLowerCase()==='milestone')){
+        // Stop at this milestone: tasks before it belong to an earlier stage.
+      }else{
+        tasks.add(blocker.key);
+        queue.push(blocker.key);
+      }
+    }
+  }
+
+  // Find the first task on each branch *after* its preceding milestone.
+  // The earliest start across parallel branches is the start of this stage.
+  const roots=[...tasks].filter(key=>
+    !(incoming.get(key)||[]).some(link=>tasks.has(link.from)));
+  // Cyclic chains may have no roots; use their tasks as a safe fallback.
+  const firstTasks=roots.length?roots:[...tasks];
+  let earliest=null;
+  for(const key of firstTasks){
+    const task=byKey.get(key);
+    const schedule=ganttScheduleForIssue(task,incoming.get(key)||[],byKey);
+    const start=ganttDate(schedule.start);
+    if(start!==null&&(!earliest||start<earliest.start||(start===earliest.start&&key<earliest.key))){
+      earliest={key,start,source:schedule.source};
+    }
+  }
+
+  let start=fallback.start;
+  let source=fallback.source;
+  if(earliest){
+    start=ganttDateKey(earliest.start);
+    source='First blocker '+earliest.key+' · '+earliest.source;
+  }
+  const startMs=ganttDate(start),endMs=ganttDate(issue.dueDate);
+  const reason=endMs===null?'No due date':startMs===null?'No start or creation date':startMs>endMs?'Start falls after due date':'';
+  return {start,end:endMs===null?null:ganttDateKey(endMs),source,reason};
 }
 function buildAllMilestonesGantt(){
   // Use precisely the same visible milestone population as the milestone view;
@@ -8247,20 +8353,32 @@ function buildAllMilestonesGantt(){
     .filter(i=>(i.labels||[]).some(label=>String(label).toLowerCase()==='milestone'))
     .sort((a,b)=>(a.dueDate||'9999-12-31').localeCompare(b.dueDate||'9999-12-31')||a.key.localeCompare(b.key));
   const keys=new Set(milestones.map(i=>i.key));
+  const byKey=new Map(state.displayIssues.map(i=>[i.key,i]));
+  const dateEdges=state.displayEdges.filter(e=>byKey.has(e.from)&&byKey.has(e.to));
+  const incoming=new Map([...byKey.keys()].map(key=>[key,[]]));
+  dateEdges.forEach(e=>incoming.get(e.to).push(e));
   const rows=milestones.map(i=>{
-    const due=ganttDate(i.dueDate);
-    const date=due===null?null:ganttDateKey(due);
-    return {key:i.key,summary:i.summary||'',status:i.status||'',assignee:i.assignee||'Unassigned',
-      milestone:true,source:'Jira milestone due date',start:date,end:date,
-      reason:date?'':'No milestone due date',color:ganttIssueColour(i.status),level:0};
+    const schedule=ganttProjectMilestoneSchedule(i,incoming,byKey);
+    return {key:i.key,summary:i.summary||'',status:i.status||'',assignee:i.assignee||'Unassigned',assigneeAccountId:i.assigneeAccountId||null,
+      milestone:true,...schedule,color:ganttIssueColour(i.status),level:0};
   });
   return {milestone:{key:'ALL-MILESTONES',summary:'All project milestones',isMilestone:true,isOverview:true},
     isMilestone:true,isOverview:true,rows,
     scheduled:rows.filter(r=>!r.reason),unscheduled:rows.filter(r=>r.reason),
     edges:state.displayEdges.filter(e=>keys.has(e.from)&&keys.has(e.to))};
 }
+// A compact, centred badge is used by every scheduled Gantt label.
+// "Unassigned" is blue to distinguish tickets that need an owner.
+function ganttAssigneeHtml(r){
+  const name=String(r.assignee||'').trim();
+  const unassigned=!name||name.toLowerCase()==='unassigned';
+  const parts=name.split(/\s+/).filter(Boolean);
+  const initials=unassigned?'U':(parts.length>1?parts[0].charAt(0)+parts[parts.length-1].charAt(0):parts[0].charAt(0)).toUpperCase();
+  const label=unassigned?'Unassigned':'Assigned to '+name;
+  return '<span class="gantt-assignee'+(unassigned?' unassigned':'')+'" title="'+esc(label)+'" aria-label="'+esc(label)+'">'+esc(initials)+'</span>';
+}
 function ganttBarTooltip(r){
-  if(ganttCurrent?.isOverview)return r.key+' — '+r.summary+'\nStatus: '+(r.status||'Unspecified')+'\nMilestone due: '+ganttDateLabel(ganttDate(r.end));
+  if(ganttCurrent?.isOverview)return r.key+' — '+r.summary+'\nStatus: '+(r.status||'Unspecified')+'\nStart: '+ganttDateLabel(ganttDate(r.start))+' ('+r.source+')'+'\nDue: '+ganttDateLabel(ganttDate(r.end));
   return r.key+' — '+r.summary+'\nStatus: '+(r.status||'Unspecified')+'\nStart: '+ganttDateLabel(ganttDate(r.start))+' ('+r.source+')\nDue: '+ganttDateLabel(ganttDate(r.end));
 }
 function updateGanttControls(){
@@ -8275,11 +8393,13 @@ function updateGanttControls(){
   const narrowToggle=document.getElementById('gantt-narrow');
   if(narrowToggle)narrowToggle.checked=state.ganttNarrow===true;
   const completedLegend=document.getElementById('gantt-legend-completed');
-  if(completedLegend) completedLegend.hidden=!state.showCompleted||ganttCurrent?.isOverview===true;
+  if(completedLegend) completedLegend.hidden=!state.showCompleted;
   const activeLegend=document.getElementById('gantt-legend-active');
-  if(activeLegend)activeLegend.hidden=ganttCurrent?.isOverview===true;
+  if(activeLegend)activeLegend.hidden=false;
   const remarkableLegend=document.getElementById('gantt-legend-remarkable');
-  if(remarkableLegend)remarkableLegend.hidden=ganttCurrent?.isOverview===true;
+  if(remarkableLegend)remarkableLegend.hidden=false;
+  const milestoneLegend=document.getElementById('gantt-legend-milestone');
+  if(milestoneLegend)milestoneLegend.hidden=ganttCurrent?.isOverview===true;
   const dependencyLegend=document.getElementById('gantt-legend-dependencies');
   if(dependencyLegend) dependencyLegend.hidden=state.ganttShowDependencies===false||!ganttCurrent?.edges.length;
 }
@@ -8294,11 +8414,20 @@ function renderGanttChart(){
     (state.showCompleted?'including':'excluding')+' completed';
   const maxDate=rows.length?Math.max(...rows.map(r=>ganttDate(r.end))):null;
   const minDate=rows.length?Math.min(...rows.map(r=>ganttDate(r.start))):null;
+  const today=ganttDate(localDateKey(new Date()));
+  const labelWidth=state.ganttNarrow===true?300:420,headHeight=64;
+  // Today is always on the timeline, even when the project is entirely in
+  // the past or future. Leave enough calendar before and after it for the
+  // initial scroll to place the red line comfortably inside the viewport.
+  const calendarViewport=Math.max(120,chart.clientWidth-labelWidth);
+  const todayGap=Math.min(190,Math.max(60,Math.floor(calendarViewport*.23)));
   const padDays=3;
-  const origin=minDate===null?ganttDate(localDateKey(new Date())):minDate-padDays*GANTT_DAY_MS;
-  const final=maxDate===null?origin+30*GANTT_DAY_MS:maxDate+padDays*GANTT_DAY_MS;
+  const beforeToday=Math.ceil(todayGap/ganttDayWidth)+padDays;
+  const afterToday=Math.ceil(Math.max(0,calendarViewport-todayGap)/ganttDayWidth)+padDays;
+  const origin=Math.min(minDate===null?today:minDate-padDays*GANTT_DAY_MS,today-beforeToday*GANTT_DAY_MS);
+  const final=Math.max(maxDate===null?today:maxDate+padDays*GANTT_DAY_MS,today+afterToday*GANTT_DAY_MS);
   const days=Math.ceil((final-origin)/GANTT_DAY_MS)+1;
-  const labelWidth=state.ganttNarrow===true?300:420,headHeight=64,timelineWidth=days*ganttDayWidth;
+  const timelineWidth=days*ganttDayWidth;
   const totalWidth=labelWidth+timelineWidth;
   const monthHead=[],dayHead=[],weeks=[];
   let lastMonth='';
@@ -8316,24 +8445,23 @@ function renderGanttChart(){
       dayHead.push('<span class="gantt-day-label" style="left:'+((day+.5)*ganttDayWidth)+'px">'+dt.getUTCDate()+'</span>');
     }
   }
-  const today=ganttDate(localDateKey(new Date()));
-  const todayLeft=today>=origin&&today<=final?(today-origin)/GANTT_DAY_MS*ganttDayWidth:null;
-  const todayMarkup=todayLeft!==null?'<div class="gantt-today" style="left:'+(labelWidth+todayLeft)+'px" title="Today"></div>':'';
+  const todayLeft=(today-origin)/GANTT_DAY_MS*ganttDayWidth;
+  const todayMarkup='<div class="gantt-today" style="left:'+(labelWidth+todayLeft)+'px" title="Today"></div>';
   const rowMarkup=rows.map(r=>{
     const from=(ganttDate(r.start)-origin)/GANTT_DAY_MS*ganttDayWidth;
     const length=((ganttDate(r.end)-ganttDate(r.start))/GANTT_DAY_MS+1)*ganttDayWidth;
-    const bar=r.milestone?'<span class="gantt-diamond" style="left:'+(from+length-ganttDayWidth/2)+'px;background:#b45309" title="'+esc(ganttBarTooltip(r))+'"></span>':
+    const bar=r.milestone&&!d.isOverview?'<span class="gantt-diamond" style="left:'+(from+length-ganttDayWidth/2)+'px;background:#b45309" title="'+esc(ganttBarTooltip(r))+'"></span>':
       '<span class="gantt-bar" style="left:'+from+'px;width:'+Math.max(5,length-2)+'px;background:'+r.color+'" title="'+esc(ganttBarTooltip(r))+'"></span>';
     return '<div class="gantt-task-row">'+
-      '<div class="gantt-task-label"><a href="'+esc(CFG.jiraBaseUrl+'/browse/'+r.key)+'" target="_blank" rel="noopener noreferrer" data-issue-key="'+esc(r.key)+'">'+esc(r.key)+'</a>'+
+      '<div class="gantt-task-label"><div class="gantt-task-info"><a href="'+esc(CFG.jiraBaseUrl+'/browse/'+r.key)+'" target="_blank" rel="noopener noreferrer" data-issue-key="'+esc(r.key)+'">'+esc(r.key)+'</a>'+
       (r.milestone&&!d.isOverview?'<span class="gantt-milestone-tag">'+(d.isMilestone?'MILESTONE':'SELECTED')+'</span>':'')+
       '<span class="gantt-task-summary" title="'+esc(r.summary)+'">'+esc(r.summary)+'</span>'+
-      '<span class="gantt-task-dates">'+(d.isOverview?'Milestone due: '+esc(ganttDateLabel(ganttDate(r.end))):esc(ganttDateLabel(ganttDate(r.start)))+' – '+esc(ganttDateLabel(ganttDate(r.end)))+' · '+esc(r.source))+'</span></div>'+
+      '<span class="gantt-task-dates">'+esc(ganttDateLabel(ganttDate(r.start)))+' – '+esc(ganttDateLabel(ganttDate(r.end)))+' · '+esc(r.source)+'</span></div>'+ganttAssigneeHtml(r)+'</div>'+
       '<div class="gantt-task-track" style="width:'+timelineWidth+'px">'+bar+'</div></div>';
   }).join('');
-  chart.innerHTML='<div class="gantt-canvas'+(state.ganttNarrow===true?' gantt-narrow':'')+'" data-origin="'+origin+'" data-days="'+days+'" data-label-width="'+labelWidth+'" style="width:'+totalWidth+'px;--gantt-left:'+labelWidth+'px">'+
+  chart.innerHTML='<div class="gantt-canvas'+(state.ganttNarrow===true?' gantt-narrow':'')+'" data-origin="'+origin+'" data-days="'+days+'" data-label-width="'+labelWidth+'" data-today-left="'+todayLeft+'" style="width:'+totalWidth+'px;--gantt-left:'+labelWidth+'px">'+
     '<div class="gantt-timeline-heading" style="height:'+headHeight+'px">'+
-      '<div class="gantt-heading-label">'+(d.isOverview?'MILESTONE / PROJECT PLAN':'ISSUE / TASK')+' <small>'+(d.isOverview?'Target due date':'Start · Due · Calculation')+'</small></div>'+
+      '<div class="gantt-heading-label">'+(d.isOverview?'MILESTONE / PROJECT PLAN':'ISSUE / TASK')+' <small>'+'Start · Due · Calculation'+'</small></div>'+
       '<div class="gantt-heading-scale" style="width:'+timelineWidth+'px">'+monthHead.join('')+dayHead.join('')+'<div class="gantt-hover-guide" hidden></div><div class="gantt-hover-date" hidden></div></div></div>'+
     '<div class="gantt-task-area" style="width:'+totalWidth+'px">'+
       '<div class="gantt-calendar-overlay" style="left:'+labelWidth+'px;width:'+timelineWidth+'px">'+weeks.join('')+'</div>'+
@@ -8353,15 +8481,34 @@ function renderGanttChart(){
   svg.setAttribute('viewBox','0 0 '+timelineWidth+' '+actualHeight);
   let arrows='';
   if(drawDependencies){
+    // Read the *rendered* endpoints. A milestone displayed as a diamond
+    // occupies its due date, so incoming links must enter its left tip,
+    // not the earlier start date of the underlying schedule. Measuring the
+    // actual shape also handles the diamond's CSS rotation and every zoom.
+    const endpoints=rowElements.map(row=>{
+      const shape=row.querySelector('.gantt-diamond, .gantt-bar');
+      const track=row.querySelector('.gantt-task-track');
+      if(!shape||!track)return null;
+      const rect=shape.getBoundingClientRect();
+      const trackLeft=track.getBoundingClientRect().left;
+      return {start:rect.left-trackLeft,end:rect.right-trackLeft};
+    });
     d.edges.forEach(link=>{
       const a=scheduledKeys.get(link.from),b=scheduledKeys.get(link.to);
-      if(!a||!b)return;
-      const x1=((ganttDate(a.r.end)-origin)/GANTT_DAY_MS+.5)*ganttDayWidth;
-      const x2=((ganttDate(b.r.start)-origin)/GANTT_DAY_MS+.5)*ganttDayWidth;
+      if(!a||!b||!endpoints[a.n]||!endpoints[b.n])return;
+      // End of the visible blocker bar/diamond -> start of the visible
+      // blocked bar/diamond, including backwards (right-to-left) links.
+      const x1=endpoints[a.n].end;
+      const x2=endpoints[b.n].start;
       const y1=rowElements[a.n].offsetTop+rowElements[a.n].offsetHeight/2;
       const y2=rowElements[b.n].offsetTop+rowElements[b.n].offsetHeight/2;
-      const turn=x2>x1+18?Math.min(x1+18,(x1+x2)/2):x1+14;
-      arrows+='<path d="M'+x1+' '+y1+' H'+turn+' V'+y2+' H'+(x2-3)+'" fill="none" stroke="#475569" stroke-width="1.5" marker-end="url(#gantt-arrow)" opacity=".75"/>';
+      const forward=x2>x1+24;
+      const route=forward
+        ?'M'+x1+' '+y1+' H'+((x1+x2)/2)+' V'+y2+' H'+x2
+        // A two-elbow detour ensures the arrow still enters the *left*
+        // edge of its target, even when that edge is behind the blocker.
+        :'M'+x1+' '+y1+' H'+(x1+12)+' V'+((y1+y2)/2)+' H'+Math.max(1,x2-12)+' V'+y2+' H'+x2;
+      arrows+='<path d="'+route+'" fill="none" stroke="#475569" stroke-width="1.5" stroke-linejoin="round" marker-end="url(#gantt-arrow)" opacity=".75"/>';
     });
   }
   svg.insertAdjacentHTML('beforeend',arrows);
@@ -8373,9 +8520,22 @@ function renderGanttChart(){
     '<span title="'+esc(r.summary)+'">'+esc(r.summary)+'</span>'+
     '<strong>'+esc(r.reason||'No valid schedule')+'</strong></div>').join('');
   missing.innerHTML='<div class="gantt-unscheduled-heading">Unscheduled ('+d.unscheduled.length+')</div>'+
-    (missingRows||'<div class="gantt-unscheduled-empty">'+(d.isOverview?'All milestones have due dates.':'All tickets have a valid start and due date.')+'</div>')+
-    '<p class="gantt-schedule-notes">'+(d.isOverview?'Each diamond marks the milestone due date in Jira. No blocker tasks are included; undated milestones are listed above.':'Start: Jira start date → day after latest direct blocker due date → Jira creation date. Tickets without a due date or with start after due date appear here.')+'</p>';
+    (missingRows||'<div class="gantt-unscheduled-empty">'+(d.isOverview?'All milestones have valid start and due dates.':'All tickets have a valid start and due date.')+'</div>')+
+    '<p class="gantt-schedule-notes">'+(d.isOverview?'Milestone bars show start through due date. Start: Jira start date → first blocker after the preceding milestone (blockers use Jira start, previous blocker due + 1 day, or creation) → milestone creation date. Blocker tasks are not displayed.':'Start: Jira start date → day after latest direct blocker due date → Jira creation date. Tickets without a due date or with start after due date appear here.')+'</p>';
   attachTicketKeyModalHandlers(missing);
+}
+function scrollGanttToToday(){
+  const chart=document.getElementById('gantt-chart');
+  const canvas=chart?.querySelector('.gantt-canvas');
+  if(!canvas)return;
+  const labelWidth=Number(canvas.dataset.labelWidth);
+  const todayLeft=Number(canvas.dataset.todayLeft);
+  if(!Number.isFinite(todayLeft)||!Number.isFinite(labelWidth))return;
+  // Reserve a visible gap immediately after the sticky task-label column.
+  const calendarViewport=Math.max(120,chart.clientWidth-labelWidth);
+  const gap=Math.min(190,Math.max(60,Math.floor(calendarViewport*.23)));
+  chart.scrollLeft=Math.max(0,todayLeft-gap);
+  chart.scrollTop=0;
 }
 function closeMilestoneGantt(){
   const overlay=document.getElementById('gantt-overlay');
@@ -8409,6 +8569,7 @@ function openGanttData(data,button){
   document.body.classList.add('gantt-open');
   updateGanttControls();
   renderGanttChart();
+  scrollGanttToToday();
   document.getElementById('gantt-close').focus();
 }
 function refreshOpenGanttAfterJiraLoad(){
@@ -8486,18 +8647,14 @@ function initMilestoneGantt(){
   document.querySelectorAll('[data-gantt-scale]').forEach(btn=>btn.addEventListener('click',()=>{
     state.ganttScale=Number(btn.dataset.ganttScale)||12;
     savePreferences({ganttScale:state.ganttScale});
-    const viewport=document.getElementById('gantt-chart');
-    const left=viewport.scrollLeft,top=viewport.scrollTop;
     updateGanttControls();renderGanttChart();
-    viewport.scrollLeft=left;viewport.scrollTop=top;
+    scrollGanttToToday();
   }));
   document.getElementById('gantt-narrow').addEventListener('change',e=>{
     state.ganttNarrow=e.target.checked;
     savePreferences({ganttNarrow:state.ganttNarrow});
-    const viewport=document.getElementById('gantt-chart');
-    const left=viewport.scrollLeft,top=viewport.scrollTop;
     updateGanttControls();renderGanttChart();
-    viewport.scrollLeft=left;viewport.scrollTop=top;
+    scrollGanttToToday();
   });
   document.getElementById('gantt-show-dependencies').addEventListener('change',e=>{
     state.ganttShowDependencies=e.target.checked;
