@@ -2307,6 +2307,13 @@ body.gantt-open #loading.show::before{display:none}
 body.gantt-open #loading.show .loading-favicon-wrap{background:#fff;width:80px;height:80px;border:2px solid #a5b4fc;box-shadow:0 0 0 12px rgba(255,255,255,.10)}
 body.gantt-open #loading.show #loading-label,body.gantt-open #loading.show #loading-status{color:white}
 body.gantt-open #loading.show .loading-progress,body.gantt-open #loading.show .startup-message{display:none!important}
+/* Subsequent Jira reloads retain the board under the same translucent overlay
+   already used for refreshing a Gantt. First startup keeps the welcome screen. */
+body.jira-refreshing #loading.show{z-index:26000;inset:0;background:rgba(15,23,42,.50);backdrop-filter:blur(3px)}
+body.jira-refreshing #loading.show::before{display:none}
+body.jira-refreshing #loading.show .loading-favicon-wrap{background:#fff;width:80px;height:80px;border:2px solid #a5b4fc;box-shadow:0 0 0 12px rgba(255,255,255,.10)}
+body.jira-refreshing #loading.show #loading-label,body.jira-refreshing #loading.show #loading-status{color:white}
+body.jira-refreshing #loading.show .loading-progress,body.jira-refreshing #loading.show .startup-message{display:none!important}
 /* dependency-status is earlier in the DOM than #loading, so it cannot be hidden with a following-sibling selector. */
 #dependency-status.loading-hidden{display:none !important}
 #dependency-status.view-hidden{display:none !important}
@@ -2567,9 +2574,7 @@ body.gantt-open #loading.show .loading-progress,body.gantt-open #loading.show .s
 .dashboard-personal-metric strong{font-size:25px;color:#172033}
 .dashboard-personal-help{font-size:10px;color:#64748b}
 .dashboard-personal-actions{display:flex;flex-direction:column;align-items:flex-start;gap:6px;flex-shrink:0}
-.dashboard-show-personal{border:1px solid #c7d2fe;background:#eef2ff;color:#3730a3;border-radius:6px;padding:6px 8px;font-size:11px;font-weight:750;cursor:pointer;white-space:nowrap}
-.dashboard-show-personal:hover{background:#e0e7ff}
-.personal-overwrite-note{font-weight:700;color:#64748b}.personal-user-change{display:flex;align-items:center;gap:8px;margin-left:auto}.personal-user-change label{font-size:12px;color:#475569;font-weight:700}.personal-user-mapping{max-width:240px;min-width:170px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#172033;font-size:12px}.dashboard-personal-actions{justify-content:center}
+.personal-user-change{display:flex;align-items:center;gap:8px;margin-left:auto}.personal-user-change label{font-size:12px;color:#475569;font-weight:700}.personal-user-mapping{max-width:240px;min-width:170px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#172033;font-size:12px}.dashboard-personal-actions{justify-content:center}
 @media(max-width:1100px){.dashboard-personal-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:700px){.dashboard-personal-grid{grid-template-columns:1fr}.dashboard-personal-metric{align-items:flex-start}}
 .dashboard-inline-stat{display:flex;align-items:baseline;gap:8px;padding:6px 2px;color:#64748b}
@@ -2988,6 +2993,69 @@ body.gantt-open{overflow:hidden}
 @media(max-width:900px){.dashboard-table-tabs{top:0}.dashboard-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-stat.dashboard-attention-stat{grid-column:span 2}}
 @media(max-width:600px){.dashboard-stats{grid-template-columns:1fr}.dashboard-stat.dashboard-attention-stat,.dashboard-health-stat{grid-column:span 1}.dashboard-table-pagination{align-items:flex-start}.dashboard-table-pagination>div{gap:4px}}
 
+
+/* v178 — concise personal metrics and session-only due-date row emphasis */
+.dashboard-personal-view{margin:10px 0 16px;padding:12px}
+.dashboard-personal-view .dashboard-section-head{margin-bottom:9px;flex-wrap:wrap}
+.dashboard-personal-view .dashboard-section-note{font-size:11px;color:#64748b}
+.dashboard-personal-view .personal-user-change{margin-left:auto}
+.dashboard-personal-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
+.dashboard-personal-metric{position:relative;display:flex;flex-direction:column;align-items:flex-start;justify-content:flex-start;gap:6px;padding:10px 12px;background:#fff;border-color:#e2e8f0;min-height:84px}
+.dashboard-personal-metric>div:first-child{display:flex;flex-direction:column;gap:4px;min-width:0}
+.dashboard-personal-metric strong{font-size:21px;line-height:1.1;font-variant-numeric:tabular-nums}
+.dashboard-personal-label{font-size:11px}
+.dashboard-personal-help{font-size:10px;line-height:1.35}
+.dashboard-personal-health{grid-column:span 2;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:6px 14px;border-width:1px;border-style:solid}
+/* Share the exact Project overview health-card palette. Severity follows the
+   assignee's PROJECT health impact, not their personal health percentage. */
+.dashboard-personal-health.green{border-color:#bbf7d0;background:#f7fff9}
+.dashboard-personal-health.amber{border-color:#fde68a;background:#fffdf5}
+.dashboard-personal-health.red{border-color:#fecaca;background:#fff8f8}
+.dashboard-personal-health-main{min-width:0}
+.dashboard-personal-health .dashboard-personal-impact-value{font-size:clamp(24px,2.7vw,32px);font-variant-numeric:tabular-nums}
+.dashboard-personal-health.red .dashboard-personal-impact-value{color:#b91c1c}
+.dashboard-personal-health.amber .dashboard-personal-impact-value{color:#92400e}
+.dashboard-personal-health.green .dashboard-personal-impact-value{color:#166534}
+.dashboard-personal-health-stats{display:flex;align-items:center;justify-content:flex-end;gap:14px;flex-wrap:wrap}
+.dashboard-personal-health-stats>div{display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.dashboard-personal-health-stats strong{font-size:16px}
+.dashboard-personal-health-stats span{font-size:10px;color:#64748b;font-weight:700}
+.my-view-highlight-toggle{display:inline-flex;align-items:center;gap:6px;border:1px solid #e2e8f0;border-radius:999px;padding:4px 8px;background:#f8fafc;color:#475569;cursor:pointer;font-size:10px;font-weight:750;white-space:nowrap;max-width:100%}
+.my-view-highlight-toggle:hover{background:#fff1f2;border-color:#fda4af;color:#9f1239}
+.my-view-highlight-toggle.active{background:#ffe4e6;border-color:#fda4af;color:#9f1239;box-shadow:0 0 0 1px rgba(244,63,94,.15)}
+.my-view-highlight-indicator{width:11px;height:11px;flex:0 0 auto;border:1.5px solid #94a3b8;border-radius:3px;background:white}
+.my-view-highlight-toggle.active .my-view-highlight-indicator{background:#e11d48;border-color:#e11d48;box-shadow:inset 0 0 0 2px #fff}
+.my-view-row.my-view-highlight td{background:#fff1f2}
+.my-view-row.my-view-highlight:hover td{background:#ffe0e5}
+@media(max-width:1100px){.dashboard-personal-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){.dashboard-personal-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-personal-health{grid-column:span 2}.dashboard-personal-metric{padding:9px;min-height:78px}.dashboard-personal-health-stats{gap:10px}.dashboard-personal-metric strong{font-size:19px}.my-view-highlight-toggle{font-size:9px;padding:4px 5px}}
+/* Workload and priorities: give the expanded assignee-health table full width. */
+.dashboard-workload-panel{display:grid;grid-template-columns:minmax(0,1fr)}
+.dashboard-workload-table thead button{display:inline-flex;align-items:center;justify-content:flex-start;gap:5px;border:0;background:transparent;color:inherit;font:inherit;font-weight:inherit;cursor:pointer;text-align:inherit;padding:0;white-space:nowrap}
+.dashboard-workload-table thead button.active{color:#4338ca}
+.dashboard-workload-table thead button:hover{color:#4338ca}
+.dashboard-workload-table thead button:focus-visible{outline:2px solid #6366f1;outline-offset:3px}
+.dashboard-workload-table thead th:not(:first-child) button{justify-content:flex-end}
+.dashboard-workload-scroll{overflow-x:auto;max-width:100%;-webkit-overflow-scrolling:touch}
+.dashboard-workload-table{border-collapse:collapse;width:100%;min-width:760px;font-size:11px}
+.dashboard-workload-table th,.dashboard-workload-table td{padding:8px 10px;border-bottom:1px solid #e2e8f0;vertical-align:middle}
+.dashboard-workload-table thead th{text-align:left;background:#f1f5f9;color:#475569;font-size:10px;font-weight:800;white-space:nowrap}
+.dashboard-workload-table tbody th{font-size:11px;color:#334155;text-align:left;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dashboard-workload-table tbody tr:hover{background:#f8fafc}
+.dashboard-workload-number{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.dashboard-workload-table thead th:not(:first-child){text-align:right}
+.dashboard-workload-ticket-cell{display:flex;align-items:center;justify-content:flex-end;gap:9px}
+.dashboard-workload-ticket-cell .dashboard-workload-bar{width:90px;max-width:45%;flex:0 0 auto}
+.dashboard-workload-health{color:#047857}
+.dashboard-workload-health.warning{color:#b45309}
+.dashboard-workload-health.risk{color:#b91c1c}
+.dashboard-workload-impact{color:#9f1239;font-weight:750}
+.dashboard-workload-footnote{font-size:10px;color:#64748b;line-height:1.5;margin:10px 0 0}
+.dashboard-workload-table tfoot tr{background:#f1f5f9;border-top:2px solid #cbd5e1}
+.dashboard-workload-table tfoot th,.dashboard-workload-table tfoot td{font-size:11px;font-weight:800;color:#172033}
+.dashboard-workload-table tfoot th{text-align:left;white-space:normal}
+.dashboard-workload-table tfoot .dashboard-workload-impact{color:#9f1239}
+@media(max-width:850px){.dashboard-personal-health{grid-template-columns:1fr}.dashboard-personal-health-stats{justify-content:space-between}.dashboard-personal-health-stats>div{align-items:flex-start}}
 </style>
 </head>
 <body>
@@ -3341,7 +3409,7 @@ const state = {
   showDashboard:false,
   showMyView:false,
   myViewSavedSorts:{}, myViewSort:{field:'priority',direction:'asc'}, myViewColumns:['key','summary','priority','dueDate','epic','status','blockers','blocked','riskScore','riskReasons'], milestoneSort:'dueDate', ganttReturnToMilestones:false, ganttReturnContext:null,
-  dashboardSavedSorts:{},dashboardDraftSorts:{},dashboardTab:'needs-attention',dashboardPages:{},dashboardAttentionFilter:'',
+  dashboardSavedSorts:{},dashboardDraftSorts:{},dashboardTab:'needs-attention',dashboardPages:{},dashboardAttentionFilter:'',dashboardWorkloadSort:'tickets-desc',myViewHighlightDue:'',
   startingView:'default',
   showMiniMap:true, customJql:'', useJiraModal:false, ganttScale:12, ganttShowDependencies:true, ganttNarrow:false, currentUserName:'', currentUserAccountId:'', personalUserOverride:false, personalTicketFilter:'',
   displayIssues:[], displayEdges:[], displayLevels:0,
@@ -4149,6 +4217,7 @@ function esc(v){ return String(v == null ? '' : v).replace(/&/g,'&amp;').replace
 function showError(msg){ errorEl.textContent = msg; errorEl.style.display = 'block'; }
 function hideError(){ errorEl.style.display = 'none'; }
 let startupMessagePromise = null;
+let hasLoadedJiraOnce = false;
 
 function setLoading(on, msg){
   loading.classList.toggle('show', on);
@@ -4159,7 +4228,7 @@ function setLoading(on, msg){
     startLoadingProgressPolling();
     startupMessage.style.display = 'none';
     startupMessage.innerHTML = '';
-    startupMessagePromise = fetchStartupMessages()
+    startupMessagePromise = document.body.classList.contains('jira-refreshing') ? null : fetchStartupMessages()
       .then(items => {
         if(!items.length){ startupMessage.style.display='none'; return items; }
         const item=items[Math.floor(Math.random()*items.length)];
@@ -5271,6 +5340,40 @@ function dashboardGraphTraversal(issues){
   return result;
 }
 
+// Exactly the same board-health calculation for the entire project and for any
+// selected subset. Risk totals are capped at 100 per ticket, as before.
+function dashboardHealthScore(total,affected,cappedRiskTotal){
+  if(!total) return 100;
+  return Math.max(0,Math.min(100,100*(1-affected/total)-(cappedRiskTotal/total)*.25));
+}
+function dashboardHealthForTickets(tickets,ticketRisks){
+  const total=tickets.length;
+  let affected=0,cappedRiskTotal=0;
+  tickets.forEach(issue=>{
+    const score=ticketRisks.get(issue.key)?.score||0;
+    if(score>0) affected++;
+    cappedRiskTotal+=Math.min(100,score);
+  });
+  return {total,affected,cappedRiskTotal,atRiskPercent:total?affected/total*100:0,
+    healthScore:dashboardHealthScore(total,affected,cappedRiskTotal)};
+}
+function dashboardHealthImpact(project,group){
+  // Each active ticket contributes to exactly one group (including Unassigned).
+  // Attribute the *actual project-wide health loss* from 100%, retaining the
+  // same affected-ticket and capped risk-weight terms as dashboardHealthScore.
+  // Without the 0% floor this is exactly the improvement from clearing the
+  // group's issues. At the 0% floor, isolated counterfactuals are not additive;
+  // scale raw group losses proportionally to the effective 100-point maximum.
+  const total=project.active.length;
+  if(!total)return 0;
+  const groupRawLoss=(100*group.affected+.25*group.cappedRiskTotal)/total;
+  const boardRawLoss=(100*project.attention.length+.25*project.cappedRiskTotal)/total;
+  const actualBoardLoss=100-project.boardHealthScore;
+  return boardRawLoss>0?Math.max(0,groupRawLoss*actualBoardLoss/boardRawLoss):0;
+}
+function dashboardHealthPercent(value){return Math.round(value)+'%';}
+function dashboardHealthImpactText(value){return value<.05?'0%':'−'+value.toLocaleString('en-GB',{maximumFractionDigits:1})+'%';}
+function dashboardHealthImpactStatus(value){return value>=5?'red':value>=.05?'amber':'green';}
 function dashboardRiskInfo(issues){
   // Project overview always uses ALL active tickets, independently of filters,
   // including With Remarkable. A ticket is counted once in Needs attention.
@@ -5324,12 +5427,13 @@ function dashboardRiskInfo(issues){
   // Healthy tickets are the baseline: widespread issues must affect Board Health
   // even when each issue has only a small risk score. Deduct additional points
   // for severity, without disproportionately penalising larger projects.
-  const averageRisk=active.length ? active.reduce((sum,i)=>sum+Math.min(100,ticketRisks.get(i.key).score),0)/active.length : 0;
-  const affectedRate=active.length ? attention.length/active.length : 0;
-  const boardHealthScore=Math.max(0,Math.min(100,100*(1-affectedRate)-averageRisk*.25));
+  const health=dashboardHealthForTickets(active,ticketRisks);
+  const averageRisk=active.length?health.cappedRiskTotal/active.length:0;
+  const boardHealthScore=health.healthScore;
   const boardHealthStatus=boardHealthScore>=90?'green':boardHealthScore>=70?'amber':'red';
   return {active,overdue,unassigned,noDueDate,noDescription,chainDateRisks,chainDateRiskKeys,chainDateRiskDetails,
-    circularDependencies,circularKeys,attention,ticketRisks,averageRisk,boardHealthScore,boardHealthStatus};
+    circularDependencies,circularKeys,attention,ticketRisks,averageRisk,
+    cappedRiskTotal:health.cappedRiskTotal,boardHealthScore,boardHealthStatus};
 }
 function lazyAssigneeSelectHtml(i, dashboard=false){
   // The current selection must be present immediately for value/keyboard
@@ -5449,17 +5553,33 @@ function dashboardDependencyBottlenecks(issues){
 function dashboardUnblocking(issues){
   return dashboardDependencyBottlenecks(issues).filter(x=>x.issue.assigneeAccountId || x.issue.dueDate || x.issue.priority);
 }
-function dashboardWorkload(issues){
+function dashboardWorkload(issues,risks){
   const active=issues.filter(i=>!isCompletedStatus(i.status));
   const groups=new Map();
   active.forEach(i=>{
+    // Unassigned work needs its own group: otherwise its health deduction
+    // disappears from the assignee impact reconciliation.
     const key=i.assigneeAccountId||'__unassigned__';
-    if(!groups.has(key)) groups.set(key,{name:i.assignee||'Unassigned',accountId:i.assigneeAccountId||'',count:0,overdue:0,highRisk:0});
-    const g=groups.get(key); g.count++;
-    if(isDueDateOverdue(i.dueDate)) g.overdue++;
-    if(['Highest','Critical'].includes(String(i.priority||'')) && (isDueDateOverdue(i.dueDate)||!i.dueDate)) g.highRisk++;
+    if(!groups.has(key)) groups.set(key,{name:i.assigneeAccountId?(i.assignee||i.assigneeAccountId):'Unassigned',accountId:i.assigneeAccountId||'',tickets:[]});
+    groups.get(key).tickets.push(i);
   });
-  return [...groups.values()].sort((a,b)=>b.count-a.count || a.name.localeCompare(b.name));
+  const values=[...groups.values()].map(group=>{
+    const health=dashboardHealthForTickets(group.tickets,risks.ticketRisks);
+    return {name:group.name,accountId:group.accountId,count:health.total,
+      affected:health.affected,atRiskPercent:health.atRiskPercent,
+      personalHealth:health.healthScore,boardImpact:dashboardHealthImpact(risks,health)};
+  });
+  // Present impacts to one decimal place, but distribute any rounding residue
+  // so the *displayed* assignee contributions exactly reconcile to the
+  // displayed overall board-health loss. Sorting cannot change these values.
+  const totalTenths=Math.round((100-risks.boardHealthScore)*10);
+  const tenths=values.map(x=>Math.floor(x.boardImpact*10+1e-8));
+  let remainder=totalTenths-tenths.reduce((sum,n)=>sum+n,0);
+  const byFraction=values.map((x,index)=>({index,fraction:x.boardImpact*10-tenths[index]}))
+    .sort((a,b)=>b.fraction-a.fraction||values[a.index].name.localeCompare(values[b.index].name));
+  for(let i=0;i<remainder && i<byFraction.length;i++)tenths[byFraction[i].index]++;
+  values.forEach((x,index)=>{x.displayImpact=tenths[index]/10;});
+  return values.sort((a,b)=>b.count-a.count || a.name.localeCompare(b.name));
 }
 function dashboardMilestones(issues){
   const graph=dashboardGraphTraversal(issues);
@@ -5507,10 +5627,45 @@ function dashboardBottleneckHtml(items){
   if(!items.length) return '<div class="dashboard-empty">No active ticket is currently blocking other active work.</div>';
   return '<div class="dashboard-compact-list">'+items.map(x=>'<button type="button" class="dashboard-compact-row" data-dashboard-unblocking="'+esc(x.issue.key)+'"><span class="dashboard-compact-main"><strong>'+esc(x.issue.key)+'</strong><span>'+esc(x.issue.summary||'')+'</span></span><span class="dashboard-impact">'+x.impact+' downstream '+(x.impact===1?'ticket':'tickets')+'</span></button>').join('')+'</div>';
 }
-function dashboardWorkloadHtml(items){
+const DASHBOARD_WORKLOAD_FIELDS=[
+  ['name','Assignee'],['tickets','Tickets assigned'],['affected','Tickets affected'],
+  ['risk','At risk'],['health','Personal health'],['impact','Board health impact']
+];
+function dashboardWorkloadHtml(items,risks){
   if(!items.length) return '<div class="dashboard-empty">No active tickets.</div>';
+  const order={tickets:'count',affected:'affected',risk:'atRiskPercent',health:'personalHealth',impact:'boardImpact'};
+  const [requestedMetric,requestedDirection]=(state.dashboardWorkloadSort||'tickets-desc').split('-');
+  const metric=DASHBOARD_WORKLOAD_FIELDS.some(([field])=>field===requestedMetric)?requestedMetric:'tickets';
+  const direction=requestedDirection==='asc'?'asc':'desc';
+  const sorted=[...items].sort((a,b)=>{
+    if(metric==='name')return (direction==='desc'?-1:1)*a.name.localeCompare(b.name);
+    const field=order[metric]||'count';
+    return (direction==='asc'?1:-1)*(a[field]-b[field]) || b.count-a.count || a.name.localeCompare(b.name);
+  });
   const max=Math.max(1,...items.map(x=>x.count));
-  return '<div class="dashboard-workload-list">'+items.map(x=>'<div class="dashboard-workload-row"><span class="dashboard-workload-name"><strong>'+esc(x.name)+'</strong>'+(x.overdue?'<span>'+x.overdue+' overdue</span>':'')+'</span><span class="dashboard-workload-bar"><span style="width:'+Math.max(4,Math.round(x.count/max*100))+'%"></span></span><strong class="dashboard-workload-count">'+x.count+'</strong></div>').join('')+'</div>';
+  const headerHtml=DASHBOARD_WORKLOAD_FIELDS.map(([field,label])=>{
+    const active=metric===field;
+    const sortIcon=active?(direction==='asc'?'▲':'▼'):'↕';
+    return '<th scope="col" aria-sort="'+(active?(direction==='asc'?'ascending':'descending'):'none')+'"><button type="button" data-workload-sort="'+field+'" class="'+(active?'active':'')+'" title="Sort by '+esc(label)+'">'+esc(label)+' <span aria-hidden="true">'+sortIcon+'</span></button></th>';
+  }).join('');
+  const rows=sorted.map(x=>'<tr><th scope="row" title="'+esc(x.name)+'">'+esc(x.name)+'</th>'+ 
+    '<td><div class="dashboard-workload-ticket-cell"><strong>'+x.count+'</strong><span class="dashboard-workload-bar"><span style="width:'+Math.max(4,Math.round(x.count/max*100))+'%"></span></span></div></td>'+ 
+    '<td class="dashboard-workload-number">'+x.affected+'</td>'+ 
+    '<td class="dashboard-workload-number">'+dashboardHealthPercent(x.atRiskPercent)+'</td>'+ 
+    '<td class="dashboard-workload-number"><strong class="dashboard-workload-health'+(x.personalHealth<70?' risk':x.personalHealth<90?' warning':'')+'">'+dashboardHealthPercent(x.personalHealth)+'</strong></td>'+ 
+    '<td class="dashboard-workload-number dashboard-workload-impact" title="Contribution to overall board health reduction, in percentage points">'+dashboardHealthImpactText(x.displayImpact)+'</td></tr>').join('');
+  const tickets=items.reduce((sum,x)=>sum+x.count,0);
+  const affected=items.reduce((sum,x)=>sum+x.affected,0);
+  const totalImpactTenths=items.reduce((sum,x)=>sum+Math.round(x.displayImpact*10),0);
+  const totalImpact=totalImpactTenths/10;
+  const exactHealth=(100-totalImpact).toFixed(1)+'%';
+  const totals='<tfoot><tr class="dashboard-workload-total"><th scope="row">All assignees (including unassigned)</th>'+ 
+    '<td class="dashboard-workload-number">'+tickets+'</td><td class="dashboard-workload-number">'+affected+'</td>'+ 
+    '<td class="dashboard-workload-number">'+dashboardHealthPercent(tickets?affected/tickets*100:0)+'</td>'+ 
+    '<td class="dashboard-workload-number"><strong>'+exactHealth+'</strong></td>'+ 
+    '<td class="dashboard-workload-number dashboard-workload-impact">'+dashboardHealthImpactText(totalImpact)+'</td></tr></tfoot>';
+  return '<div class="dashboard-workload-scroll" role="region" aria-label="Workload by assignee, horizontally scrollable" tabindex="0"><table class="dashboard-workload-table"><thead><tr>'+headerHtml+'</tr></thead><tbody>'+rows+'</tbody>'+totals+'</table></div>'+ 
+    '<p class="dashboard-workload-footnote">Select a column heading to sort (the default is most assigned tickets first). Impact measures the percentage-point reduction from a 100% healthy board: '+exactHealth+' health + '+totalImpact.toFixed(1)+' points of impact = 100%. Includes Unassigned and With Remarkable. If health is already at 0%, impacts share the capped deduction proportionally.</p>';
 }
 function dashboardMilestoneHtml(items){
   if(!items.length) return '<div class="dashboard-empty">No active milestones found.</div>';
@@ -5524,34 +5679,38 @@ function dashboardPersonalUserOptions(){
   const options=[...users.entries()].sort((a,b)=>a[1].localeCompare(b[1])).map(([id,name])=>'<option value="'+esc(id)+'"'+(id===selectedId?' selected':'')+'>'+esc(name)+'</option>').join('');
   return '<select id="personal-user-mapping" class="personal-user-mapping" aria-label="Change user"><option value="">Choose a user…</option>'+options+'</select>';
 }
-function dashboardPersonalViewHtml(activeIssues){
-  // Use all active Jira issues for personal counts so With Remarkable tickets
-  // remain counted even when the board's display toggle hides them.
-  const personalActive=(state.issues||[]).filter(i=>!isCompletedStatus(i.status));
-  const sourceIssues=personalActive.length ? personalActive : activeIssues;
-  const currentName=String(state.currentUserName||'Edward Dyer').trim().toLowerCase();
-  const mine=sourceIssues.filter(i=>String(i.assignee||'').trim().toLowerCase()===currentName ||
-    (state.currentUserAccountId && i.assigneeAccountId===state.currentUserAccountId));
+function dashboardPersonalViewHtml(activeIssues,risks){
+  // Health and personal counts cover all active work, even With Remarkable.
+  const sourceIssues=risks.active;
+  const currentId=state.currentUserAccountId||'';
+  const currentName=String(state.currentUserName||'').trim().toLowerCase();
+  const mine=sourceIssues.filter(i=>currentId ? i.assigneeAccountId===currentId : !!currentName && String(i.assignee||'').trim().toLowerCase()===currentName);
   const byKey=new Map(sourceIssues.map(i=>[i.key,i]));
   const isRemarkable=i=>String(i.status||'').trim().toLowerCase()==='with remarkable';
   const hasActiveBlocker=i=>(i.blockers||[]).some(k=>byKey.has(k));
   const unblocked=mine.filter(i=>!hasActiveBlocker(i) && !isRemarkable(i));
   const withRemarkable=mine.filter(isRemarkable);
   const blockedByOthers=mine.filter(i=>isRemarkable(i)||(i.blockers||[]).some(k=>{
-    const blocker=byKey.get(k); return blocker && blocker.assigneeAccountId!==state.currentUserAccountId;
+    const blocker=byKey.get(k); return blocker && blocker.assigneeAccountId!==i.assigneeAccountId;
   }));
   const overdue=mine.filter(i=>isDueDateOverdue(i.dueDate));
   const next7=dashboardDueSoon(mine,7);
   const nextMonth=dashboardDueSoon(mine,31);
-  const selectedName=String(state.currentUserName||'the selected user').trim();
-  const metric=(label,count,description,filter,extra='')=>'<div class="dashboard-personal-metric"><div><span class="dashboard-personal-label">'+esc(label)+'</span><strong>'+count+'</strong><span class="dashboard-personal-help">'+esc(description)+'</span>'+extra+'</div>'+(filter?'<div class="dashboard-personal-actions"><button type="button" class="dashboard-show-personal" data-personal-filter="'+filter+'">Show on board</button></div>':'')+'</div>';
+  const personal=dashboardHealthForTickets(mine,risks.ticketRisks);
+  const workload=dashboardWorkload(risks.active,risks);
+  const matchingGroup=workload.find(x=>currentId?x.accountId===currentId:x.name.trim().toLowerCase()===currentName);
+  const impact=matchingGroup?.displayImpact??dashboardHealthImpact(risks,personal);
+  const metric=(label,count,description,extra='')=>'<div class="dashboard-personal-metric"><div><span class="dashboard-personal-label">'+esc(label)+'</span><strong>'+count+'</strong><span class="dashboard-personal-help">'+esc(description)+'</span></div>'+extra+'</div>';
+  const highlightToggle=(period,label)=>'<button type="button" class="my-view-highlight-toggle'+(state.myViewHighlightDue===period?' active':'')+'" data-my-highlight="'+period+'" aria-pressed="'+(state.myViewHighlightDue===period?'true':'false')+'" aria-label="Highlight tickets '+esc(label)+' on the Assigned work table"><span class="my-view-highlight-indicator" aria-hidden="true"></span>Highlight on table</button>';
+  const healthHtml='<div class="dashboard-personal-metric dashboard-personal-health '+dashboardHealthImpactStatus(impact)+'"><div class="dashboard-personal-health-main"><span class="dashboard-personal-label">Project health impact</span><strong class="dashboard-personal-impact-value">'+dashboardHealthImpactText(impact)+'</strong><span class="dashboard-personal-help">Contribution to board health reduction</span></div><div class="dashboard-personal-health-stats"><div><strong>'+personal.affected+' / '+personal.total+'</strong><span>Tickets at risk / assigned</span></div><div><strong>'+dashboardHealthPercent(personal.atRiskPercent)+'</strong><span>At risk</span></div><div><strong>'+dashboardHealthPercent(personal.healthScore)+'</strong><span>Personal health</span></div></div></div>';
   return '<div class="dashboard-personal-grid">'+
-    metric('Tickets assigned to '+selectedName,mine.length,'Active tickets assigned to '+selectedName,'assigned')+
-    metric('Unblocked tickets',unblocked.length,'Tickets with no active blockers, excluding With Remarkable tickets',null,withRemarkable.length?'<span class="dashboard-personal-help">Plus '+withRemarkable.length+' with Remarkable</span>':'')+
-    metric('Tickets blocked by other assignees',blockedByOthers.length,'Includes tickets with active blockers assigned to someone else and With Remarkable tickets',null)+
-    metric('Overdue',overdue.length,selectedName+'’s tickets past their due date','overdue')+
-    metric('Due in the next 7 days',next7.length,selectedName+'’s tickets due today through the next seven days','next7')+
-    metric('Due in the next 31 days',nextMonth.length,selectedName+'’s tickets due today through the next 31 days','nextMonth')+
+    healthHtml+
+    metric('Tickets assigned',mine.length,'All active work, including With Remarkable')+
+    metric('Unblocked',unblocked.length,'No active blockers',withRemarkable.length?'<span class="dashboard-personal-help">+'+withRemarkable.length+' With Remarkable</span>':'')+
+    metric('Blocked by others',blockedByOthers.length,'Other assignees or With Remarkable')+
+    metric('Overdue',overdue.length,'Past their due date')+
+    metric('Due next 7 days',next7.length,'Today through the next 7 days',highlightToggle('next7','due in the next 7 days'))+
+    metric('Due next 31 days',nextMonth.length,'Today through the next 31 days',highlightToggle('next31','due in the next 31 days'))+
     '</div>';
 }
 const DASHBOARD_TABS=[
@@ -5671,7 +5830,7 @@ function dashboardOverviewHtml(){
   const tab=DASHBOARD_TABS.some(x=>x[0]===state.dashboardTab)?state.dashboardTab:'needs-attention';
   const dueSoon=dashboardDueSoon(risks.active,7);
   const dueMonth=dashboardDueSoon(risks.active,31);
-  const workload=dashboardWorkload(risks.active);
+  const workload=dashboardWorkload(risks.active,risks);
   const priorityDistribution=dashboardPriorityDistribution(risks.active);
   const topWorkload=workload.filter(x=>x.accountId).slice(0,6);
   const assignedPeopleCount=new Set(risks.active.filter(i=>i.assigneeAccountId).map(i=>i.assigneeAccountId)).size;
@@ -5694,7 +5853,7 @@ function dashboardOverviewHtml(){
   const tabs=DASHBOARD_TABS.map(([id,label])=>'<button type="button" role="tab" aria-selected="'+(tab===id?'true':'false')+'" data-dashboard-tab="'+id+'" class="'+(tab===id?'active':'')+'">'+esc(label)+'</button>').join('');
   const mainPanel=tab==='workload-priorities'
     ? '<div class="dashboard-two-column dashboard-workload-panel">'+
-        '<div class="dashboard-section-group">'+dashboardSummarySection('Workload by assignee',dashboardWorkloadHtml(workload),'workload-by-assignee','Select a person to filter the main board')+'</div>'+
+        '<div class="dashboard-section-group">'+dashboardSummarySection('Workload by assignee',dashboardWorkloadHtml(workload,risks),'workload-by-assignee','Risk and health metrics across all active tickets')+'</div>'+
         '<div class="dashboard-section-group">'+dashboardSummarySection('Priority distribution',dashboardPriorityDistributionHtml(priorityDistribution),'priority-distribution-content','Active tickets by Jira priority')+'</div></div>'
     : dashboardTableHtml(risks,tab);
   return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Project overview</div><div class="dashboard-subtitle">Delivery risks, deadlines and priorities across all active tickets.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+
@@ -5747,6 +5906,22 @@ function renderDashboard(){
     el.addEventListener('click',navigate);
     if(el.getAttribute('role')==='button') el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();navigate();}});
   });
+  board.querySelectorAll('[data-workload-sort]').forEach(btn=>btn.addEventListener('click',()=>{
+    const field=btn.dataset.workloadSort;
+    const [currentField,currentDirection]=(state.dashboardWorkloadSort||'tickets-desc').split('-');
+    const defaultDirection=field==='name'||field==='health'?'asc':'desc';
+    const direction=currentField===field?(currentDirection==='asc'?'desc':'asc'):defaultDirection;
+    state.dashboardWorkloadSort=field+'-'+direction;
+    const top=app.scrollTop,left=app.scrollLeft;
+    const horizontal=board.querySelector('.dashboard-workload-scroll')?.scrollLeft||0;
+    render();
+    const restore=()=>{
+      app.scrollTop=top;app.scrollLeft=left;
+      const scroller=board.querySelector('.dashboard-workload-scroll');
+      if(scroller)scroller.scrollLeft=horizontal;
+    };
+    restore();requestAnimationFrame(restore);
+  }));
   board.querySelector('.dashboard-clear-attention-filter')?.addEventListener('click',()=>switchTab('needs-attention',''));
   board.querySelectorAll('[data-dashboard-sort]').forEach(btn=>btn.addEventListener('click',()=>{
     const tab=state.dashboardTab,field=btn.dataset.dashboardSort,current=dashboardSortForTab(tab);
@@ -5891,14 +6066,14 @@ function compareMyViewIssues(a,b){
 }
 let dashboardMyViewGraph=null;
 let myViewTicketRisks=new Map();
-function myViewTableHtml(){
+function myViewTableHtml(risksSnapshot){
   const tickets=myViewAssignedIssues();
   const remarkableCount=myViewAssignedIssues(true).filter(isWithRemarkableStatus).length;
   // All active Jira issues must contribute to upstream/downstream counts,
   // including With Remarkable even if hidden by a Full board filter.
   dashboardMyViewGraph=dashboardGraphTraversal(state.issues||[]);
   // Reuse exactly the same risk calculation as Project overview / Needs attention.
-  myViewTicketRisks=dashboardRiskInfo(state.issues||[]).ticketRisks;
+  myViewTicketRisks=(risksSnapshot||dashboardRiskInfo(state.issues||[])).ticketRisks;
   const sorted=[...tickets].sort(compareMyViewIssues);
   const selected=normaliseMyViewColumns(state.myViewColumns);
   const names=new Map(MY_VIEW_COLUMNS);
@@ -5907,7 +6082,8 @@ function myViewTableHtml(){
     const active=state.myViewSort.field===field;
     return '<th scope="col" draggable="true" data-my-col="'+field+'" title="Drag to reorder '+esc(label)+' column" aria-sort="'+(active?(state.myViewSort.direction==='asc'?'ascending':'descending'):'none')+'"><span class="my-view-drag-handle" aria-hidden="true">⠿</span><button type="button" class="'+(active?'active':'')+'" data-my-view-sort="'+field+'">'+esc(label)+' <span aria-hidden="true">'+(active?(state.myViewSort.direction==='asc'?'▲':'▼'):'↕')+'</span></button></th>';
   }).join('');
-  const rows=sorted.map(i=>'<tr class="my-view-row dashboard-ticket" data-key="'+esc(i.key)+'" data-my-view-key="'+esc(i.key)+'" tabindex="0" title="Open dependency chain for '+esc(i.key)+'">'+
+  const highlightKeys=new Set(state.myViewHighlightDue==='next7'?dashboardDueSoon(tickets,7).map(i=>i.key):state.myViewHighlightDue==='next31'?dashboardDueSoon(tickets,31).map(i=>i.key):[]);
+  const rows=sorted.map(i=>'<tr class="my-view-row dashboard-ticket'+(highlightKeys.has(i.key)?' my-view-highlight':'')+'" data-key="'+esc(i.key)+'" data-my-view-key="'+esc(i.key)+'" tabindex="0" title="Open dependency chain for '+esc(i.key)+'">'+
     headers.map(([field])=>'<td data-my-col="'+field+'"'+(field==='summary'?' class="my-view-summary"':field==='epic'?' class="my-view-parent"':'')+'>'+myViewColumnCell(i,field)+'</td>').join('')+'</tr>').join('');
   const columnsPicker='<div class="my-view-personalise"><button type="button" id="my-view-personalise" class="my-view-personalise-button" aria-expanded="false" aria-controls="my-view-columns-menu">Personalise table</button><div id="my-view-columns-menu" class="my-view-columns-menu" hidden><strong style="font-size:12px">Visible columns</strong><p class="my-view-column-hint">Tick the columns you want, then Apply. Drag column headings in the table to reorder.</p>'+MY_VIEW_COLUMNS.map(([field,label])=>'<label><input type="checkbox" data-my-column="'+field+'"'+(selected.includes(field)?' checked':'')+'> '+esc(label)+'</label>').join('')+'<span class="my-view-column-error" id="my-view-column-error" role="status" aria-live="polite"></span><div class="my-view-column-actions"><button type="button" class="my-view-column-defaults" id="my-view-column-defaults">Restore defaults</button><button type="button" class="my-view-column-cancel" id="my-view-column-cancel">Cancel</button><button type="button" class="my-view-column-apply" id="my-view-column-apply">Apply</button></div></div></div>';
   const hasUser=!!state.currentUserAccountId;
@@ -5936,9 +6112,9 @@ window.addEventListener('resize',updateMyViewScrollControls);
 let myViewColumnMenuController=new AbortController();
 function renderMyView(){
   myViewColumnMenuController.abort();myViewColumnMenuController=new AbortController();
-  const risksActive=(state.issues||[]).filter(i=>!isCompletedStatus(i.status));
-  const personalHtml='<section class="dashboard-section dashboard-personal-view" id="my-view-personal"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">My view: '+esc(state.currentUserName||'Select a user')+'</span><span class="dashboard-section-note">Your active tickets and deadlines</span><span class="dashboard-section-note personal-overwrite-note">Show on board overwrites your filters</span></div><div class="personal-user-change"><label for="personal-user-mapping">Change user</label>'+dashboardPersonalUserOptions()+'</div></div>'+dashboardPersonalViewHtml(risksActive)+'</section>';
-  board.insertAdjacentHTML('beforeend','<div class="my-view">'+personalHtml+myViewTableHtml()+'</div>');
+  const risks=dashboardRiskInfo(state.issues||[]);
+  const personalHtml='<section class="dashboard-section dashboard-personal-view" id="my-view-personal"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">My view: '+esc(state.currentUserName||'Select a user')+'</span><span class="dashboard-section-note">Your active workload, delivery risks and deadlines</span></div><div class="personal-user-change"><label for="personal-user-mapping">Change user</label>'+dashboardPersonalUserOptions()+'</div></div>'+dashboardPersonalViewHtml(risks.active,risks)+'</section>';
+  board.insertAdjacentHTML('beforeend','<div class="my-view">'+personalHtml+myViewTableHtml(risks)+'</div>');
   const tableScroller=board.querySelector('.my-view-table-scroll');
   if(myViewScrollObserver){
     myViewScrollObserver.disconnect();
@@ -5964,34 +6140,21 @@ function renderMyView(){
     savePreferences({personalUserAccountId:state.currentUserAccountId,personalUserName:state.currentUserName});
     render();
   });
-  board.querySelectorAll('[data-personal-filter]').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      const filter=btn.dataset.personalFilter;
-      // These actions are only offered for due-date metrics. Always replace the
-      // current search and filters with the selected user's due-date filter.
-      const meId=state.currentUserAccountId||'';
-      state.searchTerm='';
-      if(searchEl) searchEl.value='';
-      state.showCompleted=false;
-      state.includeWithRemarkable=true;
-      state.personalTicketFilter='';
-      state.filterUser=meId;
-      state.filterDue=filter==='overdue'?'overdue':filter==='next7'?'next7':filter==='nextMonth'?'nextMonth':'all';
-      state.showDashboard=false;
-      state.showMyView=false;
-      state.showMilestones=false;
-      state.lockedKey=null;
-      state.selectionHistory=[];
-      state.showBlocked=false;
-      savedFullBoardView=null;
-      saveFilterPreferences();
-      updateFilterControls();
-      render();
-      // Ensure the visible filter controls reflect the filters applied by this action.
-      populateFilterUsers();
-      updateFilterControls();
+  // Exclusive session-only controls: pressing the active one turns it off.
+  // Updating rows in place preserves the table's sorting and scroll position.
+  board.querySelectorAll('[data-my-highlight]').forEach(button=>button.addEventListener('click',()=>{
+    const period=button.dataset.myHighlight;
+    state.myViewHighlightDue=state.myViewHighlightDue===period?'':period;
+    board.querySelectorAll('[data-my-highlight]').forEach(toggle=>{
+      const active=toggle.dataset.myHighlight===state.myViewHighlightDue;
+      toggle.classList.toggle('active',active);
+      toggle.setAttribute('aria-pressed',String(active));
     });
-  });
+    const matching=new Set(state.myViewHighlightDue
+      ? dashboardDueSoon(myViewAssignedIssues(),state.myViewHighlightDue==='next7'?7:31).map(i=>i.key)
+      : []);
+    board.querySelectorAll('tr[data-my-view-key]').forEach(row=>row.classList.toggle('my-view-highlight',matching.has(row.dataset.myViewKey)));
+  }));
   board.querySelector('#my-view-remarkable')?.addEventListener('change',e=>{
     state.includeWithRemarkable=e.target.checked;
     saveFilterPreferences();
@@ -8127,7 +8290,8 @@ function hideCompletedDownloadNotice(){
 
 async function load(resetSelection){
   const loadGeneration=++state.loadGeneration;
-  startLoadingStages('Connecting to Jira…'); hideError();
+  document.body.classList.toggle('jira-refreshing',hasLoadedJiraOnce);
+  startLoadingStages(hasLoadedJiraOnce?'Refreshing from Jira…':'Connecting to Jira…'); hideError();
   try{
     const wantCompleted=!!state.showCompleted;
     const d=await fetchGraph(wantCompleted ? 'all' : 'active', loadGeneration);
@@ -8135,6 +8299,7 @@ async function load(resetSelection){
     // is authoritative, so discard this older response completely.
     if(loadGeneration !== state.loadGeneration) return;
     state.issues=d.issues || []; state.edges=d.edges || []; state.levels=d.levels || 0;
+    hasLoadedJiraOnce=true;
     state.completedDownloadStatus=wantCompleted ? 'ready' : 'downloading';
     state.cleanSnapshot=cloneCleanSnapshot();
     state.pendingChanges=[]; state.history=[]; state.redoHistory=[];
@@ -8179,7 +8344,10 @@ async function load(resetSelection){
       statusText.textContent='Load failed';
     }
   }finally{
-    if(loadGeneration === state.loadGeneration) setLoading(false);
+    if(loadGeneration === state.loadGeneration){
+      setLoading(false);
+      document.body.classList.remove('jira-refreshing');
+    }
   }
 }
 
