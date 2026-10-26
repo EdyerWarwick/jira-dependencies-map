@@ -91,6 +91,7 @@ DEFAULT_PREFERENCES={
     "showCompleted":False,"filterUser":"","filterDue":"all","includeWithRemarkable":True,
     "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default","personalUserAccountId":"","personalUserName":"","myViewSorts":{},"dashboardTabSorts":{},
     "ganttScale":12,"ganttShowDependencies":True,"ganttNarrow":False,
+    "myViewColumns":["key","summary","priority","dueDate","epic","status","blockers","blocked","riskScore","riskReasons"],"milestoneSort":"dueDate",
 }
 _preferences_lock=threading.Lock()
 
@@ -108,10 +109,19 @@ def _normalise_preferences(data):
     out["ganttScale"]=out["ganttScale"] if out["ganttScale"] in (6,12,20) and type(out["ganttScale"]) is int else 12
     out["ganttShowDependencies"]=out["ganttShowDependencies"] is not False
     out["ganttNarrow"]=out["ganttNarrow"] is True
+    allowed_columns={"key","summary","priority","dueDate","epic","status","blockers","blocked","hasDescription","riskScore","riskReasons"}
+    columns=out.get("myViewColumns")
+    defaults=DEFAULT_PREFERENCES["myViewColumns"]
+    out["myViewColumns"]=[c for c in columns if isinstance(c,str) and c in allowed_columns][:len(allowed_columns)] if isinstance(columns,list) and columns else list(defaults)
+    out["myViewColumns"]=list(dict.fromkeys(out["myViewColumns"])) or list(defaults)
+    old_default=["key","summary","priority","dueDate","epic","status","blockers","blocked"]
+    if out["myViewColumns"]==old_default:
+        out["myViewColumns"]=list(defaults)
+    out["milestoneSort"]=out.get("milestoneSort") if out.get("milestoneSort") in {"dueDate","priority","assignee"} else "dueDate"
     out["startingView"]=out["startingView"] if out["startingView"] in {"default","my-view","dashboard","milestone"} else "default"
     out["personalUserAccountId"]=str(out["personalUserAccountId"] or "")
     out["personalUserName"]=str(out["personalUserName"] or "").strip()
-    valid_sort_fields={"priority","dueDate","key","summary","epic","status","blockers","blocked"}
+    valid_sort_fields={"priority","dueDate","key","summary","epic","status","blockers","blocked","hasDescription","riskScore","riskReasons"}
     sort_values=out.get("myViewSorts")
     cleaned={}
     if isinstance(sort_values,dict):
@@ -626,7 +636,7 @@ def _jira_search_parallel(jql,fields,label):
 
 # These statuses are intentionally excluded from the dependency map. A link
 # to one must not be represented as an external, unresolved blocker.
-EXCLUDED_ISSUE_STATUSES={"cancelled","canceled","archived"}
+EXCLUDED_ISSUE_STATUSES={"archived"}
 
 
 def _block_link(source, link):
@@ -667,7 +677,7 @@ def _nonblocking_external_status(status):
     name=str(status.get("name") or "").strip().lower()
     category=status.get("statusCategory") or {}
     category_key=str(category.get("key") or "").strip().lower() if isinstance(category,dict) else ""
-    return (name in EXCLUDED_ISSUE_STATUSES or name in {"done","completed","resolved","closed"}
+    return (name in EXCLUDED_ISSUE_STATUSES or name in {"done","completed","resolved","closed","cancelled","canceled"}
             or category_key=="done")
 
 
@@ -782,7 +792,7 @@ def _base_issue_fields():
 def _completed_jql(jql):
     """Restrict a JQL query to Jira's Done status category."""
     base=str(jql or JQL_QUERY).strip() or JQL_QUERY
-    return f"({base}) AND statusCategory = Done"
+    return f'({base}) AND (statusCategory = Done OR status = "Cancelled")'
 
 def _merge_issues(target, additions):
     existing={str(r.get("key") or "").strip() for r in target if r.get("key")}
@@ -834,7 +844,7 @@ def jira_fetch_all_issues(jql=None):
 def _active_jql(jql):
     """Restrict a JQL query to Jira's non-Done status category."""
     base=str(jql or JQL_QUERY).strip() or JQL_QUERY
-    return f"({base}) AND statusCategory != Done"
+    return f'({base}) AND statusCategory != Done AND status != "Cancelled"'
 
 def _completed_cache_key(jql, generation=None):
     base=str(jql or JQL_QUERY).strip() or JQL_QUERY
@@ -924,8 +934,8 @@ def _jira_description_present(value):
 
 
 def parse_dependency_graph(raw):
-    # Keep Done/Completed for historical relationships. Exclude cancelled
-    # statuses, and treat Jira-search-missing linked issues as unverified.
+    # Keep completed and cancelled issues for historical relationships. Only
+    # archived statuses are excluded; search-missing links remain unverified.
     # Jira's ARCHIVE action is not a status change: the archived issue may
     # still say Backlog, so searching status alone cannot identify it.
     raw_keys={str(r.get("key") or "").strip() for r in raw if r.get("key")}
@@ -962,7 +972,7 @@ def parse_dependency_graph(raw):
             elif blocked in issues and blocker not in issues:
                 if blocker in raw_keys:
                     # Jira DID return the linked issue, but its status made us
-                    # deliberately exclude it (Cancelled/Archived). Not external.
+                    # deliberately exclude it (Archived). Not external.
                     continue
                 if _nonblocking_external_status(linked_status):
                     # Explicitly completed/closed/cancelled linked issues are
@@ -1483,6 +1493,10 @@ def _gantt_pdf_bytes(payload):
     scale=payload.get('scale',12)
     if type(scale) is not int or scale not in (6,12,20):
         raise ValueError('Invalid Gantt PDF timeline scale.')
+    output=str(payload.get('output') or 'A3').strip().upper()
+    if output not in ('A3','A4','FULL SCREEN'):
+        raise ValueError('Invalid PDF output size.')
+    full_screen=output=='FULL SCREEN'
     narrow=payload.get('narrow') is True
     scale_name={6:'Compact',12:'Normal',20:'Expanded'}[scale]
     records=payload.get('rows') or []
@@ -1511,19 +1525,30 @@ def _gantt_pdf_bytes(payload):
                      'milestone':bool(item.get('milestone'))})
     scheduled=[r for r in rows if r['start'] is not None and r['end'] is not None and r['end']>=r['start']]
     unscheduled=[r for r in rows if r['start'] is None or r['end'] is None or r['end']<r['start']]
-    page_w,page_h=1190.55,841.89   # A3 landscape, points
     margin=40.; left_w=275. if narrow else 360.
     chart_left=margin+left_w
-    # Match screen zoom proportions while respecting legibility on A3 paper.
-    chart_w=page_w-margin-chart_left; day_w={6:3.,12:5.,20:10.}[scale]
+    day_w={6:3.,12:5.,20:10.}[scale]
     row_h=19. if narrow else 28.
-    table_top=632.; table_bottom=88.
-    per_page=max(1,int((table_top-table_bottom)/row_h))
-    capacity=max(1,int(chart_w/day_w))
+    table_bottom=88.
     dates=[d for r in scheduled for d in (r['start'],r['end'])]
     first=min(dates) if dates else date.today()
     last=max(dates) if dates else first
     days=(last-first).days+1
+    if full_screen:
+        # One single PDF sheet containing the entire timeline and every row.
+        # Its media box follows the content, instead of slicing into A3 pages.
+        day_w=scale*.75
+        row_h=25.5 if narrow else 49.5
+        left_w=225. if narrow else 315.
+        chart_left=margin+left_w
+        page_w=chart_left+days*day_w+margin
+        page_h=298.+max(1,len(rows))*row_h
+    else:
+        page_w,page_h=(841.89,595.28) if output=='A4' else (1190.55,841.89)
+    table_top=page_h-210.
+    chart_w=page_w-margin-chart_left
+    per_page=max(1,int((table_top-table_bottom)/row_h))
+    capacity=max(1,int(chart_w/day_w))
     slices=max(1,(days+capacity-1)//capacity) if scheduled else 0
     page_specs=[]
     for ix in range(slices):
@@ -1533,7 +1558,10 @@ def _gantt_pdf_bytes(payload):
             page_specs.append(('timeline',ix+1,begin,finish,scheduled[offset:offset+per_page]))
     for offset in range(0,len(unscheduled),per_page):
         page_specs.append(('unscheduled',0,None,None,unscheduled[offset:offset+per_page]))
-    if not page_specs:
+    if full_screen:
+        page_specs=[('timeline',1,first,last,scheduled+unscheduled)]
+        slices=1
+    elif not page_specs:
         page_specs.append(('unscheduled',0,None,None,[]))
     def rgb(value):
         return tuple(int(value[i:i+2],16)/255 for i in (1,3,5))
@@ -1586,12 +1614,14 @@ def _gantt_pdf_bytes(payload):
         cmds=[]
         cmds.append(rect(0,page_h-112,page_w,112,'#172033'))
         cmds.append(txt(margin,page_h-47,('PROJECT MILESTONES  /  ' if is_overview else 'MILESTONE GANTT  /  ' if is_milestone else 'SELECTED CHAIN GANTT  /  ')+key,12,True,'#bfdbfe'))
-        cmds.append(txt(margin,page_h-78,title,20,True,'#ffffff',102))
-        cmds.append(txt(page_w-270,page_h-49,'Page '+str(page_no)+' of '+str(total_pages),11,True,'#ffffff'))
+        cmds.append(txt(margin,page_h-78,fit_label(title,page_w-2*margin,20,True),20,True,'#ffffff',102))
+        if not full_screen:
+            cmds.append(txt(page_w-270,page_h-49,'Page '+str(page_no)+' of '+str(total_pages),11,True,'#ffffff'))
         detail='Scheduled '+str(len(scheduled))+'  |  Unscheduled '+str(len(unscheduled))+'  |  '+scale_name+' timeline  |  '+('Narrow' if narrow else 'Standard')+' labels'
         cmds.append(txt(margin,page_h-137,detail,10,False,'#475569'))
         if mode=='timeline':
-            cmds.append(txt(margin,page_h-162,'Timeline: '+begin.strftime('%d %b %Y')+' - '+finish.strftime('%d %b %Y')+f'  (date segment {part}/{slices})',10,True))
+            segment_label='' if full_screen else f'  (date segment {part}/{slices})'
+            cmds.append(txt(margin,page_h-162,'Timeline: '+begin.strftime('%d %b %Y')+' - '+finish.strftime('%d %b %Y')+segment_label,10,True))
         else:
             cmds.append(txt(margin,page_h-162,('Milestones without valid start and due dates' if is_overview else 'Unscheduled tasks  |  Missing due date, usable start date or invalid date range'),10,True))
         cmds.append(rect(margin,table_top+15,left_w,32,'#f1f5f9'))
@@ -1631,10 +1661,10 @@ def _gantt_pdf_bytes(payload):
                 one_line=key_label+'  |  '+r['summary']
                 cmds.append(txt(margin+8,cy-3,fit_label(one_line,left_w-43,9,False),9,False,'#172033'))
             else:
-                heading=(key_label+'  |  '+r['start'].strftime('%d %b %y')+' - '+r['end'].strftime('%d %b %y')) if is_overview and mode=='timeline' else key_label+'  |  '+r['status']
+                heading=(key_label+'  |  '+r['start'].strftime('%d %b %y')+' - '+r['end'].strftime('%d %b %y')) if is_overview and mode=='timeline' and r['start'] and r['end'] and r['end']>=r['start'] else key_label+'  |  '+r['status']
                 cmds.append(txt(margin+8,y+17,fit_label(heading,left_w-43,9,True),9,True,'#172033'))
                 cmds.append(txt(margin+8,y+5,fit_label(r['summary'],left_w-43,8),8,False,'#64748b'))
-            if mode=='timeline':
+            if mode=='timeline' and r['start'] is not None and r['end'] is not None and r['end']>=r['start']:
                 a=max(r['start'],begin); b=min(r['end'],finish)
                 if b>=a:
                     x=chart_left+((a-begin).days)*day_w+1
@@ -1656,9 +1686,9 @@ def _gantt_pdf_bytes(payload):
                     cmds.append(txt(chart_left+9,cy-3,fit_label(r['reason'] or 'Missing schedule data',chart_w-18,9,True),9,True,'#b45309'))
                 else:
                     cmds.append(txt(chart_left+9,y+17,r['reason'] or 'Missing schedule data',9,True,'#b45309',110))
-                    cmds.append(txt(chart_left+9,y+5,dates+'  |  '+r['status'],8,False,'#64748b',110))
+                    cmds.append(txt(chart_left+9,y+5,fit_label(dates+'  |  '+r['status'],chart_w-18,8),8,False,'#64748b',110))
         if mode=='timeline':
-            visible={r['key']:r for r in page_rows}
+            visible={r['key']:r for r in page_rows if r['start'] is not None and r['end'] is not None and r['end']>=r['start']}
             for parent,child in all_edges:
                 if parent not in visible or child not in visible: continue
                 a,b=visible[parent],visible[child]
@@ -1702,12 +1732,19 @@ def _gantt_pdf_bytes(payload):
     font_regular=add(b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>')
     font_bold=add(b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>')
     page_ids=[]
+    import math
+    user_unit=max(1,math.ceil(max(page_w,page_h)/14000))
     for stream in content:
+        if user_unit>1:
+            # PDF coordinates remain in points; shrink the MediaBox and
+            # compensate using /UserUnit for very large single-sheet charts.
+            transform=f'q {1/user_unit:.10f} 0 0 {1/user_unit:.10f} 0 0 cm\n'.encode()
+            stream=transform+stream+b'Q\n'
         body=add(b'<< /Length '+str(len(stream)).encode()+b' >>\nstream\n'+stream+b'\nendstream')
-        page_ids.append(add((f'<< /Type /Page /Parent {pages_obj} 0 R /MediaBox [0 0 {page_w:.2f} {page_h:.2f}] /Resources << /Font << /F1 {font_regular} 0 R /F2 {font_bold} 0 R >> >> /Contents {body} 0 R >>').encode('ascii')))
+        page_ids.append(add((f'<< /Type /Page /Parent {pages_obj} 0 R /MediaBox [0 0 {page_w/user_unit:.2f} {page_h/user_unit:.2f}] /UserUnit {user_unit} /Resources << /Font << /F1 {font_regular} 0 R /F2 {font_bold} 0 R >> >> /Contents {body} 0 R >>').encode('ascii')))
     objects[pages_obj]=b'<< /Type /Pages /Kids ['+b' '.join((str(i)+' 0 R').encode() for i in page_ids)+b'] /Count '+str(len(page_ids)).encode()+b' >>'
     root=add((f'<< /Type /Catalog /Pages {pages_obj} 0 R >>').encode())
-    pdf=io.BytesIO();pdf.write(b'%PDF-1.4\n%\xe2\xe3\xcf\xd3\n');offsets=[0]
+    pdf=io.BytesIO();pdf.write((b'%PDF-1.6\n' if user_unit>1 else b'%PDF-1.4\n')+b'%\xe2\xe3\xcf\xd3\n');offsets=[0]
     for n,obj in enumerate(objects[1:],1):
         offsets.append(pdf.tell())
         pdf.write(f'{n} 0 obj\n'.encode()+obj+b'\nendobj\n')
@@ -2052,6 +2089,7 @@ body.gantt-open .ticket-preview-modal{z-index:25031}
 .minimap-card.highlight-locked{border-color:#d97706;background:#f59e0b}
 .minimap-card.dimmed{opacity:.5}
 .minimap-card.overdue{border-color:#ef4444;background:#ef4444;box-shadow:0 0 0 1px #b91c1c}
+.minimap-card.completed{border-color:#86c7a0;background:#bbf7d0;box-shadow:none}
 #board-minimap-viewport{
   position:absolute;left:0;top:0;
   border:2px solid #6366f1;background:rgba(99,102,241,.10);
@@ -2263,6 +2301,12 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
   z-index:100;opacity:0;pointer-events:none;transition:opacity .2s;
 }
 #loading.show{opacity:1;pointer-events:auto}
+/* Close & refresh from a full-screen Gantt: loading belongs above its modal. */
+body.gantt-open #loading.show{z-index:26000;inset:0;background:rgba(15,23,42,.50);backdrop-filter:blur(3px)}
+body.gantt-open #loading.show::before{display:none}
+body.gantt-open #loading.show .loading-favicon-wrap{background:#fff;width:80px;height:80px;border:2px solid #a5b4fc;box-shadow:0 0 0 12px rgba(255,255,255,.10)}
+body.gantt-open #loading.show #loading-label,body.gantt-open #loading.show #loading-status{color:white}
+body.gantt-open #loading.show .loading-progress,body.gantt-open #loading.show .startup-message{display:none!important}
 /* dependency-status is earlier in the DOM than #loading, so it cannot be hidden with a following-sibling selector. */
 #dependency-status.loading-hidden{display:none !important}
 #dependency-status.view-hidden{display:none !important}
@@ -2716,6 +2760,29 @@ a.relation-key.completed{text-decoration:line-through;text-decoration-thickness:
 .my-view-table-heading h2{font-size:15px;color:#172033}
 .my-view-table-heading p{font-size:11px;color:#64748b;margin-top:3px}
 .my-view-sort-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.my-view-personalise{position:relative}
+.my-view-personalise-button{padding:8px 12px;border:1px solid #cbd5e1;background:#fff;color:#334155;border-radius:7px;font-size:12px;font-weight:750;cursor:pointer}
+.my-view-personalise-button:hover,.my-view-personalise-button[aria-expanded="true"]{background:#eef2ff;border-color:#818cf8}
+.my-view-columns-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:80;width:290px;max-height:min(560px,70vh);overflow:auto;padding:12px;background:#fff;border:1px solid #cbd5e1;box-shadow:0 10px 32px #0f172a25;border-radius:9px;display:grid;gap:7px}
+.my-view-columns-menu[hidden]{display:none!important}
+.my-view-columns-menu label{display:flex;align-items:center;gap:9px;font-size:12px;color:#334155;cursor:pointer}
+.my-view-columns-menu input{accent-color:#4f46e5}
+.my-view-column-hint{font-size:11px;line-height:1.4;color:#64748b;margin:0 0 2px}
+.my-view-column-error{font-size:11px;color:#b45309;min-height:14px}
+.my-view-column-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap;border-top:1px solid #e2e8f0;padding-top:9px}
+.my-view-column-actions button{padding:6px 9px;border-radius:6px;cursor:pointer;font-size:11px;border:1px solid #cbd5e1;background:#fff;color:#334155}
+.my-view-column-actions .my-view-column-defaults{background:#f1f5f9;margin-right:auto}
+.my-view-column-actions .my-view-column-apply{background:#4f46e5;border-color:#4f46e5;color:#fff;font-weight:750}
+.my-view-column-actions button:disabled{opacity:.6;cursor:wait}
+.my-view-table th[draggable="true"]{cursor:grab}
+.my-view-table th.my-view-col-dragging{opacity:.4;cursor:grabbing}
+.my-view-table th.my-view-col-drag-over{background:#e0e7ff}
+.my-view-table th.my-view-col-drag-over.before{box-shadow:inset 3px 0 #4f46e5}
+.my-view-table th.my-view-col-drag-over.after{box-shadow:inset -3px 0 #4f46e5}
+.my-view-drag-handle{font-size:15px;margin-right:6px;color:#94a3b8;vertical-align:middle;user-select:none}
+.my-view-table th[draggable="true"]:hover .my-view-drag-handle{color:#4f46e5}
+.milestone-sort-label{display:flex;align-items:center;gap:6px;color:#475569;font-size:12px;font-weight:700;white-space:nowrap}
+.milestone-sort-label select{background:#fff;border:1px solid #cbd5e1;border-radius:6px;padding:6px 8px;color:#334155;font:inherit}
 .my-view-sort-status{color:#64748b;font-size:11px}
 .my-view-save-sort{border:1px solid #6366f1;border-radius:7px;padding:8px 12px;background:#4f46e5;color:#fff;cursor:pointer;font-weight:750;font-size:12px}
 .my-view-save-sort:hover{background:#4338ca}
@@ -2822,7 +2889,7 @@ body.gantt-open{overflow:hidden}
 .gantt-task-area{position:relative}
 .gantt-task-row{position:relative;display:flex;min-height:66px;border-bottom:1px solid #e2e8f0}
 .gantt-task-row:nth-of-type(even){background:#f8fafc}
-.gantt-task-label{position:sticky;left:0;z-index:11;box-sizing:border-box;width:var(--gantt-left);flex:0 0 var(--gantt-left);display:flex;align-items:center;gap:10px;background:inherit;border-right:1px solid #cbd5e1;padding:6px 12px;white-space:normal;overflow-wrap:anywhere;font-size:11px;line-height:15px}
+.gantt-task-label{margin-bottom: -1px;position:sticky;left:0;z-index:11;box-sizing:border-box;width:var(--gantt-left);flex:0 0 var(--gantt-left);display:flex;align-items:center;gap:10px;background:inherit;border-right:1px solid #cbd5e1;padding:6px 12px;white-space:normal;overflow-wrap:anywhere;font-size:11px;line-height:15px}
 .gantt-task-info{flex:1 1 auto;min-width:0}
 .gantt-assignee{display:flex;align-items:center;justify-content:center;align-self:center;flex:0 0 26px;width:26px;height:26px;box-sizing:border-box;border-radius:50%;background:#e2e8f0;color:#334155;border:1px solid #cbd5e1;font-size:10px;font-weight:800;line-height:1;white-space:nowrap;letter-spacing:-.2px}
 .gantt-assignee.unassigned{background:#2563eb;border-color:#1d4ed8;color:#fff}
@@ -2851,6 +2918,14 @@ body.gantt-open{overflow:hidden}
 .gantt-today{position:absolute;top:0;bottom:0;border-left:2px solid #ef4444;z-index:10;pointer-events:none;box-shadow:0 0 0 1px rgba(255,255,255,.4)}
 .gantt-links-svg{position:absolute;top:0;z-index:2;overflow:visible;pointer-events:none}
 .gantt-bar{position:absolute;z-index:3;top:50%;transform:translateY(-50%);height:12px;min-width:4px;border-radius:4px;opacity:.95;box-shadow:0 1px 2px #0002}
+.gantt-task-row.gantt-chain-dim .gantt-task-label,.gantt-task-row.gantt-chain-dim .gantt-task-track,.gantt-links-svg.gantt-chain-dim{opacity:.28;transition:opacity .12s ease}
+.gantt-task-row.gantt-chain-active .gantt-task-label{background:#eef2ff}
+.gantt-task-label{cursor:pointer}
+.gantt-task-label .gantt-task-info>a{cursor:pointer}
+.gantt-bar,.gantt-diamond{cursor:pointer}
+.gantt-canvas.gantt-dependencies-off .gantt-bar,.gantt-canvas.gantt-dependencies-off .gantt-diamond{cursor:default}
+.gantt-task-row.gantt-chain-locked .gantt-task-track{background:rgba(99,102,241,.10)}
+.gantt-links-svg path.gantt-link-dim{opacity:.16}
 .gantt-diamond{position:absolute;top:50%;z-index:4;width:13px;height:13px;transform:translateY(-50%) rotate(45deg);border:1px solid #fff;box-shadow:0 1px 2px #0003}
 .gantt-unscheduled{border-top:1px solid #dbe2ea;background:#fff;flex:0 0 auto;max-height:25vh;overflow:auto;padding:10px 18px;color:#475569}
 .gantt-unscheduled-heading{font-size:12px;font-weight:850;color:#334155;margin-bottom:7px}
@@ -3218,7 +3293,7 @@ body.gantt-open{overflow:hidden}
   <section class="gantt-modal">
     <div class="gantt-header">
       <div class="gantt-header-main"><div class="gantt-eyebrow">Milestone timeline</div><h2 id="gantt-title"></h2><div id="gantt-counts" class="gantt-counts"></div></div>
-      <div class="gantt-actions"><span id="gantt-export-status" class="gantt-export-status" role="status" aria-live="polite"></span><button type="button" class="gantt-action gantt-export" id="gantt-export">↓ Download PDF</button><button type="button" class="gantt-action" id="gantt-close">Close ×</button></div>
+      <div class="gantt-actions"><span id="gantt-export-status" class="gantt-export-status" role="status" aria-live="polite"></span><label for="gantt-output" style="font-size:12px">Output <select id="gantt-output" style="padding:7px 9px;border-radius:6px;background:#fff;color:#172033"><option value="A4">A4</option><option value="A3" selected>A3</option><option value="Full screen">Full screen</option></select></label><button type="button" class="gantt-action gantt-export" id="gantt-export">↓ Download PDF</button><button type="button" class="gantt-action" id="gantt-close">Close ×</button></div>
     </div>
     <div class="gantt-toolbar"><div class="gantt-scale-buttons" role="group" aria-label="Timeline zoom"><button type="button" class="gantt-scale" data-gantt-scale="6">Compact</button><button type="button" class="gantt-scale active" data-gantt-scale="12">Normal</button><button type="button" class="gantt-scale" data-gantt-scale="20">Expanded</button></div><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-show-dependencies" checked> Show dependencies</label><label class="gantt-dependency-toggle"><input type="checkbox" id="gantt-narrow"> Narrow</label><div class="gantt-legend"><span id="gantt-legend-active"><b style="background:#2563eb"></b>In progress</span><span id="gantt-legend-completed"><b style="background:#16a34a"></b>Completed</span><span id="gantt-legend-remarkable"><b style="background:#d97706"></b>With Remarkable</span><span id="gantt-legend-milestone"><i class="gantt-legend-milestone"></i>Milestone</span><span id="gantt-legend-dependencies">→ Dependencies</span><span style="color:#ef4444">│ Today</span></div></div>
     <div id="gantt-chart" class="gantt-chart-wrap" aria-label="Milestone Gantt timeline"></div>
@@ -3265,7 +3340,7 @@ const state = {
   showMilestones:false,         // toggle: OFF by default; milestone overview
   showDashboard:false,
   showMyView:false,
-  myViewSavedSorts:{}, myViewSort:{field:'priority',direction:'asc'},
+  myViewSavedSorts:{}, myViewSort:{field:'priority',direction:'asc'}, myViewColumns:['key','summary','priority','dueDate','epic','status','blockers','blocked','riskScore','riskReasons'], milestoneSort:'dueDate', ganttReturnToMilestones:false, ganttReturnContext:null,
   dashboardSavedSorts:{},dashboardDraftSorts:{},dashboardTab:'needs-attention',dashboardPages:{},dashboardAttentionFilter:'',
   startingView:'default',
   showMiniMap:true, customJql:'', useJiraModal:false, ganttScale:12, ganttShowDependencies:true, ganttNarrow:false, currentUserName:'', currentUserAccountId:'', personalUserOverride:false, personalTicketFilter:'',
@@ -3333,6 +3408,8 @@ async function loadPreferences(){
     state.ganttScale=[6,12,20].includes(saved.ganttScale) ? saved.ganttScale : 12;
     state.ganttShowDependencies=saved.ganttShowDependencies!==false;
     state.ganttNarrow=saved.ganttNarrow===true;
+    state.myViewColumns=normaliseMyViewColumns(saved.myViewColumns);
+    state.milestoneSort=['dueDate','priority','assignee'].includes(saved.milestoneSort)?saved.milestoneSort:'dueDate';
     state.startingView=['default','my-view','dashboard','milestone'].includes(saved.startingView) ? saved.startingView : 'default';
     state.myViewSavedSorts=(saved.myViewSorts && typeof saved.myViewSorts==='object' && !Array.isArray(saved.myViewSorts)) ? saved.myViewSorts : {};
     state.dashboardSavedSorts=(saved.dashboardTabSorts && typeof saved.dashboardTabSorts==='object' && !Array.isArray(saved.dashboardTabSorts)) ? saved.dashboardTabSorts : {};
@@ -3364,7 +3441,8 @@ async function savePreferences(updates){
         showMiniMap:state.showMiniMap!==false, startingView:state.startingView || 'default',
         ganttScale:state.ganttScale, ganttShowDependencies:state.ganttShowDependencies!==false, ganttNarrow:state.ganttNarrow===true,
         personalUserAccountId:state.currentUserAccountId||'', personalUserName:state.currentUserName||'',
-        myViewSorts:state.myViewSavedSorts||{}, dashboardTabSorts:state.dashboardSavedSorts||{}
+        myViewSorts:state.myViewSavedSorts||{}, dashboardTabSorts:state.dashboardSavedSorts||{},
+        myViewColumns:normaliseMyViewColumns(state.myViewColumns),milestoneSort:state.milestoneSort||'dueDate'
       }),cache:'no-store'
     });
     if(!response.ok) throw new Error('Preferences API returned '+response.status);
@@ -4835,12 +4913,12 @@ async function saveChanges(){
 // ── Status badge colour ───────────────────────────────────────────────────
 function isCompletedStatus(status){
   const value = String(status || '').toLowerCase().trim();
-  return value === 'completed' || value === 'done';
+  return value === 'completed' || value === 'done' || value === 'cancelled' || value === 'canceled';
 }
 
 function statusStyle(s){
   const l = (s || '').toLowerCase();
-  if(l.includes('done') || l.includes('complete'))
+  if(l.includes('done') || l.includes('complete') || l.includes('cancel'))
     return 'background:#dcfce7;color:#166534;border:1px solid #bbf7d0';
   if(l.includes('progress') || l.includes('doing') || l.includes('active'))
     return 'background:#dbeafe;color:#1e40af;border:1px solid #bfdbfe';
@@ -5522,7 +5600,7 @@ function dashboardCompareTable(a,b,tab,risks,graph){
   const sort=dashboardSortForTab(tab);
   function value(i,field){
     if(field==='priority') return priorityRank(i.priority);
-    if(field==='dueDate') return i.dueDate||'';
+    if(field==='dueDate'||field==='startDate'||field==='created') return i[field]||'';
     if(field==='epic') return (i.epic?.summary||i.epic?.key||'').toLowerCase();
     if(field==='assignee') return (i.assigneeAccountId?i.assignee:'').toLowerCase();
     if(field==='blockers') return graph.upstreamCount(i.key);
@@ -5742,7 +5820,36 @@ function updateDashboardPagination(section){
 function isWithRemarkableStatus(i){
   return String(i?.status||'').trim().toLowerCase()==='with remarkable';
 }
-const MY_VIEW_SORT_FIELDS=['key','summary','priority','dueDate','epic','status','blockers','blocked'];
+const MY_VIEW_COLUMNS=[['key','Key'],['summary','Summary'],['priority','Priority'],['dueDate','Due date'],['epic','Parent (epic)'],['status','Status'],['blockers','Blockers'],['blocked','Blocked'],['hasDescription','Description'],['riskScore','Risk score'],['riskReasons','Risk reasons']];
+const MY_VIEW_DEFAULT_COLUMNS=['key','summary','priority','dueDate','epic','status','blockers','blocked','riskScore','riskReasons'];
+const MY_VIEW_SORT_FIELDS=MY_VIEW_COLUMNS.map(c=>c[0]);
+function normaliseMyViewColumns(columns){
+  const valid=new Set(MY_VIEW_SORT_FIELDS);
+  const selected=Array.isArray(columns)?[...new Set(columns.filter(c=>valid.has(c)))]:MY_VIEW_DEFAULT_COLUMNS;
+  return selected.length?[...selected]:[...MY_VIEW_DEFAULT_COLUMNS];
+}
+function myViewColumnCell(i,field){
+  switch(field){
+    case 'key': return '<a class="dashboard-ticket-key" href="'+esc(i.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(i.key)+'">'+esc(i.key)+'</a>';
+    case 'summary': return esc(i.summary||'');
+    case 'priority': return '<div class="my-view-priority" title="'+esc(i.priority||'Unspecified')+'">'+dashboardPriorityHtml(i)+'</div>';
+    case 'dueDate':return dueDateHtml(i);
+    case 'epic':{
+      const e=i.epic,label=e?(e.summary?e.summary+' ('+e.key+')':e.key):'';
+      return e?'<a href="'+esc(e.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(e.key)+'" title="'+esc(label)+'">'+esc(label)+'</a>':'—';
+    }
+    case 'status':return '<span class="status-badge" style="'+statusStyle(i.status)+'">'+esc(i.status||'—')+'</span>';
+    case 'blockers':return '<span class="my-view-count upstream">'+dashboardMyViewGraph.upstreamCount(i.key)+'</span>';
+    case 'blocked':return '<span class="my-view-count downstream">'+dashboardMyViewGraph.downstreamCount(i.key)+'</span>';
+    case 'hasDescription':return i.hasDescription?'Yes':'No';
+    case 'riskScore':return '<strong class="dashboard-risk-score">'+(myViewTicketRisks.get(i.key)?.score||0)+'</strong>';
+    case 'riskReasons':{
+      const reasons=myViewTicketRisks.get(i.key)?.reasons||[];
+      return reasons.length?'<span class="dashboard-reason-list" title="'+esc(reasons.map(x=>x.label+' (+'+x.points+')').join(', '))+'">'+reasons.map(x=>'<span class="dashboard-risk-reason" title="+'+x.points+' points">'+esc(x.label)+'</span>').join('')+'</span>':'—';
+    }
+    default:return '—';
+  }
+}
 function resetMyViewSort(){
   const preference=state.myViewSavedSorts?.[state.currentUserAccountId||''];
   state.myViewSort={field:MY_VIEW_SORT_FIELDS.includes(preference?.field)?preference.field:'priority',direction:preference?.direction==='desc'?'desc':'asc'};
@@ -5766,6 +5873,9 @@ function compareMyViewIssues(a,b){
     if(field==='epic') return (i.epic?.key||'').toLowerCase();
     if(field==='blockers') return dashboardMyViewGraph.upstreamCount(i.key);
     if(field==='blocked') return dashboardMyViewGraph.downstreamCount(i.key);
+    if(field==='hasDescription') return i.hasDescription?1:0;
+    if(field==='riskScore')return myViewTicketRisks.get(i.key)?.score||0;
+    if(field==='riskReasons')return (myViewTicketRisks.get(i.key)?.reasons||[]).map(r=>r.label).join(', ').toLowerCase();
     return String(i[field]||'').toLowerCase();
   };
   const av=getValue(a),bv=getValue(b);
@@ -5780,42 +5890,35 @@ function compareMyViewIssues(a,b){
   return a.key.localeCompare(b.key);
 }
 let dashboardMyViewGraph=null;
+let myViewTicketRisks=new Map();
 function myViewTableHtml(){
   const tickets=myViewAssignedIssues();
   const remarkableCount=myViewAssignedIssues(true).filter(isWithRemarkableStatus).length;
   // All active Jira issues must contribute to upstream/downstream counts,
   // including With Remarkable even if hidden by a Full board filter.
   dashboardMyViewGraph=dashboardGraphTraversal(state.issues||[]);
+  // Reuse exactly the same risk calculation as Project overview / Needs attention.
+  myViewTicketRisks=dashboardRiskInfo(state.issues||[]).ticketRisks;
   const sorted=[...tickets].sort(compareMyViewIssues);
-  const headers=[['key','Key'],['summary','Summary'],['priority','Priority'],['dueDate','Due date'],['epic','Parent (epic)'],['status','Status'],['blockers','Blockers'],['blocked','Blocked']];
+  const selected=normaliseMyViewColumns(state.myViewColumns);
+  const names=new Map(MY_VIEW_COLUMNS);
+  const headers=selected.map(field=>[field,names.get(field)]).filter(([,label])=>label);
   const headerHtml=headers.map(([field,label])=>{
     const active=state.myViewSort.field===field;
-    return '<th scope="col" aria-sort="'+(active?(state.myViewSort.direction==='asc'?'ascending':'descending'):'none')+'"><button type="button" class="'+(active?'active':'')+'" data-my-view-sort="'+field+'">'+label+' <span aria-hidden="true">'+(active?(state.myViewSort.direction==='asc'?'▲':'▼'):'↕')+'</span></button></th>';
+    return '<th scope="col" draggable="true" data-my-col="'+field+'" title="Drag to reorder '+esc(label)+' column" aria-sort="'+(active?(state.myViewSort.direction==='asc'?'ascending':'descending'):'none')+'"><span class="my-view-drag-handle" aria-hidden="true">⠿</span><button type="button" class="'+(active?'active':'')+'" data-my-view-sort="'+field+'">'+esc(label)+' <span aria-hidden="true">'+(active?(state.myViewSort.direction==='asc'?'▲':'▼'):'↕')+'</span></button></th>';
   }).join('');
-  const rows=sorted.map(i=>{
-    const epic=i.epic;
-    const epicLabel=epic?(epic.summary?epic.summary+' ('+epic.key+')':epic.key):'';
-    const epicHtml=epic?'<a href="'+esc(epic.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(epic.key)+'" title="'+esc(epicLabel)+'">'+esc(epicLabel)+'</a>':'—';
-    return '<tr class="my-view-row dashboard-ticket" data-key="'+esc(i.key)+'" data-my-view-key="'+esc(i.key)+'" tabindex="0" title="Open dependency chain for '+esc(i.key)+'">'+
-      '<td><a class="dashboard-ticket-key" href="'+esc(i.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(i.key)+'">'+esc(i.key)+'</a></td>'+
-      '<td class="my-view-summary">'+esc(i.summary||'')+'</td>'+
-      '<td><div class="my-view-priority" title="'+esc(i.priority||'Unspecified')+'">'+dashboardPriorityHtml(i)+'</div></td>'+
-      '<td>'+dueDateHtml(i)+'</td>'+
-      '<td class="my-view-parent">'+epicHtml+'</td>'+
-      '<td><span class="status-badge" style="'+statusStyle(i.status)+'">'+esc(i.status||'—')+'</span></td>'+
-      '<td><span class="my-view-count upstream">'+dashboardMyViewGraph.upstreamCount(i.key)+'</span></td>'+
-      '<td><span class="my-view-count downstream">'+dashboardMyViewGraph.downstreamCount(i.key)+'</span></td>'+
-    '</tr>';
-  }).join('');
+  const rows=sorted.map(i=>'<tr class="my-view-row dashboard-ticket" data-key="'+esc(i.key)+'" data-my-view-key="'+esc(i.key)+'" tabindex="0" title="Open dependency chain for '+esc(i.key)+'">'+
+    headers.map(([field])=>'<td data-my-col="'+field+'"'+(field==='summary'?' class="my-view-summary"':field==='epic'?' class="my-view-parent"':'')+'>'+myViewColumnCell(i,field)+'</td>').join('')+'</tr>').join('');
+  const columnsPicker='<div class="my-view-personalise"><button type="button" id="my-view-personalise" class="my-view-personalise-button" aria-expanded="false" aria-controls="my-view-columns-menu">Personalise table</button><div id="my-view-columns-menu" class="my-view-columns-menu" hidden><strong style="font-size:12px">Visible columns</strong><p class="my-view-column-hint">Tick the columns you want, then Apply. Drag column headings in the table to reorder.</p>'+MY_VIEW_COLUMNS.map(([field,label])=>'<label><input type="checkbox" data-my-column="'+field+'"'+(selected.includes(field)?' checked':'')+'> '+esc(label)+'</label>').join('')+'<span class="my-view-column-error" id="my-view-column-error" role="status" aria-live="polite"></span><div class="my-view-column-actions"><button type="button" class="my-view-column-defaults" id="my-view-column-defaults">Restore defaults</button><button type="button" class="my-view-column-cancel" id="my-view-column-cancel">Cancel</button><button type="button" class="my-view-column-apply" id="my-view-column-apply">Apply</button></div></div></div>';
   const hasUser=!!state.currentUserAccountId;
   const remarkableToggle=remarkableCount
     ? '<label class="my-view-remarkable-toggle" for="my-view-remarkable"><input type="checkbox" id="my-view-remarkable"'+(state.includeWithRemarkable?' checked':'')+'><span>Include With Remarkable</span><span class="my-view-remarkable-count">('+remarkableCount+')</span></label>'
     : '';
-  return '<section class="my-view-table-section"><div class="my-view-table-heading"><div><h2>Assigned work <span class="dashboard-section-count">('+sorted.length+')</span></h2><p>Active tickets assigned to the selected user. Select a row to open its dependency chain. Click a heading to change the sort.</p></div>'+
-    '<div class="my-view-sort-actions">'+remarkableToggle+'<span class="my-view-sort-status">'+(myViewSortChanged()?'Sorting not saved':(state.myViewSavedSorts?.[state.currentUserAccountId||'']?'Sorting saved':'Default sorting'))+'</span><button class="my-view-save-sort" type="button" id="my-view-save-sort"'+(!hasUser || !myViewSortChanged()?' disabled':'')+'>Save sort</button></div></div>'+
+  return '<section class="my-view-table-section"><div class="my-view-table-heading"><div><h2>Assigned work <span class="dashboard-section-count">('+sorted.length+')</span></h2><p>Active tickets assigned to the selected user. Select a row to open its dependency chain. Click a heading to sort or drag it to reorder columns.</p></div>'+
+    '<div class="my-view-sort-actions">'+remarkableToggle+columnsPicker+'<span class="my-view-sort-status">'+(myViewSortChanged()?'Sorting not saved':(state.myViewSavedSorts?.[state.currentUserAccountId||'']?'Sorting saved':'Default sorting'))+'</span><button class="my-view-save-sort" type="button" id="my-view-save-sort"'+(!hasUser || !myViewSortChanged()?' disabled':'')+'>Save sort</button></div></div>'+
     '<div class="my-view-scroll-controls" hidden><span class="my-view-scroll-hint">Scroll to see more columns</span><button type="button" class="my-view-scroll-button" data-my-view-scroll="left" aria-label="Scroll assigned work left">&#8592;</button><button type="button" class="my-view-scroll-button" data-my-view-scroll="right" aria-label="Scroll assigned work right">&#8594;</button></div>'+ 
     '<div class="my-view-table-scroll" role="region" aria-label="Assigned work table, horizontally scrollable" tabindex="0"><table class="my-view-table"><thead><tr>'+headerHtml+'</tr></thead><tbody>'+
-    (rows || '<tr><td colspan="8" class="my-view-empty">'+(hasUser?'No active tickets assigned to this user.':'Choose a user above to see their tickets.')+'</td></tr>')+'</tbody></table></div></section>';
+    (rows || '<tr><td colspan="'+headers.length+'" class="my-view-empty">'+(hasUser?'No active tickets assigned to this user.':'Choose a user above to see their tickets.')+'</td></tr>')+'</tbody></table></div></section>';
 }
 // The scroll buttons appear only when the table is wider than its container.
 function updateMyViewScrollControls(){
@@ -5830,7 +5933,9 @@ function updateMyViewScrollControls(){
 const myViewScrollObserver=typeof ResizeObserver==='undefined' ? null : new ResizeObserver(updateMyViewScrollControls);
 window.addEventListener('resize',updateMyViewScrollControls);
 
+let myViewColumnMenuController=new AbortController();
 function renderMyView(){
+  myViewColumnMenuController.abort();myViewColumnMenuController=new AbortController();
   const risksActive=(state.issues||[]).filter(i=>!isCompletedStatus(i.status));
   const personalHtml='<section class="dashboard-section dashboard-personal-view" id="my-view-personal"><div class="dashboard-section-head"><div class="dashboard-section-heading"><span class="dashboard-section-title">My view: '+esc(state.currentUserName||'Select a user')+'</span><span class="dashboard-section-note">Your active tickets and deadlines</span><span class="dashboard-section-note personal-overwrite-note">Show on board overwrites your filters</span></div><div class="personal-user-change"><label for="personal-user-mapping">Change user</label>'+dashboardPersonalUserOptions()+'</div></div>'+dashboardPersonalViewHtml(risksActive)+'</section>';
   board.insertAdjacentHTML('beforeend','<div class="my-view">'+personalHtml+myViewTableHtml()+'</div>');
@@ -5893,6 +5998,98 @@ function renderMyView(){
     updateFilterControls();
     render();
   });
+  const personaliseButton=board.querySelector('#my-view-personalise');
+  const columnsMenu=board.querySelector('#my-view-columns-menu');
+  function closeColumnsMenu(){
+    if(!columnsMenu)return;
+    columnsMenu.hidden=true;
+    personaliseButton?.setAttribute('aria-expanded','false');
+  }
+  personaliseButton?.addEventListener('click',e=>{
+    e.stopPropagation();
+    const opening=columnsMenu.hidden;
+    columnsMenu.hidden=!opening;
+    personaliseButton.setAttribute('aria-expanded',String(opening));
+    // Reopening always discards an unapplied draft.
+    if(opening){
+      const chosen=new Set(normaliseMyViewColumns(state.myViewColumns));
+      columnsMenu.querySelectorAll('[data-my-column]').forEach(input=>{input.checked=chosen.has(input.dataset.myColumn);});
+      columnsMenu.querySelector('#my-view-column-error').textContent='';
+    }
+  });
+  columnsMenu?.addEventListener('click',e=>e.stopPropagation());
+  document.addEventListener('click',e=>{
+    if(!columnsMenu?.isConnected||columnsMenu.hidden||e.target.closest('.my-view-personalise'))return;
+    closeColumnsMenu();
+  },{signal:myViewColumnMenuController.signal});
+  columnsMenu?.querySelector('#my-view-column-cancel')?.addEventListener('click',closeColumnsMenu);
+  columnsMenu?.querySelector('#my-view-column-defaults')?.addEventListener('click',()=>{
+    const defaults=new Set(MY_VIEW_DEFAULT_COLUMNS);
+    columnsMenu.querySelectorAll('[data-my-column]').forEach(input=>{input.checked=defaults.has(input.dataset.myColumn);});
+    columnsMenu.querySelector('#my-view-column-error').textContent='Defaults selected. Click Apply to save.';
+  });
+  columnsMenu?.querySelector('#my-view-column-apply')?.addEventListener('click',async()=>{
+    const chosen=new Set([...columnsMenu.querySelectorAll('[data-my-column]:checked')].map(input=>input.dataset.myColumn));
+    const error=columnsMenu.querySelector('#my-view-column-error');
+    if(!chosen.size){error.textContent='Select at least one column.';return;}
+    const previous=[...state.myViewColumns];
+    // Keep the existing column order; newly enabled columns go at the end.
+    const next=[...previous.filter(field=>chosen.has(field)),...MY_VIEW_COLUMNS.map(([field])=>field).filter(field=>chosen.has(field)&&!previous.includes(field))];
+    const apply=columnsMenu.querySelector('#my-view-column-apply');
+    apply.disabled=true;error.textContent='Saving columns…';
+    state.myViewColumns=normaliseMyViewColumns(next);
+    const success=await savePreferences({myViewColumns:state.myViewColumns});
+    if(!success){state.myViewColumns=previous;error.textContent='Could not save columns. Try again.';apply.disabled=false;return;}
+    const left=tableScroller.scrollLeft;
+    render();
+    const refreshed=board.querySelector('.my-view-table-scroll');
+    if(refreshed)refreshed.scrollLeft=left;
+  });
+  // Native drag-and-drop on table headings; apply the new visible order to
+  // every row by re-rendering, then persist it in the existing preferences file.
+  let draggedColumn=null;
+  const clearDragStyles=()=>board.querySelectorAll('.my-view-col-dragging,.my-view-col-drag-over').forEach(th=>th.classList.remove('my-view-col-dragging','my-view-col-drag-over','before','after'));
+  board.querySelectorAll('.my-view-table thead th[data-my-col]').forEach(th=>{
+    th.addEventListener('dragstart',e=>{
+      draggedColumn=th.dataset.myCol;
+      th.classList.add('my-view-col-dragging');
+      e.dataTransfer.effectAllowed='move';
+      e.dataTransfer.setData('text/plain',draggedColumn);
+    });
+    th.addEventListener('dragover',e=>{
+      if(!draggedColumn||draggedColumn===th.dataset.myCol)return;
+      e.preventDefault();e.dataTransfer.dropEffect='move';
+      board.querySelectorAll('.my-view-col-drag-over').forEach(el=>el.classList.remove('my-view-col-drag-over','before','after'));
+      const midpoint=th.getBoundingClientRect().left+th.getBoundingClientRect().width/2;
+      th.classList.add('my-view-col-drag-over',e.clientX<midpoint?'before':'after');
+    });
+    th.addEventListener('drop',async e=>{
+      if(!draggedColumn)return;
+      e.preventDefault();e.stopPropagation();
+      const source=draggedColumn,target=th.dataset.myCol;
+      draggedColumn=null;clearDragStyles();
+      if(source===target)return;
+      const previous=[...state.myViewColumns];
+      const updated=[...previous];
+      const from=updated.indexOf(source),to=updated.indexOf(target);
+      if(from<0||to<0)return;
+      const insertAfter=e.clientX>=th.getBoundingClientRect().left+th.getBoundingClientRect().width/2;
+      updated.splice(from,1);
+      updated.splice(updated.indexOf(target)+(insertAfter?1:0),0,source);
+      if(updated.every((field,i)=>field===previous[i]))return;
+      const left=tableScroller.scrollLeft;
+      state.myViewColumns=updated;
+      render();
+      const refreshed=board.querySelector('.my-view-table-scroll');if(refreshed)refreshed.scrollLeft=left;
+      const success=await savePreferences({myViewColumns:updated});
+      if(!success){
+        state.myViewColumns=previous;render();
+        const hint=board.querySelector('.my-view-sort-status');if(hint)hint.textContent='Could not save column order.';
+      }
+    });
+    th.addEventListener('dragend',()=>{draggedColumn=null;clearDragStyles();});
+  });
+  // The existing shared table editor handles optional assignee controls.
   board.querySelectorAll('[data-my-view-sort]').forEach(btn=>btn.addEventListener('click',()=>{
     const field=btn.dataset.myViewSort;
     if(!MY_VIEW_SORT_FIELDS.includes(field)) return;
@@ -6110,10 +6307,16 @@ function milestoneCardHtml(i){
   '</article>';
 }
 
+function compareMilestoneSort(a,b){
+  const byDue=()=> (a.dueDate||'9999-12-31').localeCompare(b.dueDate||'9999-12-31');
+  const byPriority=()=>priorityRank(a.priority)-priorityRank(b.priority);
+  const byAssignee=()=>String(a.assignee||'Unassigned').localeCompare(String(b.assignee||'Unassigned'),undefined,{sensitivity:'base'});
+  const preferred=state.milestoneSort==='priority'?byPriority():state.milestoneSort==='assignee'?byAssignee():byDue();
+  return preferred||byDue()||byPriority()||a.key.localeCompare(b.key);
+}
 function sortedMilestoneBlockers(milestoneKey){
   return milestoneChainItems(milestoneKey).sort((a,b)=>
-    (a.chainLevel-b.chainLevel) || priorityRank(a.priority)-priorityRank(b.priority) ||
-    (a.dueDate||'9999-12-31').localeCompare(b.dueDate||'9999-12-31') || a.key.localeCompare(b.key));
+    (a.chainLevel-b.chainLevel)||compareMilestoneSort(a,b));
 }
 function milestoneOverviewHtml(milestones){
   function blockerItems(i){
@@ -6158,7 +6361,7 @@ function milestoneOverviewHtml(milestones){
   return '<div class="milestone-overview">' +
     '<div class="milestone-overview-header">' +
       '<span class="milestone-overview-title">Milestones</span>' +
-      '<div class="milestone-overview-tools"><span class="milestone-overview-count">' + milestones.length + '</span>' +
+      '<div class="milestone-overview-tools"><label class="milestone-sort-label" for="milestone-sort">Sort blocked by <select id="milestone-sort"><option value="dueDate"'+(state.milestoneSort==='dueDate'?' selected':'')+'>Due date</option><option value="priority"'+(state.milestoneSort==='priority'?' selected':'')+'>Priority</option><option value="assignee"'+(state.milestoneSort==='assignee'?' selected':'')+'>Assignee</option></select></label><span class="milestone-overview-count">' + milestones.length + '</span>' +
       '<button type="button" class="milestone-project-gantt" id="milestone-project-gantt"'+(milestones.length?'':' disabled')+' title="See every milestone on one project timeline">▤ All milestones Gantt</button></div>' +
     '</div>' +
     '<div class="milestone-row">' +
@@ -6179,24 +6382,36 @@ function milestoneBlockersClipboardContent(milestoneKey){
   const milestone=state.issues.find(i=>i.key===milestoneKey);
   const blockers=sortedMilestoneBlockers(milestoneKey);
   const columns=['Level','Key','Summary','Priority','Assignee','Due date','Status'];
+  const sortName={dueDate:'Due date',priority:'Priority',assignee:'Assignee'}[state.milestoneSort]||'Due date';
   const records=blockers.map(b=>[
     b.chainLevel===0?'Unblocked':'Level '+b.chainLevel,
     b.key,b.summary||'',b.priority||'Unspecified',b.assignee||'Unassigned',
     b.dueDate?formatDueDate(b.dueDate):'No due date',b.status||''
   ]);
-  const textValue=String(milestone?.summary||milestoneKey)+' ('+milestoneKey+') — Blocked by\n'+
+  const name=String(milestone?.summary||milestoneKey);
+  const heading=name+' ('+milestoneKey+') - Blocked by ('+blockers.length+')';
+  const textValue=heading+' - Sorted by '+sortName+'\n'+
     columns.join('\t')+'\n'+records.map(r=>r.map(v=>String(v).replace(/[\t\r\n]+/g,' ')).join('\t')).join('\n');
-  const css='border:1px solid #cbd5e1;padding:7px 10px;text-align:left;font:12px Arial,sans-serif;vertical-align:top;';
-  const headerCells=columns.map(c=>'<th style="'+css+'background:#e2e8f0;color:#172033;font-weight:bold;">'+esc(c)+'</th>').join('');
+
+  // A typical portrait A4 Word document with default margins has approximately
+  // 600px of usable page width. Give the *pasted* table a fixed 560px layout
+  // (including explicit HTML widths for Word's HTML importer), and wrap text
+  // instead of letting long summaries or statuses enlarge the whole table.
+  const widths=[58,60,180,65,76,67,54]; // 560px total
+  const cellCss='border:1px solid #cbd5e1;padding:3px 4px;text-align:left;'+
+    'font:10px Arial,sans-serif;vertical-align:top;white-space:normal;'+
+    'word-wrap:break-word;overflow-wrap:break-word;word-break:break-word;';
+  const cols='<colgroup>'+widths.map(w=>'<col width="'+w+'" style="width:'+w+'px;">').join('')+'</colgroup>';
+  const headerCells=columns.map((c,idx)=>'<th width="'+widths[idx]+'" style="width:'+widths[idx]+'px;'+cellCss+'background:#e2e8f0;color:#172033;font-weight:bold;">'+esc(c)+'</th>').join('');
   const rows=records.map((r,n)=>'<tr>'+r.map((value,idx)=>{
     const url=idx===1?((state.issues.find(i=>i.key===value)?.url)||CFG.jiraBaseUrl+'/browse/'+value):'';
     const content=url?'<a href="'+esc(url)+'" style="color:#4338ca;text-decoration:underline;">'+esc(value)+'</a>':esc(value);
-    return '<td style="'+css+'background:'+(n%2?'#f8fafc':'#ffffff')+';">'+content+'</td>';
+    return '<td width="'+widths[idx]+'" style="width:'+widths[idx]+'px;'+cellCss+'background:'+(n%2?'#f8fafc':'#ffffff')+';">'+content+'</td>';
   }).join('')+'</tr>').join('');
-  const name=milestone?.summary||milestoneKey;
-  const html='<div style="font:13px Arial,sans-serif;color:#172033;"><p style="font-weight:bold;margin:0 0 8px;">'+esc(name)+' ('+esc(milestoneKey)+') — Blocked by ('+blockers.length+')</p>'+
-    '<table style="border-collapse:collapse;width:100%;max-width:900px;">' +
-    '<thead><tr>'+headerCells+'</tr></thead><tbody>'+rows+'</tbody></table></div>';
+  const html='<div style="font:12px Arial,sans-serif;color:#172033;">'+
+    '<p style="margin:0 0 8px;"><strong>'+esc(heading)+'</strong> - Sorted by '+esc(sortName)+'</p>'+
+    '<table width="560" cellspacing="0" cellpadding="0" style="width:560px;max-width:100%;table-layout:fixed;border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt;">'+
+    cols+'<thead><tr>'+headerCells+'</tr></thead><tbody>'+rows+'</tbody></table></div>';
   return {html,text:textValue};
 }
 async function copyMilestoneBlockers(milestoneKey,button){
@@ -6218,7 +6433,7 @@ async function copyMilestoneBlockers(milestoneKey,button){
     // ClipboardItem, without requiring the user to select any page contents.
     const temp=document.createElement('div');
     temp.contentEditable='true';
-    temp.style.cssText='position:fixed;left:-99999px;top:0;width:900px;';
+    temp.style.cssText='position:fixed;left:-99999px;top:0;width:560px;';
     temp.innerHTML=html;
     document.body.appendChild(temp);
     const selection=window.getSelection();
@@ -6251,13 +6466,18 @@ async function copyMilestoneBlockers(milestoneKey,button){
 function renderMilestoneOverview(flashKey){
   const milestones = state.displayIssues
     .filter(i => (i.labels || []).some(label => String(label).toLowerCase() === 'milestone'))
-    .sort((a,b) => (!a.dueDate ? 0:1)-(!b.dueDate ? 0:1) || (a.dueDate||'').localeCompare(b.dueDate||'') || a.key.localeCompare(b.key));
+    .sort((a,b)=>(a.dueDate||'9999-12-31').localeCompare(b.dueDate||'9999-12-31')||a.key.localeCompare(b.key));
 
   const existing = board.querySelector('.milestone-overview');
   if(existing) existing.remove();
   const wrapper = document.createElement('div');
   wrapper.innerHTML = milestoneOverviewHtml(milestones);
   board.appendChild(wrapper.firstElementChild);
+  board.querySelector('#milestone-sort')?.addEventListener('change',e=>{
+    state.milestoneSort=e.target.value;
+    savePreferences({milestoneSort:state.milestoneSort});
+    render();
+  });
   board.querySelector('#milestone-project-gantt')?.addEventListener('click',e=>{
     e.preventDefault();e.stopPropagation();
     openAllMilestonesGantt(e.currentTarget);
@@ -6537,10 +6757,12 @@ function render(){
       dashboardBackLabels[state.dashboardReturnSection]=DASHBOARD_TABS.find(([id])=>id===tabId)?.[1]||'Project overview';
     }
     const dashboardBack = !!state.dashboardReturnSection && !!dashboardBackLabels[state.dashboardReturnSection];
-    milestoneBackBtn.classList.toggle('visible', !!backMilestone || dashboardBack);
-    milestoneBackBtn.innerHTML = dashboardBack
+    milestoneBackBtn.classList.toggle('visible', !!state.ganttReturnContext || !!backMilestone || dashboardBack || state.ganttReturnToMilestones);
+    milestoneBackBtn.innerHTML = state.ganttReturnContext
+      ? '&#8592; Back to '+esc(state.ganttReturnContext.isOverview?'All milestones Gantt':state.ganttReturnContext.milestoneKey+' Gantt')
+      : dashboardBack
       ? '&#8592; Back to ' + esc(dashboardBackLabels[state.dashboardReturnSection])
-      : (backMilestone ? '&#8592; Back to ' + esc(backMilestone.key + ' - ' + (backMilestone.summary || 'Milestone')) : '');
+      : (state.ganttReturnToMilestones ? '&#8592; Back to milestones' : backMilestone ? '&#8592; Back to ' + esc(backMilestone.key + ' - ' + (backMilestone.summary || 'Milestone')) : '');
   }
 
   // Search is applied after the cards are rendered. In selected mode the
@@ -6788,7 +7010,8 @@ function updateMiniMap(){
     const key = card.dataset.key;
     const issue = state.displayIssues.find(i => i.key === key) || state.issues.find(i => i.key === key);
     const isMilestone = !!issue && (issue.labels || []).some(label => String(label).toLowerCase() === 'milestone');
-    const isOverdue = !!issue && isDueDateOverdue(issue.dueDate);
+    const isOverdue = !!issue && !isCompletedStatus(issue.status) && isDueDateOverdue(issue.dueDate);
+    if(issue && isCompletedStatus(issue.status)) el.classList.add('completed');
     if(isMilestone) el.classList.add('milestone');
     if(isOverdue) el.classList.add('overdue');
     if(state.lockedKey && key === state.lockedKey) el.classList.add('selected');
@@ -7968,6 +8191,10 @@ document.getElementById('refresh').addEventListener('click', () => {
   load(true);
 });
 function goBackFromSelection(){
+  if(state.ganttReturnContext&&state.selectionHistory.length<=1){returnToOriginGantt();return;}
+  if(state.ganttReturnToMilestones&&state.selectionHistory.length<=1){
+    milestoneBackBtn.click();return;
+  }
   if(String(state.dashboardReturnSection||'').startsWith('dashboard:') && state.selectionHistory.length===0){
     const tab=state.dashboardReturnSection.slice('dashboard:'.length);
     state.dashboardReturnSection=null;state.dashboardTab=tab;state.showDashboard=true;
@@ -8040,6 +8267,14 @@ document.addEventListener('click', () => {
 });
 
 milestoneBackBtn.addEventListener('click', () => {
+  if(state.ganttReturnContext){returnToOriginGantt();return;}
+  if(state.ganttReturnToMilestones){
+    const previous=state.selectionHistory[0];
+    if(previous?.filters)restoreFilterSnapshot(previous.filters);
+    state.ganttReturnToMilestones=false;state.showMilestones=true;state.showDashboard=false;
+    state.showMyView=false;state.lockedKey=null;state.selectionHistory=[];state.showBlocked=false;
+    state.returnMilestoneKey=null;render();return;
+  }
   if(state.dashboardReturnSection){
     const sectionId=state.dashboardReturnSection;
     state.dashboardReturnSection=null;
@@ -8079,6 +8314,8 @@ document.querySelectorAll('.view-switch').forEach(btn => {
     if(currentView==='default' && view!=='default'){
       savedFullBoardView={lockedKey:state.lockedKey,selectionHistory:JSON.parse(JSON.stringify(state.selectionHistory||[])),showBlocked:state.showBlocked,filterUser:state.filterUser,filterDue:state.filterDue,includeWithRemarkable:state.includeWithRemarkable,searchTerm:state.searchTerm,scrollPositions:JSON.parse(JSON.stringify(state.scrollPositions||{}))};
     }
+    state.ganttReturnToMilestones=false;
+    state.ganttReturnContext=null;
     state.showDashboard=view==='dashboard';
     state.showMyView=view==='my-view';
     state.showMilestones=view==='milestone';
@@ -8243,6 +8480,7 @@ window.addEventListener('resize', () => { scheduleDependencyLines(); scheduleMin
 let ganttCurrent=null;
 let ganttReturnFocus=null;
 let ganttDayWidth=12;
+let ganttHoverKey=null,ganttLockedKey=null;
 const GANTT_DAY_MS=86400000;
 function ganttDate(value){
   const match=/^(\d{4})-(\d{2})-(\d{2})/.exec(String(value||''));
@@ -8252,6 +8490,14 @@ function ganttDate(value){
   return date.toISOString().slice(0,10)===match[0]?ms:null;
 }
 function ganttDateKey(ms){return new Date(ms).toISOString().slice(0,10);}
+function ganttAddCalendarMonth(ms){
+  // One calendar month after the final plotted date, clamping month-ends
+  // (e.g. 31 January -> 28 February), rather than adding a fixed 30 days.
+  const date=new Date(ms);
+  const y=date.getUTCFullYear(),m=date.getUTCMonth(),day=date.getUTCDate();
+  const lastNextMonth=new Date(Date.UTC(y,m+2,0)).getUTCDate();
+  return Date.UTC(y,m+1,Math.min(day,lastNextMonth));
+}
 function ganttDateLabel(ms){return new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'}).format(new Date(ms));}
 function ganttIssueColour(status){
   if(isCompletedStatus(status))return '#16a34a';
@@ -8425,7 +8671,9 @@ function renderGanttChart(){
   const beforeToday=Math.ceil(todayGap/ganttDayWidth)+padDays;
   const afterToday=Math.ceil(Math.max(0,calendarViewport-todayGap)/ganttDayWidth)+padDays;
   const origin=Math.min(minDate===null?today:minDate-padDays*GANTT_DAY_MS,today-beforeToday*GANTT_DAY_MS);
-  const final=Math.max(maxDate===null?today:maxDate+padDays*GANTT_DAY_MS,today+afterToday*GANTT_DAY_MS);
+  // Leave a full calendar month after the latest scheduled end date while
+  // retaining the viewport space required to show today's marker.
+  const final=Math.max(ganttAddCalendarMonth(maxDate===null?today:maxDate),today+afterToday*GANTT_DAY_MS);
   const days=Math.ceil((final-origin)/GANTT_DAY_MS)+1;
   const timelineWidth=days*ganttDayWidth;
   const totalWidth=labelWidth+timelineWidth;
@@ -8452,14 +8700,14 @@ function renderGanttChart(){
     const length=((ganttDate(r.end)-ganttDate(r.start))/GANTT_DAY_MS+1)*ganttDayWidth;
     const bar=r.milestone&&!d.isOverview?'<span class="gantt-diamond" style="left:'+(from+length-ganttDayWidth/2)+'px;background:#b45309" title="'+esc(ganttBarTooltip(r))+'"></span>':
       '<span class="gantt-bar" style="left:'+from+'px;width:'+Math.max(5,length-2)+'px;background:'+r.color+'" title="'+esc(ganttBarTooltip(r))+'"></span>';
-    return '<div class="gantt-task-row">'+
+    return '<div class="gantt-task-row" data-gantt-key="'+esc(r.key)+'">'+
       '<div class="gantt-task-label"><div class="gantt-task-info"><a href="'+esc(CFG.jiraBaseUrl+'/browse/'+r.key)+'" target="_blank" rel="noopener noreferrer" data-issue-key="'+esc(r.key)+'">'+esc(r.key)+'</a>'+
       (r.milestone&&!d.isOverview?'<span class="gantt-milestone-tag">'+(d.isMilestone?'MILESTONE':'SELECTED')+'</span>':'')+
       '<span class="gantt-task-summary" title="'+esc(r.summary)+'">'+esc(r.summary)+'</span>'+
       '<span class="gantt-task-dates">'+esc(ganttDateLabel(ganttDate(r.start)))+' – '+esc(ganttDateLabel(ganttDate(r.end)))+' · '+esc(r.source)+'</span></div>'+ganttAssigneeHtml(r)+'</div>'+
       '<div class="gantt-task-track" style="width:'+timelineWidth+'px">'+bar+'</div></div>';
   }).join('');
-  chart.innerHTML='<div class="gantt-canvas'+(state.ganttNarrow===true?' gantt-narrow':'')+'" data-origin="'+origin+'" data-days="'+days+'" data-label-width="'+labelWidth+'" data-today-left="'+todayLeft+'" style="width:'+totalWidth+'px;--gantt-left:'+labelWidth+'px">'+
+  chart.innerHTML='<div class="gantt-canvas'+(state.ganttNarrow===true?' gantt-narrow':'')+(drawDependencies?'':' gantt-dependencies-off')+'" data-origin="'+origin+'" data-days="'+days+'" data-label-width="'+labelWidth+'" data-today-left="'+todayLeft+'" style="width:'+totalWidth+'px;--gantt-left:'+labelWidth+'px">'+
     '<div class="gantt-timeline-heading" style="height:'+headHeight+'px">'+
       '<div class="gantt-heading-label">'+(d.isOverview?'MILESTONE / PROJECT PLAN':'ISSUE / TASK')+' <small>'+'Start · Due · Calculation'+'</small></div>'+
       '<div class="gantt-heading-scale" style="width:'+timelineWidth+'px">'+monthHead.join('')+dayHead.join('')+'<div class="gantt-hover-guide" hidden></div><div class="gantt-hover-date" hidden></div></div></div>'+
@@ -8508,11 +8756,12 @@ function renderGanttChart(){
         // A two-elbow detour ensures the arrow still enters the *left*
         // edge of its target, even when that edge is behind the blocker.
         :'M'+x1+' '+y1+' H'+(x1+12)+' V'+((y1+y2)/2)+' H'+Math.max(1,x2-12)+' V'+y2+' H'+x2;
-      arrows+='<path d="'+route+'" fill="none" stroke="#475569" stroke-width="1.5" stroke-linejoin="round" marker-end="url(#gantt-arrow)" opacity=".75"/>';
+      arrows+='<path data-gantt-from="'+esc(link.from)+'" data-gantt-to="'+esc(link.to)+'" d="'+route+'" fill="none" stroke="#475569" stroke-width="1.5" stroke-linejoin="round" marker-end="url(#gantt-arrow)" opacity=".75"/>';
     });
   }
   svg.insertAdjacentHTML('beforeend',arrows);
   attachTicketKeyModalHandlers(chart);
+  applyGanttChainHighlight();
 
   const missing=document.getElementById('gantt-unscheduled');
   const missingRows=d.unscheduled.map(r=>'<div class="gantt-unscheduled-item">'+
@@ -8523,6 +8772,85 @@ function renderGanttChart(){
     (missingRows||'<div class="gantt-unscheduled-empty">'+(d.isOverview?'All milestones have valid start and due dates.':'All tickets have a valid start and due date.')+'</div>')+
     '<p class="gantt-schedule-notes">'+(d.isOverview?'Milestone bars show start through due date. Start: Jira start date → first blocker after the preceding milestone (blockers use Jira start, previous blocker due + 1 day, or creation) → milestone creation date. Blocker tasks are not displayed.':'Start: Jira start date → day after latest direct blocker due date → Jira creation date. Tickets without a due date or with start after due date appear here.')+'</p>';
   attachTicketKeyModalHandlers(missing);
+}
+function ganttChainKeys(key){
+  const keys=new Set([key]);
+  if(!ganttCurrent)return keys;
+  const back=new Map(),forward=new Map();
+  for(const edge of ganttCurrent.edges||[]){
+    if(!back.has(edge.to))back.set(edge.to,[]);
+    if(!forward.has(edge.from))forward.set(edge.from,[]);
+    back.get(edge.to).push(edge.from);forward.get(edge.from).push(edge.to);
+  }
+  for(const graph of [back,forward]){
+    const seen=new Set([key]),queue=[key];
+    for(let pos=0;pos<queue.length;pos++)for(const next of graph.get(queue[pos])||[]){
+      if(seen.has(next))continue;
+      seen.add(next);keys.add(next);queue.push(next);
+    }
+  }
+  return keys;
+}
+function applyGanttChainHighlight(){
+  const chart=document.getElementById('gantt-chart');
+  const active=state.ganttShowDependencies!==false&&(ganttLockedKey||ganttHoverKey);
+  const keys=active?ganttChainKeys(active):null;
+  chart.querySelectorAll('[data-gantt-key]').forEach(row=>{
+    row.classList.toggle('gantt-chain-dim',!!keys&&!keys.has(row.dataset.ganttKey));
+    row.classList.toggle('gantt-chain-active',!!keys&&keys.has(row.dataset.ganttKey));
+  });
+  chart.querySelectorAll('[data-gantt-from][data-gantt-to]').forEach(path=>{
+    path.classList.toggle('gantt-link-dim',!!keys&&!(keys.has(path.dataset.ganttFrom)&&keys.has(path.dataset.ganttTo)));
+  });
+  chart.querySelectorAll('[data-gantt-key]').forEach(row=>{
+    row.classList.toggle('gantt-chain-locked',!!ganttLockedKey&&!!keys&&keys.has(row.dataset.ganttKey));
+  });
+}
+function openGanttTicketChain(key){
+  if(!key||!state.issues.some(i=>i.key===key)||!ganttCurrent)return;
+  // Preserve the originating Gantt and the view beneath it, including a
+  // specific milestone (e.g. WT-303) versus the all-milestones chart.
+  const source={
+    milestoneKey:ganttCurrent.milestone.key,
+    isOverview:!!ganttCurrent.isOverview,
+    showMilestones:state.showMilestones,showDashboard:state.showDashboard,showMyView:state.showMyView,
+    lockedKey:state.lockedKey,showBlocked:state.showBlocked,
+    selectionHistory:JSON.parse(JSON.stringify(state.selectionHistory||[])),
+    returnMilestoneKey:state.returnMilestoneKey,dashboardReturnSection:state.dashboardReturnSection,
+    filters:filterSnapshot()
+  };
+  const previousKey=state.lockedKey;
+  closeMilestoneGantt();
+  state.ganttReturnContext=source;
+  state.ganttReturnToMilestones=false;
+  state.selectionHistory.push({key:previousKey,filters:filterSnapshot()});
+  state.showMilestones=false;state.showDashboard=false;state.showMyView=false;
+  state.searchTerm='';state.filterUser='';state.filterDue='all';state.includeWithRemarkable=true;
+  if(searchEl)searchEl.value='';
+  updateSearchClearButton();saveFilterPreferences();
+  state.lockedKey=key;state.showBlocked=false;state.revealSelectedKey=key;
+  clearHoverLock();render();
+}
+function returnToOriginGantt(){
+  const source=state.ganttReturnContext;
+  if(!source)return;
+  state.ganttReturnContext=null;
+  state.ganttReturnToMilestones=false;
+  restoreFilterSnapshot(source.filters);
+  state.showMilestones=source.showMilestones;
+  state.showDashboard=source.showDashboard;
+  state.showMyView=source.showMyView;
+  state.lockedKey=source.lockedKey;
+  state.showBlocked=source.showBlocked;
+  state.selectionHistory=source.selectionHistory;
+  state.returnMilestoneKey=source.returnMilestoneKey;
+  state.dashboardReturnSection=source.dashboardReturnSection;
+  state.revealSelectedKey=source.lockedKey;
+  render();
+  // Render has rebuilt displayIssues; always create a fresh timeline from it.
+  const data=source.isOverview?buildAllMilestonesGantt():buildMilestoneGantt(source.milestoneKey);
+  if(data)openGanttData(data,null);
+  else statusText.textContent='The original Gantt is no longer available with the current filters.';
 }
 function scrollGanttToToday(){
   const chart=document.getElementById('gantt-chart');
@@ -8543,7 +8871,7 @@ function closeMilestoneGantt(){
   if(document.getElementById('ticket-preview-modal'))closeTicketPreviewModal();
   overlay.hidden=true;
   document.body.classList.remove('gantt-open');
-  ganttCurrent=null;
+  ganttCurrent=null;ganttHoverKey=null;ganttLockedKey=null;
   // Refresh the selected chain's connections if its layout changed while
   // the full-screen Gantt was open; no hidden redraws run under the overlay.
   scheduleDependencyLines();
@@ -8558,7 +8886,8 @@ function openAllMilestonesGantt(button){
 }
 function openGanttData(data,button){
   if(!data)return;
-  ganttCurrent=data;
+  state.ganttReturnContext=null;
+  ganttCurrent=data;ganttHoverKey=null;ganttLockedKey=null;
   ganttReturnFocus=button||document.activeElement;
   const overlay=document.getElementById('gantt-overlay');
   const kind=data.isOverview?'Project plan · milestones only':data.isMilestone?'Milestone timeline':'Selected chain timeline';
@@ -8590,16 +8919,20 @@ async function exportMilestoneGanttPdf(){
   if(!ganttCurrent)return;
   const btn=document.getElementById('gantt-export');
   const status=document.getElementById('gantt-export-status');
+  const output=document.getElementById('gantt-output').value;
   btn.disabled=true;status.textContent='Generating complete PDF…';
   try{
-    const response=await fetch('/api/gantt-pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({milestone:ganttCurrent.milestone,rows:ganttCurrent.rows,edges:state.ganttShowDependencies!==false?ganttCurrent.edges:[],scale:state.ganttScale,narrow:state.ganttNarrow===true})});
+    const response=await fetch('/api/gantt-pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({milestone:ganttCurrent.milestone,rows:ganttCurrent.rows,edges:state.ganttShowDependencies!==false?ganttCurrent.edges:[],scale:state.ganttScale,narrow:state.ganttNarrow===true,output})});
     if(!response.ok){
       const err=await response.json().catch(()=>({}));
       throw new Error(err.error||'PDF generation failed ('+response.status+')');
     }
     const pdf=await response.blob(),url=URL.createObjectURL(pdf);
     const link=document.createElement('a');
-    link.href=url;link.download=ganttCurrent.isOverview?'all_milestones_gantt.pdf':ganttCurrent.milestone.key+'_gantt.pdf';
+    const format=output==='Full screen'?'Full':output==='A4'?'A4':'A3';
+    const today=new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'numeric'}).format(new Date());
+    const title=ganttCurrent.isOverview?'All milestones':ganttCurrent.milestone.key;
+    link.href=url;link.download=title+' Gantt '+format+' '+today+'.pdf';
     document.body.appendChild(link);link.click();link.remove();
     setTimeout(()=>URL.revokeObjectURL(url),30000);
     status.textContent='PDF download started.';
@@ -8640,6 +8973,31 @@ function initMilestoneGantt(){
   document.getElementById('gantt-close').addEventListener('click',closeMilestoneGantt);
   document.getElementById('gantt-export').addEventListener('click',exportMilestoneGanttPdf);
   const ganttViewport=document.getElementById('gantt-chart');
+  ganttViewport.addEventListener('pointermove',e=>{
+    const bar=e.target.closest?.('.gantt-bar,.gantt-diamond');
+    if(ganttLockedKey||state.ganttShowDependencies===false)return;
+    const next=bar?.closest('[data-gantt-key]')?.dataset.ganttKey||null;
+    if(ganttHoverKey!==next){ganttHoverKey=next;applyGanttChainHighlight();}
+  });
+  ganttViewport.addEventListener('pointerleave',()=>{
+    if(!ganttLockedKey){ganttHoverKey=null;applyGanttChainHighlight();}
+  });
+  ganttViewport.addEventListener('click',e=>{
+    const bar=e.target.closest('.gantt-bar,.gantt-diamond');
+    if(bar&&state.ganttShowDependencies!==false){
+      e.preventDefault();e.stopPropagation();
+      const key=bar.closest('[data-gantt-key]')?.dataset.ganttKey;
+      ganttLockedKey=ganttLockedKey===key?null:key;
+      ganttHoverKey=null;applyGanttChainHighlight();return;
+    }
+    const label=e.target.closest('.gantt-task-label');
+    if(label&&!e.target.closest('a,button')){
+      const key=label.closest('[data-gantt-key]')?.dataset.ganttKey;
+      openGanttTicketChain(key);return;
+    }
+    // Clicking elsewhere in the Gantt clears a pinned dependency chain.
+    if(ganttLockedKey){ganttLockedKey=null;ganttHoverKey=null;applyGanttChainHighlight();}
+  });
   ganttViewport.addEventListener('pointermove',updateGanttHoverGuide);
   ganttViewport.addEventListener('pointerleave',hideGanttHoverGuide);
   ganttViewport.addEventListener('scroll',hideGanttHoverGuide,{passive:true});
@@ -8661,6 +9019,7 @@ function initMilestoneGantt(){
     savePreferences({ganttShowDependencies:state.ganttShowDependencies});
     const viewport=document.getElementById('gantt-chart');
     const left=viewport.scrollLeft,top=viewport.scrollTop;
+    ganttHoverKey=null;ganttLockedKey=null;
     updateGanttControls();renderGanttChart();
     viewport.scrollLeft=left;viewport.scrollTop=top;
   });
