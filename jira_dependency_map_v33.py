@@ -1516,7 +1516,7 @@ def _gantt_pdf_bytes(payload):
         start=date_value(item.get('start')); end=date_value(item.get('end'))
         raw_color=str(item.get('color') or '')
         color=raw_color if re.fullmatch(r'#[0-9a-fA-F]{6}',raw_color) else '#64748b'
-        rows.append({'key':key,'summary':str(item.get('summary') or '')[:300],
+        rows.append({'key':key,'summary':str(item.get('summary') or '')[:2000],
                      'status':str(item.get('status') or '')[:60],
                      'assignee':str(item.get('assignee') or 'Unassigned')[:140],
                      'start':start,'end':end,'color':color,
@@ -1525,39 +1525,86 @@ def _gantt_pdf_bytes(payload):
                      'milestone':bool(item.get('milestone'))})
     scheduled=[r for r in rows if r['start'] is not None and r['end'] is not None and r['end']>=r['start']]
     unscheduled=[r for r in rows if r['start'] is None or r['end'] is None or r['end']<r['start']]
-    margin=40.; left_w=275. if narrow else 360.
+    # Wider label columns on every paper size, with word-wrapped summaries.
+    # Page breaks use the REAL height of each row; no ellipsis or hidden lines.
+    margin=40.
+    full_label=390. if narrow else 490.
+    left_w=(325. if narrow else 390.) if output=='A4' else (
+        (370. if narrow else 455.) if output=='A3' else full_label)
     chart_left=margin+left_w
     day_w={6:3.,12:5.,20:10.}[scale]
-    row_h=19. if narrow else 28.
     table_bottom=88.
     dates=[d for r in scheduled for d in (r['start'],r['end'])]
     first=min(dates) if dates else date.today()
     last=max(dates) if dates else first
     days=(last-first).days+1
     if full_screen:
-        # One single PDF sheet containing the entire timeline and every row.
-        # Its media box follows the content, instead of slicing into A3 pages.
+        # One page covering the timeline and all tasks. Let the PDF grow in
+        # height with the actual number of wrapped lines, not a fixed row size.
         day_w=scale*.75
-        row_h=25.5 if narrow else 49.5
-        left_w=225. if narrow else 315.
         chart_left=margin+left_w
         page_w=chart_left+days*day_w+margin
-        page_h=298.+max(1,len(rows))*row_h
     else:
-        page_w,page_h=(841.89,595.28) if output=='A4' else (1190.55,841.89)
-    table_top=page_h-210.
+        page_w=(841.89 if output=='A4' else 1190.55)
     chart_w=page_w-margin-chart_left
-    per_page=max(1,int((table_top-table_bottom)/row_h))
+
+    import textwrap
+    def wrap_label(value,available,size=8,bold=False):
+        # Helvetica is proportional. Reserve generous width for broad letters
+        # to avoid PDF text running into the assignee badge or timeline.
+        limit=max(1,int(available/(size*.96)))
+        words=str(value or '').replace('\r',' ').replace('\n',' ').strip()
+        return textwrap.wrap(words,width=limit,break_long_words=True,
+                             break_on_hyphens=False,replace_whitespace=True) or ['']
+
+    def pdf_row_layout(r,mode):
+        key_label=r['key']+(('  [Milestone]' if is_milestone else '  [Selected]') if r['milestone'] and not is_overview else '')
+        avail=left_w-47   # badge + right padding
+        if narrow:
+            combined=key_label+'  |  '+r['summary']
+            lines=wrap_label(combined,avail,9)
+            height=max(26.,12.+len(lines)*11.)
+            return {'height':height,'heading':[],'summary':lines}
+        heading=(key_label+'  |  '+r['start'].strftime('%d %b %y')+' - '+r['end'].strftime('%d %b %y')) if is_overview and mode=='timeline' and r['start'] and r['end'] and r['end']>=r['start'] else key_label+'  |  '+r['status']
+        heads=wrap_label(heading,avail,9,True)
+        summary=wrap_label(r['summary'],avail,8)
+        height=max(34.,11.+11.*len(heads)+10.*len(summary)+5.)
+        return {'height':height,'heading':heads,'summary':summary}
+
+    # The labels depend on whether the row is scheduled, so calculate the
+    # layout in the right section and carry it into pagination and drawing.
+    # No task is split across pages, even for very long issue summaries.
+    is_milestone=milestone.get('isMilestone') is not False
+    is_overview=milestone.get('isOverview') is True
+    layouts={id(r):pdf_row_layout(r,'timeline') for r in scheduled}
+    layouts.update({id(r):pdf_row_layout(r,'unscheduled') for r in unscheduled})
+    if full_screen:
+        page_h=298.+sum(layouts[id(r)]['height'] for r in scheduled+unscheduled)
+    else:
+        page_h=595.28 if output=='A4' else 841.89
+    table_top=page_h-210.
+    available_height=table_top-table_bottom
+
+    def fit_pages(items):
+        current=[];height=0.
+        for r in items:
+            h=layouts[id(r)]['height']
+            if current and height+h>available_height:
+                yield current
+                current=[];height=0.
+            current.append(r);height+=h
+        if current:yield current
+
     capacity=max(1,int(chart_w/day_w))
     slices=max(1,(days+capacity-1)//capacity) if scheduled else 0
     page_specs=[]
     for ix in range(slices):
         begin=first+timedelta(days=ix*capacity)
         finish=min(last,begin+timedelta(days=capacity-1))
-        for offset in range(0,len(scheduled),per_page):
-            page_specs.append(('timeline',ix+1,begin,finish,scheduled[offset:offset+per_page]))
-    for offset in range(0,len(unscheduled),per_page):
-        page_specs.append(('unscheduled',0,None,None,unscheduled[offset:offset+per_page]))
+        for group in fit_pages(scheduled):
+            page_specs.append(('timeline',ix+1,begin,finish,group))
+    for group in fit_pages(unscheduled):
+        page_specs.append(('unscheduled',0,None,None,group))
     if full_screen:
         page_specs=[('timeline',1,first,last,scheduled+unscheduled)]
         slices=1
@@ -1650,20 +1697,26 @@ def _gantt_pdf_bytes(payload):
             cmds.append(rect(chart_left,table_top+15,chart_w,32,'#f1f5f9'))
             cmds.append(txt(chart_left+10,table_top+26,'REASON / DATES AVAILABLE',10,True))
         row_centers={}
+        next_y=table_top
         for idx,r in enumerate(page_rows):
-            y=table_top-idx*row_h-row_h; cy=y+row_h/2
+            label=layouts[id(r)]
+            height=label['height']
+            y=next_y-height;cy=y+height/2;next_y=y
             row_centers[r['key']]=cy
-            if idx%2==1: cmds.append(rect(margin,y,page_w-2*margin,row_h,'#f8fafc'))
+            if idx%2==1: cmds.append(rect(margin,y,page_w-2*margin,height,'#f8fafc'))
             cmds.append(line(margin,y,page_w-margin,y,'#e2e8f0',.45))
             cmds.append(assignee_badge(margin+left_w-16,cy,r['assignee']))
-            key_label=r['key']+(('  [Milestone]' if is_milestone else '  [Selected]') if r['milestone'] and not is_overview else '')
-            if narrow:
-                one_line=key_label+'  |  '+r['summary']
-                cmds.append(txt(margin+8,cy-3,fit_label(one_line,left_w-43,9,False),9,False,'#172033'))
-            else:
-                heading=(key_label+'  |  '+r['start'].strftime('%d %b %y')+' - '+r['end'].strftime('%d %b %y')) if is_overview and mode=='timeline' and r['start'] and r['end'] and r['end']>=r['start'] else key_label+'  |  '+r['status']
-                cmds.append(txt(margin+8,y+17,fit_label(heading,left_w-43,9,True),9,True,'#172033'))
-                cmds.append(txt(margin+8,y+5,fit_label(r['summary'],left_w-43,8),8,False,'#64748b'))
+            # Start at the upper edge and work down. One PDF line per wrapped
+            # line, rather than the former one-line fit_label() truncation.
+            baseline=y+height-12.
+            for head in label['heading']:
+                cmds.append(txt(margin+8,baseline,head,9,True,'#172033'))
+                baseline-=11.
+            if label['heading']: baseline-=2.
+            for summary_line in label['summary']:
+                cmds.append(txt(margin+8,baseline,summary_line,9 if narrow else 8,
+                                False,'#172033' if narrow else '#475569'))
+                baseline-=11. if narrow else 10.
             if mode=='timeline' and r['start'] is not None and r['end'] is not None and r['end']>=r['start']:
                 a=max(r['start'],begin); b=min(r['end'],finish)
                 if b>=a:
@@ -1685,8 +1738,8 @@ def _gantt_pdf_bytes(payload):
                 if narrow:
                     cmds.append(txt(chart_left+9,cy-3,fit_label(r['reason'] or 'Missing schedule data',chart_w-18,9,True),9,True,'#b45309'))
                 else:
-                    cmds.append(txt(chart_left+9,y+17,r['reason'] or 'Missing schedule data',9,True,'#b45309',110))
-                    cmds.append(txt(chart_left+9,y+5,fit_label(dates+'  |  '+r['status'],chart_w-18,8),8,False,'#64748b',110))
+                    cmds.append(txt(chart_left+9,y+height-14,fit_label(r['reason'] or 'Missing schedule data',chart_w-18,9,True),9,True,'#b45309',110))
+                    cmds.append(txt(chart_left+9,y+height-26,fit_label(dates+'  |  '+r['status'],chart_w-18,8),8,False,'#64748b',110))
         if mode=='timeline':
             visible={r['key']:r for r in page_rows if r['start'] is not None and r['end'] is not None and r['end']>=r['start']}
             for parent,child in all_edges:
@@ -1774,7 +1827,14 @@ def api_gantt_pdf():
 
 
 @app.route("/")
-def index(): return Response(build_html(),mimetype="text/html")
+@app.route("/fullboard")
+@app.route("/my-view")
+@app.route("/project-overview")
+@app.route("/milestones")
+@app.route("/gantt/all-milestones")
+@app.route("/gantt/<issue_key>")
+def index(issue_key=None):
+    return Response(build_html(),mimetype="text/html")
 
 # ---------------------------------------------------------------------------
 # HTML / CSS / JS
@@ -1867,6 +1927,21 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .btn-settings:hover{color:#fff}
 #deselect{display:none;border-color:rgba(99,102,241,.5);background:rgba(99,102,241,.18);color:#c7d2fe}
 #deselect.visible{display:inline-flex}
+/* The header becomes two or more rows rather than hiding navigation on laptops. */
+@media(max-width:1350px){
+  #app-header{height:auto;min-height:58px;flex-wrap:wrap;row-gap:8px;padding:9px 14px;align-content:center}
+  .header-center{flex:1 1 260px;min-width:0}
+  .header-actions{flex:1 1 100%;min-width:0;flex-wrap:wrap;justify-content:flex-start}
+  .view-switcher{flex-wrap:wrap;max-width:100%}
+}
+@media(max-width:600px){
+  #app-header{gap:8px;padding:8px 10px}
+  .header-center{order:2;flex:1 1 100%}
+  .search-wrap{max-width:none}
+  .header-actions{order:3;gap:6px}
+  .view-switch{padding:6px 7px;font-size:11px}
+  .filter-menu{width:min(300px,calc(100vw - 20px))}
+}
 /* ── Completed toggle ────────────────────────────────────────────────────── */
 .btn-toggle-completed{gap:7px;padding-left:10px}
 .toggle-track{
@@ -2036,11 +2111,11 @@ body.gantt-open .ticket-preview-modal{z-index:25031}
 .dashboard-ticket.chain-date-risk{border-color:#f59e0b;background:#fffbeb}
 .dashboard-risk.chain-date-risk{color:#92400e;background:#fef3c7;border-color:#fcd34d}
 /* ── App shell ───────────────────────────────────────────────────────────── */
-#app{height:calc(100vh - 58px);overflow-x:auto;overflow-y:hidden;position:relative}
+#app{height:calc(100dvh - var(--app-header-height,58px));overflow-x:auto;overflow-y:hidden;position:relative}
 #app.locked{
   height:auto;
-  min-height:calc(100vh - 58px);
-  max-height:calc(100vh - 58px);
+  min-height:calc(100dvh - var(--app-header-height,58px));
+  max-height:calc(100dvh - var(--app-header-height,58px));
   overflow-x:auto;
   overflow-y:auto;
 }
@@ -2752,6 +2827,8 @@ body.jira-refreshing #loading.show .loading-progress,body.jira-refreshing #loadi
 .required-update-button:disabled{opacity:.65;cursor:wait}
 .required-update-status{min-height:18px;margin-top:12px;color:#64748b;font-size:12px;line-height:1.45}
 .required-update-status.error{color:#b91c1c}
+.required-update-release-link{display:inline-block;margin-top:13px;font-size:12px;font-weight:750;color:#4338ca;text-decoration:underline}
+.required-update-release-link:hover{color:#312e81}
 
 
 /* Dedicated personal view; table remains readable in a narrow window. */
@@ -3066,6 +3143,7 @@ body.gantt-open{overflow:hidden}
     <h2 class="required-update-title" id="required-update-title">New version available!</h2>
     <p class="required-update-message" id="required-update-message">A new version is ready to install.</p>
     <button class="required-update-button" id="required-update-button" type="button">Update now</button>
+    <a class="required-update-release-link" id="required-update-release-link" href="https://github.com/EdyerWarwick/jira-dependencies-map/releases/latest" target="_blank" rel="noopener noreferrer">View latest release notes</a>
     <div class="required-update-status" id="required-update-status" role="status" aria-live="polite"></div>
   </div>
 </div>
@@ -3427,31 +3505,127 @@ const state = {
 // Initial credential data is obtained by initialiseApp once; do not trigger
 // another Jira /myself call here before the first board loads.
 
-// ── Shareable selected-card URL ───────────────────────────────────────────
-// URLs use the compact form ?opd-523 and optionally ?opd-523&showblocked.
+// ── Section-aware shareable routes ────────────────────────────────────────
+// /fullboard?key=OPD-123&showBlockers=1
+// /milestones?key=WT-592  (focus the milestone in its OWN view)
+// /project-overview#tab-overdue ; /my-view
+// /gantt/WT-592 ; /gantt/all-milestones
+const ROUTE_TABS=new Set(['needs-attention','upcoming-7','upcoming-31','overdue','missing-due',
+  'unassigned','biggest-unblockers','chain-risks','circular','in-development','workload-priorities']);
+const ROUTE_TICKET=/^[A-Za-z][A-Za-z0-9_]*-\d+$/;
+let routeBootstrapping=true;
+let routeRestoring=false;
+let navigationReady=false;
 function readSharedViewUrl(){
-  const parts=window.location.search.replace(/^\?/,'').split('&').map(part=>decodeURIComponent(part).trim()).filter(Boolean);
-  const keyPart=parts.find(part=>/^[A-Za-z][A-Za-z0-9_]*-\d+$/.test(part));
-  return {
-    key:keyPart ? keyPart.toUpperCase() : null,
-    showBlocked:parts.some(part=>part.toLowerCase()==='showblocked')
-  };
+  const path=decodeURI(window.location.pathname).replace(/\/+$/,'').toLowerCase();
+  const params=new URLSearchParams(window.location.search);
+  const legacy=[...params.keys()].find(k=>ROUTE_TICKET.test(k));
+  const rawKey=params.get('key')||legacy||'';
+  const key=ROUTE_TICKET.test(rawKey)?rawKey.toUpperCase():null;
+  const blocked=params.has('showBlockers')?params.get('showBlockers'):
+    params.has('showblocked')?params.get('showblocked'):null;
+  const showBlocked=blocked!==null&&!['0','false','no'].includes(String(blocked).toLowerCase());
+  let section=null,ganttKey=null;
+  if(path==='/fullboard'||path==='/full-board'||path==='/board')section='default';
+  else if(path==='/my-view'||path==='/myview')section='my-view';
+  else if(path==='/project-overview'||path==='/dashboard')section='dashboard';
+  else if(path==='/milestones'||path==='/milestone')section='milestone';
+  else if(path==='/gantt/all-milestones'){section='gantt';ganttKey='ALL-MILESTONES';}
+  else if(path.startsWith('/gantt/')){
+    const raw=decodeURIComponent(window.location.pathname.split('/').filter(Boolean).pop()||'');
+    if(ROUTE_TICKET.test(raw)){section='gantt';ganttKey=raw.toUpperCase();}
+  }
+  // The old root ?issue-key link is a valid, explicit Full board link.
+  if(!section&&key)section='default';
+  const fragment=decodeURIComponent(window.location.hash.replace(/^#/,''));
+  const tab=fragment.startsWith('tab-')?fragment.slice(4):fragment;
+  return {section,key,showBlocked,ganttKey,tab:ROUTE_TABS.has(tab)?tab:'needs-attention'};
 }
 let pendingSharedView=readSharedViewUrl();
 let savedFullBoardView=null;
-
-function syncSharedViewUrl(){
-  const selectedKey=(!state.showDashboard && !state.showMilestones && !state.showMyView && state.lockedKey)
-    ? String(state.lockedKey).toLowerCase()
-    : '';
-  const query=selectedKey
-    ? '?' + encodeURIComponent(selectedKey) + (state.showBlocked ? '&showblocked' : '')
-    : '';
-  const nextUrl=window.location.pathname + query + window.location.hash;
-  if(nextUrl !== window.location.pathname + window.location.search + window.location.hash){
-    window.history.replaceState(null,'',nextUrl);
+function setViewFromUrl(route){
+  if(!route?.section)return false;
+  const section=route.section==='gantt'?(route.ganttKey==='ALL-MILESTONES'?'milestone':
+    (state.issues.find(i=>i.key===route.ganttKey)?.labels||[]).some(l=>String(l).toLowerCase()==='milestone')?'milestone':'default'):route.section;
+  state.showDashboard=section==='dashboard';
+  state.showMyView=section==='my-view';
+  state.showMilestones=section==='milestone';
+  state.lockedKey=null;state.selectionHistory=[];state.showBlocked=false;
+  state.returnMilestoneKey=null;state.dashboardReturnSection=null;
+  state.milestoneUrlKey=null;
+  if(state.showDashboard)state.dashboardTab=route.tab;
+  if(section==='default'&&route.key&&state.issues.some(i=>i.key===route.key)){
+    state.lockedKey=route.key;state.showBlocked=route.showBlocked;
+    state.revealSelectedKey=route.key;
+  }
+  if(section==='milestone'&&route.key&&state.issues.some(i=>i.key===route.key)){
+    state.milestoneUrlKey=route.key;
+    state.milestoneFlashKey=route.key;
+  }
+  return true;
+}
+function syncSharedViewUrl(forceReplace=false){
+  if(routeBootstrapping||routeRestoring)return;
+  const overlay=document.getElementById('gantt-overlay');
+  let path,query='',hash='';
+  if(overlay&&!overlay.hidden&&ganttCurrent){
+    path='/gantt/'+(ganttCurrent.isOverview?'all-milestones':encodeURIComponent(ganttCurrent.milestone.key));
+  }else if(state.showDashboard){
+    path='/project-overview';
+    hash='#tab-'+(ROUTE_TABS.has(state.dashboardTab)?state.dashboardTab:'needs-attention');
+  }else if(state.showMyView){path='/my-view';}
+  else if(state.showMilestones){
+    path='/milestones';
+    if(state.milestoneUrlKey)query='?key='+encodeURIComponent(state.milestoneUrlKey);
+  }else{
+    path='/fullboard';
+    if(state.lockedKey)query='?key='+encodeURIComponent(state.lockedKey)+
+      (state.showBlocked?'&showBlockers=1':'');
+  }
+  const next=path+query+hash;
+  const current=window.location.pathname+window.location.search+window.location.hash;
+  if(next!==current){
+    window.history[(navigationReady&&!forceReplace)?'pushState':'replaceState'](null,'',next);
+  }
+  navigationReady=true;
+}
+function restoreBrowserRoute(){
+  if(!state.issues.length)return;
+  routeRestoring=true;
+  try{
+    const route=readSharedViewUrl();
+    if(!document.getElementById('gantt-overlay').hidden)closeMilestoneGantt();
+    if(route.section)setViewFromUrl(route);
+    else {
+      // Treat / as the chosen starting view, without leaving stale selection.
+      setViewFromUrl({section:state.startingView,key:null,tab:'needs-attention'});
+    }
+    render();
+    if(route.section==='gantt'){
+      const data=route.ganttKey==='ALL-MILESTONES'?buildAllMilestonesGantt():buildMilestoneGantt(route.ganttKey);
+      if(data)openGanttData(data,null);
+    }
+  }finally{
+    routeRestoring=false;
+    syncSharedViewUrl(true);
   }
 }
+window.addEventListener('popstate',restoreBrowserRoute);
+window.addEventListener('hashchange',()=>{
+  if(!routeRestoring&&window.location.pathname==='/project-overview')restoreBrowserRoute();
+});
+// The header's height changes as the navigation wraps. Keep the board viewport
+// measured from that actual height, including in milestones and My view.
+const headerResizeObserver=typeof ResizeObserver!=='undefined'?new ResizeObserver(()=>{
+  const height=document.getElementById('app-header').getBoundingClientRect().height;
+  document.documentElement.style.setProperty('--app-header-height',height+'px');
+}):null;
+if(headerResizeObserver)headerResizeObserver.observe(document.getElementById('app-header'));
+function updateHeaderHeight(){
+  document.documentElement.style.setProperty('--app-header-height',document.getElementById('app-header').getBoundingClientRect().height+'px');
+}
+updateHeaderHeight();
+window.addEventListener('resize',updateHeaderHeight);
 
 // ── Filter preferences ────────────────────────────────────────────────────
 let preferencesReady=false;
@@ -4160,6 +4334,8 @@ async function checkForRequiredUpdate(){
       const latest = data.latest ? 'v' + data.latest : 'a newer version';
       document.getElementById('required-update-message').textContent =
         'Jira Dependency Map ' + latest + ' is available. You are using ' + current + '.';
+      const releaseLink=document.getElementById('required-update-release-link');
+      if(releaseLink && /^https:\/\/github\.com\//i.test(String(data.releaseUrl||''))) releaseLink.href=data.releaseUrl;
       const modal = document.getElementById('required-update-modal');
       modal.classList.add('open');
       document.getElementById('required-update-button').focus();
@@ -5850,7 +6026,7 @@ function dashboardOverviewHtml(){
   const topWorkloadHtml=topWorkload.length?topWorkload.map((x,index)=>'<div class="dashboard-top-workload-row"><strong>'+((index+1)+'. ')+esc(x.name)+'</strong><span class="dashboard-top-workload-count">'+x.count+'</span></div>').join(''):'<div class="dashboard-empty">No assigned active tickets.</div>';
   const riskTotals=attentionItems.map(([id,label,n])=>'<button type="button" class="dashboard-attention-item" data-dashboard-risk-link="'+id+'"><span>'+esc(label)+'</span><strong>'+n+'</strong></button>').join('');
   const healthDetails=attentionItems.map(([id,label,n])=>'<div class="dashboard-health-row"><span class="dashboard-health-row-label">'+esc(label)+'</span><span class="dashboard-health-row-detail">'+n+' affected</span></div>').join('');
-  const tabs=DASHBOARD_TABS.map(([id,label])=>'<button type="button" role="tab" aria-selected="'+(tab===id?'true':'false')+'" data-dashboard-tab="'+id+'" class="'+(tab===id?'active':'')+'">'+esc(label)+'</button>').join('');
+  const tabs=DASHBOARD_TABS.map(([id,label])=>'<button type="button" role="tab" id="tab-'+id+'" aria-selected="'+(tab===id?'true':'false')+'" data-dashboard-tab="'+id+'" class="'+(tab===id?'active':'')+'">'+esc(label)+'</button>').join('');
   const mainPanel=tab==='workload-priorities'
     ? '<div class="dashboard-two-column dashboard-workload-panel">'+
         '<div class="dashboard-section-group">'+dashboardSummarySection('Workload by assignee',dashboardWorkloadHtml(workload,risks),'workload-by-assignee','Risk and health metrics across all active tickets')+'</div>'+
@@ -5884,6 +6060,7 @@ function renderDashboard(){
     state.dashboardTab=tab;
     state.dashboardAttentionFilter=attentionFilter;
     state.dashboardPages[tab]=1;
+    syncSharedViewUrl();
     render();
     app.scrollTop=previousTop;
     app.scrollLeft=previousLeft;
@@ -8071,6 +8248,7 @@ function attachEvents(root=board, partial=false){
       state.selectionHistory = [];
       state.showBlocked = false;
       state.milestoneFlashKey = key;
+      state.milestoneUrlKey = key;
       state.returnMilestoneKey = null;
       render();
     });
@@ -8303,17 +8481,12 @@ async function load(resetSelection){
     state.completedDownloadStatus=wantCompleted ? 'ready' : 'downloading';
     state.cleanSnapshot=cloneCleanSnapshot();
     state.pendingChanges=[]; state.history=[]; state.redoHistory=[];
+    let requestedGantt=null;
     if(resetSelection){
       state.lockedKey=null; state.selectionHistory=[]; state.showBlocked=false;
-      if(pendingSharedView && pendingSharedView.key){
-        const sharedIssue=state.issues.find(i => String(i.key).toUpperCase() === pendingSharedView.key);
-        if(sharedIssue){
-          state.showDashboard=false;
-          state.showMyView=false;
-          state.showMilestones=false;
-          state.lockedKey=sharedIssue.key;
-          state.showBlocked=!!pendingSharedView.showBlocked;
-          state.revealSelectedKey=sharedIssue.key;
+      if(pendingSharedView?.section){
+        if(setViewFromUrl(pendingSharedView)){
+          requestedGantt=pendingSharedView.section==='gantt'?pendingSharedView.ganttKey:null;
           startupViewPending=false;
         }
         pendingSharedView=null;
@@ -8326,6 +8499,11 @@ async function load(resetSelection){
       }
     }
     await render(); updateSaveButton();
+    if(requestedGantt){
+      const data=requestedGantt==='ALL-MILESTONES'?buildAllMilestonesGantt():buildMilestoneGantt(requestedGantt);
+      if(data)openGanttData(data,null);
+    }
+    if(routeBootstrapping){routeBootstrapping=false;syncSharedViewUrl();}
     if(loadGeneration!==state.loadGeneration) return;
     // Close & refresh from a Jira issue preview leaves the user in the same
     // Gantt, rebuilt against the refreshed Jira graph and current preferences.
@@ -8356,7 +8534,8 @@ document.addEventListener('click', closePriorityPickers);
 document.getElementById('save').addEventListener('click', saveChanges);
 document.getElementById('refresh').addEventListener('click', () => {
   if(state.pendingChanges.length && !confirm('Discard ' + state.pendingChanges.length + ' unsaved change' + (state.pendingChanges.length === 1 ? '' : 's') + ' and refresh from Jira?')) return;
-  load(true);
+  // Rebuild Jira data without resetting the selected ticket, section or Gantt.
+  load(false);
 });
 function goBackFromSelection(){
   if(state.ganttReturnContext&&state.selectionHistory.length<=1){returnToOriginGantt();return;}
@@ -8441,7 +8620,7 @@ milestoneBackBtn.addEventListener('click', () => {
     if(previous?.filters)restoreFilterSnapshot(previous.filters);
     state.ganttReturnToMilestones=false;state.showMilestones=true;state.showDashboard=false;
     state.showMyView=false;state.lockedKey=null;state.selectionHistory=[];state.showBlocked=false;
-    state.returnMilestoneKey=null;render();return;
+    state.returnMilestoneKey=null;state.milestoneUrlKey=null;render();return;
   }
   if(state.dashboardReturnSection){
     const sectionId=state.dashboardReturnSection;
@@ -8471,6 +8650,7 @@ milestoneBackBtn.addEventListener('click', () => {
   state.selectionHistory = [];
   state.showBlocked = false;
   state.milestoneFlashKey = key;
+  state.milestoneUrlKey = key;
   state.returnMilestoneKey = null;
   render();
 });
@@ -8487,6 +8667,7 @@ document.querySelectorAll('.view-switch').forEach(btn => {
     state.showDashboard=view==='dashboard';
     state.showMyView=view==='my-view';
     state.showMilestones=view==='milestone';
+    state.milestoneUrlKey=null;
     if(view==='default' && savedFullBoardView){
       Object.assign(state,savedFullBoardView);
       savedFullBoardView=null;
@@ -8684,9 +8865,10 @@ function ganttScheduleForIssue(i,edges,byKey){
   const created=ganttDate(i.created);
   const blockerDue=edges.filter(e=>e.to===i.key).map(e=>ganttDate(byKey.get(e.from)?.dueDate)).filter(n=>n!==null);
   const lastBlocker=blockerDue.length?Math.max(...blockerDue):null;
-  const start=jiraStart!==null?jiraStart:lastBlocker!==null?lastBlocker+GANTT_DAY_MS:created;
   const end=ganttDate(i.dueDate);
-  const source=jiraStart!==null?'Jira start date':lastBlocker!==null?'Latest blocker due + 1 day':created!==null?'Jira creation date':'Missing start date';
+  const sameDayHandoff=jiraStart===null&&lastBlocker!==null&&end!==null&&lastBlocker===end;
+  const start=jiraStart!==null?jiraStart:lastBlocker!==null?(sameDayHandoff?lastBlocker:lastBlocker+GANTT_DAY_MS):created;
+  const source=jiraStart!==null?'Jira start date':sameDayHandoff?'Same-day blocker/due-date exception':lastBlocker!==null?'Latest blocker due + 1 day':created!==null?'Jira creation date':'Missing start date';
   const reason=end===null?'No due date':start===null?'No start or creation date':start>end?'Start falls after due date':'';
   return {source,start:start===null?null:ganttDateKey(start),end:end===null?null:ganttDateKey(end),reason};
 }
@@ -9045,6 +9227,7 @@ function closeMilestoneGantt(){
   scheduleDependencyLines();
   if(ganttReturnFocus?.isConnected)ganttReturnFocus.focus({preventScroll:true});
   ganttReturnFocus=null;
+  syncSharedViewUrl();
 }
 function openMilestoneGantt(key,button){
   openGanttData(buildMilestoneGantt(key),button);
@@ -9064,6 +9247,7 @@ function openGanttData(data,button){
   document.getElementById('gantt-export-status').textContent='';
   overlay.hidden=false;
   document.body.classList.add('gantt-open');
+  syncSharedViewUrl();
   updateGanttControls();
   renderGanttChart();
   scrollGanttToToday();
