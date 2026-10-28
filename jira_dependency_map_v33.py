@@ -1942,6 +1942,9 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
   .view-switch{padding:6px 7px;font-size:11px}
   .filter-menu{width:min(300px,calc(100vw - 20px))}
 }
+/* Navigation stays visibly unavailable until Jira finishes loading. This
+   applies to the first startup as well as subsequent Refresh from Jira calls. */
+body.jira-loading #app-header{filter:blur(3px);opacity:.55;pointer-events:none;user-select:none}
 /* ── Completed toggle ────────────────────────────────────────────────────── */
 .btn-toggle-completed{gap:7px;padding-left:10px}
 .toggle-track{
@@ -1978,6 +1981,8 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 .milestone-project-gantt:disabled{opacity:.5;cursor:default}
 .milestone-overview-count{font-size:12px;background:#e0f2fe;border-radius:999px;padding:3px 9px;color:#0369a1;font-weight:800}
 .milestone-row{display:flex;flex:1;min-height:0;gap:14px;overflow:visible;padding:2px 2px 0;align-items:stretch}
+.milestone-item[hidden],.milestone-search-empty[hidden]{display:none!important}
+.milestone-row > .milestone-search-empty.no-results{align-self:center;flex:0 0 auto;width:min(520px,calc(100vw - 72px));margin:auto}
 .milestone-item{width:600px;min-width:600px;height:100%;max-height:100%;min-height:0;overflow:hidden;display:flex;flex-direction:column;gap:7px}
 .milestone-item .card{width:100%;}
 .milestone-blocked{border:1px solid var(--border);border-radius:9px;background:#fff;padding:9px 10px;box-shadow:0 1px 2px rgba(15,23,42,.04);display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}
@@ -2047,36 +2052,38 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sa
 @keyframes dependencyFlash{0%{box-shadow:0 0 0 4px rgba(99,102,241,.75)}100%{box-shadow:0 0 0 0 rgba(99,102,241,0)}}
 #status-text{font-size:12px;color:#fff;white-space:nowrap}
 
-/* ── Jira ticket preview modal ─────────────────────────────────────────── */
+/* ── Jira ticket preview: share Gantt's fullscreen dialog design ─────── */
 .ticket-preview-backdrop{
   position:fixed;inset:0;z-index:10079;
-  background:rgba(15,23,42,.22);
+  background:rgba(15,23,42,.6);
 }
-.ticket-preview-modal{
-  position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
-  width:min(1600px,calc(100vw - 48px));height:min(760px,calc(100vh - 48px));
-  z-index:10080;display:flex;flex-direction:column;overflow:hidden;resize:none;
-  background:#fff;border:1px solid #cbd5e1;border-radius:10px;
-  box-shadow:0 24px 70px rgba(15,23,42,.28);
+/* The Gantt itself fills an overlay padded 12px. The preview is a separate
+   fixed layer, so match the same inset without changing modal stacking. */
+#ticket-preview-modal{
+  position:fixed;inset:12px;width:auto;height:auto;
+  z-index:10080;box-sizing:border-box;min-width:0;min-height:0;
 }
-.ticket-preview-header{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 12px;background:#f8fafc;border-bottom:1px solid #e2e8f0}
-.ticket-preview-title{min-width:0;font-size:12px;font-weight:700;color:#0f172a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ticket-preview-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto}
-.ticket-preview-open,.ticket-preview-close{
-  width:108px;height:30px;padding:0 10px;border:1px solid #cbd5e1;
-  background:#fff;color:#334155;border-radius:5px;font-size:11px;font-weight:700;
-  line-height:1;cursor:pointer;text-decoration:none;
+#ticket-preview-modal .gantt-header{flex:0 0 auto}
+#ticket-preview-modal .gantt-actions a{
+  display:inline-flex;align-items:center;justify-content:center;
+  text-decoration:none;
+}
+.ticket-preview-modal iframe{
+  display:block;flex:1 1 auto;width:100%;min-height:0;border:0;background:#fff;
+}
+/* The FAQs dialog also uses this close-button class; keep its original design. */
+.faqs-header .ticket-preview-close{
+  width:108px;height:30px;padding:0 10px;border:1px solid #334155;
+  background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;
+  border-radius:5px;font-size:11px;font-weight:700;line-height:1;cursor:pointer;
   display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;
 }
-.ticket-preview-open:hover{background:#f1f5f9}
-.ticket-preview-close{
-  background:linear-gradient(135deg,#0f172a,#1e293b);
-  border-color:#334155;color:#fff;
+.faqs-header .ticket-preview-close:hover{
+  background:#334155;border-color:#475569;color:#fff;
 }
-.ticket-preview-close:hover{background:#334155;border-color:#475569;color:#fff}
-.ticket-preview-modal iframe{display:block;flex:1 1 auto;width:100%;min-height:0;border:0;background:#fff}
 body.gantt-open .ticket-preview-backdrop{z-index:25030}
-body.gantt-open .ticket-preview-modal{z-index:25031}
+body.gantt-open #ticket-preview-modal{z-index:25031}
+@media(max-width:700px){#ticket-preview-modal{inset:0;border-radius:0}}
 #faqs-modal{display:none;position:fixed;inset:0;z-index:10079;background:rgba(15,23,42,.22);align-items:center;justify-content:center;padding:24px}
 #faqs-modal.open{display:flex}
 .faqs-dialog{width:min(760px,calc(100vw - 48px));height:min(760px,calc(100vh - 48px));display:flex;flex-direction:column;overflow:hidden;background:#fff;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 24px 70px rgba(15,23,42,.28)}
@@ -2390,6 +2397,7 @@ body.jira-refreshing #loading.show .loading-favicon-wrap{background:#fff;width:8
 body.jira-refreshing #loading.show #loading-label,body.jira-refreshing #loading.show #loading-status{color:white}
 body.jira-refreshing #loading.show .loading-progress,body.jira-refreshing #loading.show .startup-message{display:none!important}
 /* dependency-status is earlier in the DOM than #loading, so it cannot be hidden with a following-sibling selector. */
+body.jira-loading #dependency-status,
 #dependency-status.loading-hidden{display:none !important}
 #dependency-status.view-hidden{display:none !important}
 #loading::before{
@@ -2451,8 +2459,11 @@ body.jira-refreshing #loading.show .loading-progress,body.jira-refreshing #loadi
 
 
 #dependency-status{
-  position:fixed;top:66px;right:16px;z-index:120;
-  display:flex;align-items:center;gap:5px;padding:4px 6px;
+  /* The header can wrap onto several rows. Place the legend just below its
+     measured height rather than letting it overlap the navigation. */
+  position:fixed;top:calc(var(--app-header-height, 58px) + 8px);right:16px;z-index:120;
+  display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;
+  max-width:calc(100vw - 32px);gap:5px;padding:4px 6px;
   background:rgba(255,255,255,.94);border:1px solid #e2e8f0;
   border-radius:7px;box-shadow:0 2px 8px rgba(15,23,42,.06);
   pointer-events:none;
@@ -3135,7 +3146,7 @@ body.gantt-open{overflow:hidden}
 @media(max-width:850px){.dashboard-personal-health{grid-template-columns:1fr}.dashboard-personal-health-stats{justify-content:space-between}.dashboard-personal-health-stats>div{align-items:flex-start}}
 </style>
 </head>
-<body>
+<body class="jira-loading">
 
 <div id="required-update-modal" role="alertdialog" aria-modal="true" aria-labelledby="required-update-title">
   <div class="required-update-card">
@@ -3309,7 +3320,7 @@ body.gantt-open{overflow:hidden}
   </div>
 </div>
 
-<div id="dependency-status" aria-label="Dependency status key">
+<div id="dependency-status" class="loading-hidden" aria-label="Dependency status key">
   <span class="status-pill blocked"><span class="status-arrow">←</span>Blocked by</span>
   <span class="status-pill blocks"><span class="status-arrow">→</span>Blocks</span>
   <span id="external-status" class="status-pill external"><span class="status-dot"></span>External blocker</span>
@@ -3318,7 +3329,7 @@ body.gantt-open{overflow:hidden}
 </div>
 
 
-<header id="app-header">
+<header id="app-header" inert aria-busy="true">
   <div class="brand" data-action="escape" role="button" tabindex="0" title="Home" aria-label="Home">
     <span class="brand-icon"><img src="https://warwick.ac.uk/services/marketing/teams/cds/opd/1486504840-cog-cogwheel-gear-repr-options-setting_81360.png" alt="" aria-hidden="true"></span>
     <div>Jira Dependency Map<small id="brand-subtitle">Web Evolution dependencies</small></div>
@@ -3471,6 +3482,7 @@ const state = {
   selectionHistory:[],
   showBlocked:false,
   filterUser:"",
+  searchTerm:'',             // Full Board search is always an initialised string
   filterDue:"all",
   includeWithRemarkable:true,
   // Each entry: { source, target, action:'add'|'delete' }
@@ -3484,6 +3496,7 @@ const state = {
   // Incremented for every Jira load. Older responses/background jobs are ignored.
   loadGeneration:0,
   showMilestones:false,         // toggle: OFF by default; milestone overview
+  milestoneSearchTerm:'',       // Milestones-only card filter; never filters the Gantt
   showDashboard:false,
   showMyView:false,
   myViewSavedSorts:{}, myViewSort:{field:'priority',direction:'asc'}, myViewColumns:['key','summary','priority','dueDate','epic','status','blockers','blocked','riskScore','riskReasons'], milestoneSort:'dueDate', ganttReturnToMilestones:false, ganttReturnContext:null,
@@ -4396,6 +4409,12 @@ let startupMessagePromise = null;
 let hasLoadedJiraOnce = false;
 
 function setLoading(on, msg){
+  document.body.classList.toggle('jira-loading',on);
+  const header=document.getElementById('app-header');
+  if(header){
+    header.inert=on; // Unlike pointer-events, this also prevents keyboard focus.
+    header.setAttribute('aria-busy',String(on));
+  }
   loading.classList.toggle('show', on);
   dependencyStatus.classList.toggle('loading-hidden', on);
   if(on){
@@ -6562,25 +6581,32 @@ function openTicketPreviewModal(key, url, summary){
 
   const modal=document.createElement('div');
   modal.id='ticket-preview-modal';
-  modal.className='ticket-preview-modal';
+  modal.className='ticket-preview-modal gantt-modal';
   modal.setAttribute('role','dialog');
   modal.setAttribute('aria-modal','true');
-  modal.setAttribute('aria-label',key+' Jira preview');
+  modal.setAttribute('aria-labelledby','ticket-preview-title');
   modal.addEventListener('click', e => e.stopPropagation());
 
   const header=document.createElement('div');
-  header.className='ticket-preview-header';
+  header.className='gantt-header';
 
-  const title=document.createElement('div');
-  title.className='ticket-preview-title';
+  const headerMain=document.createElement('div');
+  headerMain.className='gantt-header-main';
+  const eyebrow=document.createElement('div');
+  eyebrow.className='gantt-eyebrow';
+  eyebrow.textContent='Jira ticket preview';
+  const title=document.createElement('h2');
+  title.id='ticket-preview-title';
   title.textContent=key+(summary ? ' · '+summary : '');
+  headerMain.appendChild(eyebrow);
+  headerMain.appendChild(title);
 
   const actions=document.createElement('div');
-  actions.className='ticket-preview-actions';
+  actions.className='gantt-actions';
 
   const refresh=document.createElement('button');
   refresh.type='button';
-  refresh.className='ticket-preview-open';
+  refresh.className='gantt-action';
   refresh.textContent='Close & refresh';
   refresh.title='Close this preview and refresh Jira data';
   refresh.addEventListener('click', () => {
@@ -6589,7 +6615,7 @@ function openTicketPreviewModal(key, url, summary){
   });
 
   const open=document.createElement('a');
-  open.className='ticket-preview-open';
+  open.className='gantt-action gantt-export';
   open.href=url;
   open.target='_blank';
   open.rel='noopener noreferrer';
@@ -6597,15 +6623,15 @@ function openTicketPreviewModal(key, url, summary){
 
   const close=document.createElement('button');
   close.type='button';
-  close.className='ticket-preview-close';
+  close.className='gantt-action';
   close.setAttribute('aria-label','Close');
-  close.textContent='Close';
+  close.textContent='Close ×';
   close.addEventListener('click',closeTicketPreviewModal);
 
   actions.appendChild(refresh);
   actions.appendChild(open);
   actions.appendChild(close);
-  header.appendChild(title);
+  header.appendChild(headerMain);
   header.appendChild(actions);
 
   const iframe=document.createElement('iframe');
@@ -6706,12 +6732,16 @@ function milestoneOverviewHtml(milestones){
     '</div>' +
     '<div class="milestone-row">' +
       (milestones.length
-        ? milestones.map(i => '<div class="milestone-item">' +
+        ? milestones.map(i => '<div class="milestone-item" data-search-index="' + esc(buildSearchIndex(i)) + '">' +
             '<div class="milestone-overview-card" data-milestone-card="' + esc(i.key) + '" data-milestone-chain="' + esc(i.key) + '">' + milestoneCardHtml(i) +
               '</div>' +
             blockerItems(i) +
           '</div>').join('')
         : '<div class="empty">No milestone tickets</div>') +
+      '<div class="milestone-search-empty no-results" role="status" hidden>' +
+        '<div class="no-results-title">No milestones match your search.</div>' +
+        '<div class="no-results-message">Try a different key, summary, assignee or epic.</div>' +
+      '</div>' +
     '</div>' +
   '</div>';
 }
@@ -6803,6 +6833,27 @@ async function copyMilestoneBlockers(milestoneKey,button){
   },2500);
 }
 
+// Filter only the milestone cards currently on screen; no Jira data or Gantt
+// rows are changed, and typing never destroys/rebuilds the milestone board.
+function applyMilestoneSearchFilter(){
+  if(!state.showMilestones) return;
+  const words=searchWords(state.milestoneSearchTerm);
+  const items=[...board.querySelectorAll('.milestone-row > .milestone-item')];
+  let visible=0;
+  items.forEach(item=>{
+    const index=item.dataset.searchIndex || '';
+    const matches=words.every(word=>index.includes(word));
+    item.hidden=!matches;
+    if(matches) visible++;
+  });
+  const count=board.querySelector('.milestone-overview-count');
+  if(count) count.textContent=words.length ? visible+' / '+items.length : String(items.length);
+  const noResults=board.querySelector('.milestone-search-empty');
+  if(noResults) noResults.hidden=!words.length || visible!==0 || items.length===0;
+  statusText.textContent=(words.length ? visible.toLocaleString('en-GB')+' of '+items.length.toLocaleString('en-GB') : items.length.toLocaleString('en-GB'))+
+    ' milestone'+(words.length || items.length!==1?'s':'');
+}
+
 function renderMilestoneOverview(flashKey){
   const milestones = state.displayIssues
     .filter(i => (i.labels || []).some(label => String(label).toLowerCase() === 'milestone'))
@@ -6813,6 +6864,7 @@ function renderMilestoneOverview(flashKey){
   const wrapper = document.createElement('div');
   wrapper.innerHTML = milestoneOverviewHtml(milestones);
   board.appendChild(wrapper.firstElementChild);
+  applyMilestoneSearchFilter();
   board.querySelector('#milestone-sort')?.addEventListener('change',e=>{
     state.milestoneSort=e.target.value;
     savePreferences({milestoneSort:state.milestoneSort});
@@ -6897,7 +6949,6 @@ function renderMilestoneOverview(flashKey){
     });
   });
 
-  statusText.textContent = milestones.length.toLocaleString('en-GB') + ' milestone' + (milestones.length === 1 ? '' : 's');
   const app = document.getElementById('app');
   requestAnimationFrame(() => {
     const savedMilestoneScroll = state.scrollPositions.milestone || {};
@@ -6977,7 +7028,7 @@ function render(){
 
   // Keep the search field stable while the board is rebuilt. This is important
   // because search results are rendered on every input event.
-  const searchValue = searchEl ? searchEl.value : state.searchTerm;
+  const searchValue = state.showMilestones ? (state.milestoneSearchTerm || '') : (state.searchTerm || '');
   const searchWasFocused = document.activeElement === searchEl;
   const searchSelectionStart = searchEl ? searchEl.selectionStart : null;
   const searchSelectionEnd = searchEl ? searchEl.selectionEnd : null;
@@ -6999,6 +7050,15 @@ function render(){
   // Rebuild display data honoring the completed toggle
   computeDisplayData();
   console.debug('Dependency graph render', {issues:state.displayIssues.length, edges:state.displayEdges.length, selected:state.lockedKey});
+
+  // The shared search input has independent text for the milestones and full
+  // board views. Switching views must not carry one view's search into another.
+  if(searchEl){
+    const viewSearch=state.showMilestones ? (state.milestoneSearchTerm || '') : (state.searchTerm || '');
+    if(searchEl.value!==viewSearch) searchEl.value=viewSearch;
+    searchEl.placeholder=state.showMilestones ? 'Search milestone key, summary or epic…' : 'Search key, summary or epic…';
+    updateSearchClearButton();
+  }
 
   // Sync filter controls
   populateFilterUsers();
@@ -7049,7 +7109,7 @@ function render(){
     state.showBlocked = false;
     syncSharedViewUrl();
     document.getElementById('app').classList.remove('locked');
-    searchWrap.style.visibility = 'hidden';
+    searchWrap.style.visibility = 'visible';
     if(filterMenu) filterMenu.classList.remove('open');
     if(filtersBtn) filtersBtn.style.visibility = 'hidden';
     if(clearFiltersBtn) clearFiltersBtn.style.visibility = 'hidden';
@@ -8699,18 +8759,30 @@ function updateSearchClearButton(){
 }
 
 searchEl.addEventListener('input', () => {
-  // Never rebuild the board while typing. Filter the existing cards directly so
-  // the input value and the search state cannot get out of sync.
+  // Never rebuild while typing. In Milestones, search is a local, card-only
+  // filter and is intentionally not applied to the All milestones Gantt.
+  if(state.showMilestones){
+    state.milestoneSearchTerm=searchEl.value;
+    updateSearchClearButton();
+    applyMilestoneSearchFilter();
+    return;
+  }
   state.searchTerm = searchEl.value;
   updateSearchClearButton();
   applySearchFilter();
 });
 searchClearBtn.addEventListener('click', () => {
-  // Clear only the text query. User, due-date and Remarkable filters remain.
+  // Clear only the search of the active view; keep any other board filters.
   searchEl.value = '';
-  state.searchTerm = '';
-  updateSearchClearButton();
-  applySearchFilter();
+  if(state.showMilestones){
+    state.milestoneSearchTerm='';
+    updateSearchClearButton();
+    applyMilestoneSearchFilter();
+  }else{
+    state.searchTerm='';
+    updateSearchClearButton();
+    applySearchFilter();
+  }
   searchEl.focus({preventScroll:true});
 });
 document.addEventListener('keydown', e => {
@@ -8943,8 +9015,9 @@ function ganttProjectMilestoneSchedule(issue,incoming,byKey){
   return {start,end:endMs===null?null:ganttDateKey(endMs),source,reason};
 }
 function buildAllMilestonesGantt(){
-  // Use precisely the same visible milestone population as the milestone view;
-  // respect the global Completed / With Remarkable and other board filters.
+  // The milestone text search is deliberately NOT applied here: it only hides
+  // cards in the milestone overview, leaving this full timeline unchanged.
+  // Respect the underlying Completed / With Remarkable display settings.
   const milestones=state.displayIssues
     .filter(i=>(i.labels||[]).some(label=>String(label).toLowerCase()==='milestone'))
     .sort((a,b)=>(a.dueDate||'9999-12-31').localeCompare(b.dueDate||'9999-12-31')||a.key.localeCompare(b.key));
