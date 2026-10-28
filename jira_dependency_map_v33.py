@@ -133,7 +133,7 @@ def _normalise_preferences(data):
                     cleaned[user_id]={"field":field,"direction":direction}
     out["myViewSorts"]=cleaned
     dashboard_fields={"priority","dueDate","key","summary","epic","status","blockers","blocked","assignee","riskScore"}
-    dashboard_tabs={"needs-attention","upcoming-7","upcoming-31","overdue","missing-due","unassigned","biggest-unblockers","chain-risks","circular","in-development"}
+    dashboard_tabs={"needs-attention","upcoming-7","upcoming-31","overdue","missing-due","unassigned","biggest-unblockers","chain-risks","circular","in-development","backlog"}
     dashboard_sorts={}
     raw_dashboard_sorts=out.get("dashboardTabSorts")
     if isinstance(raw_dashboard_sorts,dict):
@@ -2576,10 +2576,24 @@ body.jira-loading #dependency-status,
 .dashboard-stat.risk .dashboard-stat-value{color:#b91c1c}
  .dashboard-health-stat{min-width:0;grid-column:span 2}
 .dashboard-stat.dashboard-attention-stat{grid-column:span 2}
-.dashboard-attention-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin-top:7px}
+/* Risk categories navigate to overview tabs; filter controls are a separate
+   group beneath them with a little breathing room. */
+.dashboard-attention-summary{display:flex;flex-direction:column;gap:9px;margin-top:7px}
+.dashboard-attention-links,.dashboard-attention-filters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}
+.dashboard-attention-filters{margin-top:1px}
 .dashboard-attention-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 7px;border:1px solid #e2e8f0;background:#f8fafc;border-radius:6px;font-size:10px;color:#334155;cursor:pointer;text-align:left;width:100%}
 .dashboard-attention-item:hover{background:#fff;border-color:#cbd5e1}
 .dashboard-attention-item strong{font-size:10px;color:#172033}
+/* Two summary categories filter Needs attention rather than opening their own tabs.
+   Give these a distinct outlined/filter-chip treatment and a pressed state. */
+.dashboard-attention-item.dashboard-attention-filter{border:1px dashed #a5b4fc;background:#eef2ff;color:#3730a3}
+.dashboard-attention-item.dashboard-attention-filter:hover{background:#e0e7ff;border-color:#818cf8}
+.dashboard-attention-filter-label{display:flex;align-items:center;gap:5px;min-width:0}
+.dashboard-attention-filter-icon{width:12px;height:12px;flex:0 0 12px;color:#6366f1}
+.dashboard-attention-item.dashboard-attention-filter strong{color:#4338ca}
+.dashboard-attention-item.dashboard-attention-filter.is-active{border-style:solid;border-color:#4338ca;background:#4338ca;color:#fff}
+.dashboard-attention-item.dashboard-attention-filter.is-active strong,.dashboard-attention-item.dashboard-attention-filter.is-active .dashboard-attention-filter-icon{color:#fff}
+.dashboard-attention-item:focus-visible{outline:2px solid #6366f1;outline-offset:2px}
 .dashboard-upcoming-stack{display:flex;flex-direction:column;gap:10px;min-width:0}
 .dashboard-upcoming-stack .dashboard-stat{width:100%}
 .dashboard-upcoming-tabs{display:flex;gap:5px;margin:0 0 9px}
@@ -3524,7 +3538,7 @@ const state = {
 // /project-overview#tab-overdue ; /my-view
 // /gantt/WT-592 ; /gantt/all-milestones
 const ROUTE_TABS=new Set(['needs-attention','upcoming-7','upcoming-31','overdue','missing-due',
-  'unassigned','biggest-unblockers','chain-risks','circular','in-development','workload-priorities']);
+  'unassigned','biggest-unblockers','chain-risks','circular','in-development','backlog','workload-priorities']);
 const ROUTE_TICKET=/^[A-Za-z][A-Za-z0-9_]*-\d+$/;
 let routeBootstrapping=true;
 let routeRestoring=false;
@@ -5580,6 +5594,23 @@ function dashboardRiskInfo(issues){
   const graph=dashboardGraphTraversal(issues);
   const chainDateRiskKeys=new Set();
   const chainDateRiskDetails=new Map();
+  const chainMissingDueDateKeys=new Set();
+  const chainMissingDueDateDetails=new Map();
+  // The reduced 5-point missing-date risk belongs to an UNDated ticket,
+  // not to its dated descendants. Inspect all active upstream blockers,
+  // including indirect ones. The graph helper excludes the ticket itself,
+  // so cycles do not make a ticket its own missing-date blocker.
+  active.forEach(issue=>{
+    if(issue.dueDate) return;
+    const undatedBlockers=[];
+    graph.eachReachable(issue.key,blocker=>{
+      if(!blocker.dueDate && undatedBlockers.length<5) undatedBlockers.push(blocker.key);
+    },true);
+    if(undatedBlockers.length){
+      chainMissingDueDateKeys.add(issue.key);
+      chainMissingDueDateDetails.set(issue.key,undatedBlockers);
+    }
+  });
   active.forEach(source=>{
     const sourceDate=source.dueDate ? new Date(source.dueDate+'T00:00:00') : null;
     if(!sourceDate || Number.isNaN(sourceDate.getTime())) return;
@@ -5593,6 +5624,7 @@ function dashboardRiskInfo(issues){
     });
   });
   const chainDateRisks=active.filter(i=>chainDateRiskKeys.has(i.key));
+  const chainMissingDueDateRisks=active.filter(i=>chainMissingDueDateKeys.has(i.key));
   const circularKeys=calculateGraphLayout(active,state.edges).cycleKeys;
   const circularDependencies=active.filter(i=>circularKeys.has(i.key));
   const today=new Date();today.setHours(0,0,0,0);
@@ -5612,7 +5644,18 @@ function dashboardRiskInfo(issues){
       score+=points;
     }
     if(!issue.assigneeAccountId){reasons.push({id:'unassigned',label:'Unassigned',points:10});score+=10;}
-    if(!issue.dueDate){reasons.push({id:'missing-due',label:'Missing due date',points:15});score+=15;}
+    if(!issue.dueDate){
+      if(chainMissingDueDateKeys.has(issue.key)){
+        // Its own date is missing, but at least one earlier blocker is also
+        // undated: one 5-point reason replaces the normal 15-point reason.
+        reasons.push({id:'chain-missing-due',label:'Chain due date missing',points:5,
+          details:(chainMissingDueDateDetails.get(issue.key)||[]).join(', ')});
+        score+=5;
+      }else{
+        reasons.push({id:'missing-due',label:'Missing due date',points:15});
+        score+=15;
+      }
+    }
     if(chainDateRiskKeys.has(issue.key)){reasons.push({id:'chain-risks',label:'Chain date risk',points:20});score+=20;}
     if(circularKeys.has(issue.key)){reasons.push({id:'circular',label:'Circular dependency',points:25});score+=25;}
     if(issue.hasDescription===false){reasons.push({id:'missing-description',label:'Missing description',points:5});score+=5;}
@@ -5627,6 +5670,7 @@ function dashboardRiskInfo(issues){
   const boardHealthScore=health.healthScore;
   const boardHealthStatus=boardHealthScore>=90?'green':boardHealthScore>=70?'amber':'red';
   return {active,overdue,unassigned,noDueDate,noDescription,chainDateRisks,chainDateRiskKeys,chainDateRiskDetails,
+    chainMissingDueDateRisks,chainMissingDueDateKeys,chainMissingDueDateDetails,
     circularDependencies,circularKeys,attention,ticketRisks,averageRisk,
     cappedRiskTotal:health.cappedRiskTotal,boardHealthScore,boardHealthStatus};
 }
@@ -5908,12 +5952,16 @@ function dashboardPersonalViewHtml(activeIssues,risks){
     metric('Due next 31 days',nextMonth.length,'Today through the next 31 days',highlightToggle('next31','due in the next 31 days'))+
     '</div>';
 }
+// Follow the Project overview summary: needs-attention risk categories, then
+// upcoming deadlines, then workload/delivery views. Preserve tab IDs for URLs
+// and saved sort preferences; In development remains immediately before Backlog.
 const DASHBOARD_TABS=[
-  ['needs-attention','Needs attention'],['upcoming-7','Upcoming 7 days'],['upcoming-31','Upcoming 31 days'],
-  ['overdue','Overdue'],['missing-due','Missing Due Date'],['unassigned','Unassigned tickets'],
-  ['biggest-unblockers','Biggest unblockers'],['chain-risks','Dependency chain date risks'],
-  ['circular','Circular Dependencies'],['in-development','In development'],
-  ['workload-priorities','Workload and Priorities']
+  ['needs-attention','Needs attention'],
+  ['overdue','Overdue'],['unassigned','Unassigned'],['missing-due','Missing Due Date'],
+  ['chain-risks','Dependency chain date risks'],['circular','Circular Dependencies'],
+  ['upcoming-7','Next 7 days'],['upcoming-31','Next 31 days'],
+  ['workload-priorities','Workload and Priorities'],['biggest-unblockers','Biggest unblockers'],
+  ['in-development','In development'],['backlog','Backlog']
 ];
 const DASHBOARD_TABLE_FIELDS=[['key','Key'],['summary','Summary'],['priority','Priority'],['dueDate','Due date'],
   ['epic','Parent (epic)'],['assignee','Assignee'],['status','Status'],['blockers','Blockers'],['blocked','Blocked']];
@@ -5932,7 +5980,9 @@ function dashboardSortChanged(tab){
 function dashboardTableData(risks,tab){
   const active=risks.active;
   switch(tab){
-    case 'needs-attention':return risks.attention.filter(i=>state.dashboardAttentionFilter!=='missing-description'||i.hasDescription===false);
+    case 'needs-attention':return risks.attention.filter(i=>
+      state.dashboardAttentionFilter==='missing-description'?i.hasDescription===false:
+      state.dashboardAttentionFilter==='chain-missing-due'?risks.chainMissingDueDateKeys.has(i.key):true);
     case 'upcoming-7':return dashboardDueSoon(active,7);
     case 'upcoming-31':return dashboardDueSoon(active,31);
     case 'overdue':return risks.overdue;
@@ -5947,6 +5997,7 @@ function dashboardTableData(risks,tab){
     case 'chain-risks':return risks.chainDateRisks;
     case 'circular':return risks.circularDependencies;
     case 'in-development':return active.filter(isWithRemarkableStatus);
+    case 'backlog':return active.filter(i=>String(i.status||'').trim().toLowerCase()==='backlog');
     default:return [];
   }
 }
@@ -5997,7 +6048,7 @@ function dashboardTableHtml(risks,tab){
     const epicLabel=epic?(epic.summary?epic.summary+' ('+epic.key+')':epic.key):'';
     const epicHtml=epic?'<a href="'+esc(epic.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(epic.key)+'" title="'+esc(epicLabel)+'">'+esc(epicLabel)+'</a>':'—';
     const risk=risks.ticketRisks.get(i.key)||{score:0,reasons:[]};
-    const riskColumns=tab==='needs-attention'?'<td><strong class="dashboard-risk-score">'+risk.score+'</strong></td><td class="dashboard-reason-cell"><span class="dashboard-reason-list" title="'+esc(risk.reasons.map(x=>x.label+' (+'+x.points+')').join(', '))+'">'+risk.reasons.map(x=>'<span class="dashboard-risk-reason" title="+'+x.points+' points">'+esc(x.label)+'</span>').join('')+'</span></td>':'';
+    const riskColumns=tab==='needs-attention'?'<td><strong class="dashboard-risk-score">'+risk.score+'</strong></td><td class="dashboard-reason-cell"><span class="dashboard-reason-list" title="'+esc(risk.reasons.map(x=>x.label+' (+'+x.points+')').join(', '))+'">'+risk.reasons.map(x=>'<span class="dashboard-risk-reason" title="+'+x.points+' points'+(x.details?' · Upstream: '+esc(x.details):'')+'">'+esc(x.label)+'</span>').join('')+'</span></td>':'';
     return '<tr class="my-view-row dashboard-ticket" data-key="'+esc(i.key)+'" data-dashboard-row-key="'+esc(i.key)+'" tabindex="0" title="Open dependency chain for '+esc(i.key)+'">'+
       '<td><a class="dashboard-ticket-key" href="'+esc(i.url)+'" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="'+esc(i.key)+'">'+esc(i.key)+'</a></td>'+
       '<td class="my-view-summary" title="'+esc(i.summary||'')+'">'+esc(i.summary||'')+'</td>'+
@@ -6011,8 +6062,8 @@ function dashboardTableHtml(risks,tab){
       riskColumns+'</tr>';
   }).join('');
   const title=DASHBOARD_TABS.find(x=>x[0]===tab)?.[1]||'Tickets';
-  const filterNote=state.dashboardAttentionFilter==='missing-description'&&tab==='needs-attention'
-    ? '<button class="dashboard-clear-attention-filter" type="button">Missing descriptions only ×</button>':'';
+  const filterNote=tab==='needs-attention' && ['missing-description','chain-missing-due'].includes(state.dashboardAttentionFilter)
+    ? '<button class="dashboard-clear-attention-filter" type="button">'+(state.dashboardAttentionFilter==='chain-missing-due'?'Chain due date missing':'Missing descriptions')+' only ×</button>':'';
   const sortStatus=dashboardSortChanged(tab)?'Sorting not saved':state.dashboardSavedSorts?.[tab]?'Sorting saved':'Default sorting';
   const pagination=data.length>pageSize?'<nav class="dashboard-table-pagination bottom" aria-label="Table pagination" data-dashboard-page-count="'+pageCount+'"><span class="dashboard-page-count">Showing '+(start+1)+'–'+Math.min(start+pageSize,data.length)+' of '+data.length+'</span><div><button type="button" data-dashboard-page="first"'+(page===1?' disabled':'')+' aria-label="First page">« First</button><button type="button" data-dashboard-page="prev"'+(page===1?' disabled':'')+'>Previous</button><span class="dashboard-page-number">Page '+page+' of '+pageCount+'</span><button type="button" data-dashboard-page="next"'+(page===pageCount?' disabled':'')+'>Next</button><button type="button" data-dashboard-page="last"'+(page===pageCount?' disabled':'')+' aria-label="Last page">Last »</button></div></nav>':'';
   return '<section class="my-view-table-section dashboard-table-section" id="dashboard-table-panel"><div class="my-view-table-heading"><div><h2>'+esc(title)+' <span class="dashboard-section-count">('+data.length+')</span></h2><p>Active tickets · Select a row to open its dependency chain · Click a column heading to sort</p>'+filterNote+'</div><div class="my-view-sort-actions"><span class="my-view-sort-status">'+sortStatus+'</span><button type="button" class="my-view-save-sort" id="dashboard-save-sort"'+(!dashboardSortChanged(tab)?' disabled':'')+'>Save sort</button></div></div>'+
@@ -6034,8 +6085,9 @@ function dashboardOverviewHtml(){
   const attentionPercent=activeCount?Math.round(count/activeCount*100):0;
   const attentionItems=[
     ['overdue','Overdue tickets',risks.overdue.length],
-    ['unassigned','Unassigned tickets',risks.unassigned.length],
+    ['unassigned','Unassigned',risks.unassigned.length],
     ['missing-due','Missing due dates',risks.noDueDate.length],
+    ['chain-missing-due','Chain due date missing',risks.chainMissingDueDateRisks.length],
     ['chain-risks','Dependency chain date risks',risks.chainDateRisks.length],
     ['circular','Circular dependencies',risks.circularDependencies.length],
     ['missing-description','Missing descriptions',risks.noDescription.length]
@@ -6043,7 +6095,19 @@ function dashboardOverviewHtml(){
   const healthScore=Math.round(risks.boardHealthScore);
   const healthLabel=risks.boardHealthStatus==='green'?'Healthy':risks.boardHealthStatus==='amber'?'Needs attention':'At risk';
   const topWorkloadHtml=topWorkload.length?topWorkload.map((x,index)=>'<div class="dashboard-top-workload-row"><strong>'+((index+1)+'. ')+esc(x.name)+'</strong><span class="dashboard-top-workload-count">'+x.count+'</span></div>').join(''):'<div class="dashboard-empty">No assigned active tickets.</div>';
-  const riskTotals=attentionItems.map(([id,label,n])=>'<button type="button" class="dashboard-attention-item" data-dashboard-risk-link="'+id+'"><span>'+esc(label)+'</span><strong>'+n+'</strong></button>').join('');
+  const isAttentionFilter=id=>id==='missing-description'||id==='chain-missing-due';
+  const filterIcon='<svg class="dashboard-attention-filter-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.5 7.5V19l-3 1v-7.5L4 5z"/></svg>';
+  const attentionButtonHtml=([id,label,n])=>{
+    const isFilter=isAttentionFilter(id);
+    const activeFilter=isFilter&&tab==='needs-attention'&&state.dashboardAttentionFilter===id;
+    return '<button type="button" class="dashboard-attention-item'+(isFilter?' dashboard-attention-filter':'')+(activeFilter?' is-active':'')+'" data-dashboard-risk-link="'+id+'"'+
+      (isFilter?' aria-pressed="'+(activeFilter?'true':'false')+'" title="Filter Needs attention by '+esc(label)+'"':'')+'>'+
+      (isFilter?'<span class="dashboard-attention-filter-label">'+filterIcon+'<span>'+esc(label)+'</span></span>':'<span>'+esc(label)+'</span>')+
+      '<strong>'+n+'</strong></button>';
+  };
+  // Keep the filter-only actions together, on their own row beneath the tab links.
+  const riskTotals='<div class="dashboard-attention-links">'+attentionItems.filter(([id])=>!isAttentionFilter(id)).map(attentionButtonHtml).join('')+'</div>'+
+    '<div class="dashboard-attention-filters" role="group" aria-label="Needs attention filters">'+attentionItems.filter(([id])=>isAttentionFilter(id)).map(attentionButtonHtml).join('')+'</div>';
   const healthDetails=attentionItems.map(([id,label,n])=>'<div class="dashboard-health-row"><span class="dashboard-health-row-label">'+esc(label)+'</span><span class="dashboard-health-row-detail">'+n+' affected</span></div>').join('');
   const tabs=DASHBOARD_TABS.map(([id,label])=>'<button type="button" role="tab" id="tab-'+id+'" aria-selected="'+(tab===id?'true':'false')+'" data-dashboard-tab="'+id+'" class="'+(tab===id?'active':'')+'">'+esc(label)+'</button>').join('');
   const mainPanel=tab==='workload-priorities'
@@ -6053,7 +6117,7 @@ function dashboardOverviewHtml(){
     : dashboardTableHtml(risks,tab);
   return '<div class="dashboard"><div class="dashboard-head"><div><div class="dashboard-title">Project overview</div><div class="dashboard-subtitle">Delivery risks, deadlines and priorities across all active tickets.</div></div><div class="dashboard-updated">'+risks.active.length.toLocaleString('en-GB')+' active tickets</div></div>'+
     '<section class="dashboard-section dashboard-overview" id="overview"><div class="dashboard-stats">'+
-      '<div class="dashboard-stat dashboard-summary-link dashboard-health-stat '+risks.boardHealthStatus+'" role="button" tabindex="0" data-dashboard-risk-link="needs-attention"><div class="dashboard-health-score-line"><div class="dashboard-stat-value">'+healthScore+'%</div><span class="dashboard-health-status">'+healthLabel+'</span></div><div class="dashboard-stat-label">Board health</div><div class="dashboard-stat-help">Percentage of active tickets without risks, minus 25% of the average risk points. Includes all six risk areas.</div><div class="dashboard-health-breakdown">'+healthDetails+'</div></div>'+
+      '<div class="dashboard-stat dashboard-summary-link dashboard-health-stat '+risks.boardHealthStatus+'" role="button" tabindex="0" data-dashboard-risk-link="needs-attention"><div class="dashboard-health-score-line"><div class="dashboard-stat-value">'+healthScore+'%</div><span class="dashboard-health-status">'+healthLabel+'</span></div><div class="dashboard-stat-label">Board health</div><div class="dashboard-stat-help">Percentage of active tickets without risks, minus 25% of the average risk points. Includes all seven risk areas.</div><div class="dashboard-health-breakdown">'+healthDetails+'</div></div>'+
       '<div class="dashboard-stat dashboard-attention-stat risk"><div class="dashboard-stat-value">'+count.toLocaleString('en-GB')+' / '+activeCount.toLocaleString('en-GB')+' ('+attentionPercent+'%)</div><div class="dashboard-stat-label">Needs attention</div><div class="dashboard-stat-help">Unique active tickets with one or more risks. Select a category to see its tickets.</div><div class="dashboard-attention-summary">'+riskTotals+'</div></div>'+
       '<div class="dashboard-upcoming-stack">'+
         '<div class="dashboard-stat dashboard-summary-link" data-dashboard-risk-link="upcoming-7"><div class="dashboard-stat-value">'+dueSoon.length+'</div><div class="dashboard-stat-label">Due next 7 days</div></div>'+
@@ -6097,7 +6161,10 @@ function renderDashboard(){
   board.querySelectorAll('[data-dashboard-risk-link]').forEach(el=>{
     const navigate=()=>{
       const id=el.dataset.dashboardRiskLink;
-      switchTab(id==='missing-description'?'needs-attention':id,id==='missing-description'?'missing-description':'');
+      const attentionOnly=['missing-description','chain-missing-due'].includes(id);
+      // Summary filter chips toggle on/off; category buttons navigate to tabs.
+      const alreadyFiltered=attentionOnly&&state.dashboardTab==='needs-attention'&&state.dashboardAttentionFilter===id;
+      switchTab(attentionOnly?'needs-attention':id,attentionOnly&&!alreadyFiltered?id:'');
     };
     el.addEventListener('click',navigate);
     if(el.getAttribute('role')==='button') el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();navigate();}});
@@ -6216,7 +6283,7 @@ function myViewColumnCell(i,field){
     case 'riskScore':return '<strong class="dashboard-risk-score">'+(myViewTicketRisks.get(i.key)?.score||0)+'</strong>';
     case 'riskReasons':{
       const reasons=myViewTicketRisks.get(i.key)?.reasons||[];
-      return reasons.length?'<span class="dashboard-reason-list" title="'+esc(reasons.map(x=>x.label+' (+'+x.points+')').join(', '))+'">'+reasons.map(x=>'<span class="dashboard-risk-reason" title="+'+x.points+' points">'+esc(x.label)+'</span>').join('')+'</span>':'—';
+      return reasons.length?'<span class="dashboard-reason-list" title="'+esc(reasons.map(x=>x.label+' (+'+x.points+')').join(', '))+'">'+reasons.map(x=>'<span class="dashboard-risk-reason" title="+'+x.points+' points'+(x.details?' · Upstream: '+esc(x.details):'')+'">'+esc(x.label)+'</span>').join('')+'</span>':'—';
     }
     default:return '—';
   }
@@ -6606,8 +6673,8 @@ function openTicketPreviewModal(key, url, summary){
 
   const refresh=document.createElement('button');
   refresh.type='button';
-  refresh.className='gantt-action';
-  refresh.textContent='Close & refresh';
+  refresh.className='gantt-action gantt-export';
+  refresh.textContent='Close and refresh';
   refresh.title='Close this preview and refresh Jira data';
   refresh.addEventListener('click', () => {
     closeTicketPreviewModal();
@@ -6615,7 +6682,7 @@ function openTicketPreviewModal(key, url, summary){
   });
 
   const open=document.createElement('a');
-  open.className='gantt-action gantt-export';
+  open.className='gantt-action';
   open.href=url;
   open.target='_blank';
   open.rel='noopener noreferrer';
@@ -7146,7 +7213,7 @@ function render(){
       'high-priority-risk':'High-priority risk',
       'overdue':'Overdue tickets',
       'chain-risks':'Dependency chain date risks',
-      'unassigned':'Unassigned tickets',
+      'unassigned':'Unassigned',
       'missing-due':'Missing due dates',
       'circular':'Circular dependencies',
       'blocked-tickets':'Blocked tickets'
