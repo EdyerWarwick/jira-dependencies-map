@@ -91,7 +91,7 @@ DEFAULT_PREFERENCES={
     "showCompleted":False,"filterUser":"","filterDue":"all","includeWithRemarkable":True,
     "customJql":"","useJiraModal":False,"showMiniMap":True,"startingView":"default","personalUserAccountId":"","personalUserName":"","myViewSorts":{},"dashboardTabSorts":{},
     "ganttScale":12,"ganttShowDependencies":True,"ganttNarrow":False,
-    "myViewColumns":["key","summary","priority","dueDate","epic","status","blockers","blocked","riskScore","riskReasons"],"milestoneSort":"dueDate",
+    "myViewColumns":["key","summary","priority","dueDate","epic","status","blockers","blocked","riskScore","riskReasons"],"milestoneSort":"dueDate","collapseMilestoneBlockers":False,
 }
 _preferences_lock=threading.Lock()
 
@@ -118,6 +118,7 @@ def _normalise_preferences(data):
     if out["myViewColumns"]==old_default:
         out["myViewColumns"]=list(defaults)
     out["milestoneSort"]=out.get("milestoneSort") if out.get("milestoneSort") in {"dueDate","priority","assignee"} else "dueDate"
+    out["collapseMilestoneBlockers"]=out.get("collapseMilestoneBlockers") is True
     out["startingView"]=out["startingView"] if out["startingView"] in {"default","my-view","dashboard","milestone"} else "default"
     out["personalUserAccountId"]=str(out["personalUserAccountId"] or "")
     out["personalUserName"]=str(out["personalUserName"] or "").strip()
@@ -1535,8 +1536,12 @@ def _gantt_pdf_bytes(payload):
     day_w={6:3.,12:5.,20:10.}[scale]
     table_bottom=88.
     dates=[d for r in scheduled for d in (r['start'],r['end'])]
-    first=min(dates) if dates else date.today()
-    last=max(dates) if dates else first
+    today=date.today()
+    # The browser always includes the current date on its timeline, even when
+    # every scheduled issue is entirely in the past or future. Match that in
+    # PDF exports so the Today marker has a real date position to draw at.
+    first=min(dates+[today])
+    last=max(dates+[today])
     days=(last-first).days+1
     if full_screen:
         # One page covering the timeline and all tasks. Let the PDF grow in
@@ -1558,7 +1563,7 @@ def _gantt_pdf_bytes(payload):
                              break_on_hyphens=False,replace_whitespace=True) or ['']
 
     def pdf_row_layout(r,mode):
-        key_label=r['key']+(('  [Milestone]' if is_milestone else '  [Selected]') if r['milestone'] and not is_overview else '')
+        key_label=r['key']+(('  [Milestone]' if is_whole_project or is_milestone else '  [Selected]') if r['milestone'] and not is_overview else '')
         avail=left_w-47   # badge + right padding
         if narrow:
             combined=key_label+'  |  '+r['summary']
@@ -1576,6 +1581,7 @@ def _gantt_pdf_bytes(payload):
     # No task is split across pages, even for very long issue summaries.
     is_milestone=milestone.get('isMilestone') is not False
     is_overview=milestone.get('isOverview') is True
+    is_whole_project=milestone.get('isWholeProject') is True
     layouts={id(r):pdf_row_layout(r,'timeline') for r in scheduled}
     layouts.update({id(r):pdf_row_layout(r,'unscheduled') for r in unscheduled})
     if full_screen:
@@ -1660,7 +1666,7 @@ def _gantt_pdf_bytes(payload):
     for page_no,(mode,part,begin,finish,page_rows) in enumerate(page_specs,1):
         cmds=[]
         cmds.append(rect(0,page_h-112,page_w,112,'#172033'))
-        cmds.append(txt(margin,page_h-47,('PROJECT MILESTONES  /  ' if is_overview else 'MILESTONE GANTT  /  ' if is_milestone else 'SELECTED CHAIN GANTT  /  ')+key,12,True,'#bfdbfe'))
+        cmds.append(txt(margin,page_h-47,('WHOLE PROJECT GANTT  /  ' if is_whole_project else 'PROJECT MILESTONES  /  ' if is_overview else 'MILESTONE GANTT  /  ' if is_milestone else 'SELECTED CHAIN GANTT  /  ')+key,12,True,'#bfdbfe'))
         cmds.append(txt(margin,page_h-78,fit_label(title,page_w-2*margin,20,True),20,True,'#ffffff',102))
         if not full_screen:
             cmds.append(txt(page_w-270,page_h-49,'Page '+str(page_no)+' of '+str(total_pages),11,True,'#ffffff'))
@@ -1722,7 +1728,7 @@ def _gantt_pdf_bytes(payload):
                 if b>=a:
                     x=chart_left+((a-begin).days)*day_w+1
                     length=max(3,((b-a).days+1)*day_w-2)
-                    if r['milestone'] and not is_overview:
+                    if r['milestone'] and not is_overview and not is_whole_project:
                         # A milestone is a dated diamond at its due date, not
                         # a bar that spans its start and end. Only render the
                         # marker in the PDF date slice containing its due date.
@@ -1748,13 +1754,13 @@ def _gantt_pdf_bytes(payload):
                 # A visible milestone diamond takes incoming arrows at its
                 # left tip (its due date), rather than at the nominal task
                 # start. All other targets use the start of their task bar.
-                target_diamond=b['milestone'] and not is_overview
+                target_diamond=b['milestone'] and not is_overview and not is_whole_project
                 target_date=b['end'] if target_diamond else b['start']
                 # In multipage exports, only draw the link in a date segment
                 # containing both *visible* endpoints.
                 if not(begin<=a['end']<=finish and begin<=target_date<=finish):continue
                 x1=chart_left+((a['end']-begin).days+1)*day_w-1
-                if a['milestone'] and not is_overview:
+                if a['milestone'] and not is_overview and not is_whole_project:
                     x1=chart_left+((a['end']-begin).days+.5)*day_w+6.5
                 x2=(chart_left+((target_date-begin).days+.5)*day_w-6.5 if target_diamond
                     else chart_left+((target_date-begin).days)*day_w+1)
@@ -1770,8 +1776,20 @@ def _gantt_pdf_bytes(payload):
                 for (px,py),(qx,qy) in zip(coords,coords[1:]):
                     cmds.append(line(px,py,qx,qy,'#94a3b8',.8))
                 cmds.append(f'{poscolor("#64748b")} rg {x2:.2f} {y2:.2f} m {x2-4.5:.2f} {y2+2.3:.2f} l {x2-4.5:.2f} {y2-2.3:.2f} l h f\n')
+            # Match the red Today guide on the interactive Gantt. Draw it
+            # *after* rows and dependency arrows so it stays visible above
+            # the bars, on every vertical page with this date segment.
+            if begin <= today <= finish:
+                today_x=chart_left+(today-begin).days*day_w
+                cmds.append(line(today_x,table_bottom,today_x,table_top+15,'#ef4444',1.7))
+                # Label below the chart; never overlap the month/date headings.
+                tag_x=min(max(chart_left,today_x+4),page_w-margin-35)
+                cmds.append(txt(tag_x,table_bottom-13,'TODAY',8,True,'#dc2626'))
         cmds.append(line(margin,table_bottom,page_w-margin,table_bottom))
-        if is_overview:
+        if is_whole_project:
+            cmds.append(txt(margin,55,'Whole project: unconnected tickets included; completed follow Show completed.',9,False,'#64748b'))
+            cmds.append(txt(margin,38,'Milestone bars use stage starts; task bars use Jira start, blocker due, or creation.',9,False,'#64748b'))
+        elif is_overview:
             cmds.append(txt(margin,55,'Bars span the milestone start and due dates; blocker tasks are not included.',9,False,'#64748b'))
             cmds.append(txt(margin,38,'Start: Jira start > first blocker after prior milestone > creation.',9,False,'#64748b'))
         else:
@@ -1832,6 +1850,7 @@ def api_gantt_pdf():
 @app.route("/project-overview")
 @app.route("/milestones")
 @app.route("/gantt/all-milestones")
+@app.route("/gantt/whole-project")
 @app.route("/gantt/<issue_key>")
 def index(issue_key=None):
     return Response(build_html(),mimetype="text/html")
@@ -1976,6 +1995,12 @@ body.jira-loading #app-header{filter:blur(3px);opacity:.55;pointer-events:none;u
 .milestone-overview-header{display:flex;align-items:center;justify-content:space-between;padding:0 2px}
 .milestone-overview-title{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--muted)}
 .milestone-overview-tools{position:sticky;right:0;z-index:21;display:flex;align-items:center;gap:10px;flex:0 0 auto;margin-left:auto;background:var(--bg)}
+.milestone-collapse-toggle{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;font-size:11px;font-weight:750;color:#475569;cursor:pointer}
+.milestone-collapse-toggle input{width:15px;height:15px;accent-color:#2563eb;cursor:pointer}
+.milestone-blocked-item.upstream-milestone{background:#eff6ff;border-color:#bfdbfe}
+.milestone-blocked-item.upstream-milestone:hover{background:#dbeafe;border-color:#93c5fd}
+.milestone-upstream-dot{width:8px;height:8px;flex:0 0 8px;border-radius:50%;display:inline-block;background:#2563eb;box-shadow:0 0 0 2px #dbeafe;margin-right:3px}
+@media(max-width:850px){.milestone-overview-header{gap:8px}.milestone-overview-tools{flex-wrap:wrap;justify-content:flex-end}.milestone-overview-title{align-self:flex-start}}
 .milestone-project-gantt{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border-radius:7px;border:1px solid #818cf8;background:#eef2ff;color:#3730a3;font-size:11px;font-weight:800;cursor:pointer}
 .milestone-project-gantt:hover,.milestone-project-gantt:focus-visible{background:#e0e7ff}
 .milestone-project-gantt:disabled{opacity:.5;cursor:default}
@@ -2466,8 +2491,15 @@ body.jira-loading #dependency-status,
   max-width:calc(100vw - 32px);gap:5px;padding:4px 6px;
   background:rgba(255,255,255,.94);border:1px solid #e2e8f0;
   border-radius:7px;box-shadow:0 2px 8px rgba(15,23,42,.06);
-  pointer-events:none;
+  pointer-events:auto;
 }
+#dependency-status .status-legend{display:flex;align-items:center;flex-wrap:wrap;gap:3px}
+#dependency-status .status-divider{height:22px;border-left:1px solid #e2e8f0;margin:0 4px}
+#dependency-status .whole-project-gantt{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid #a5b4fc;border-radius:6px;background:#eef2ff;color:#3730a3;font-size:11px;font-weight:800;white-space:nowrap;cursor:pointer;transition:background .15s,border-color .15s}
+#dependency-status .whole-project-gantt:hover{background:#e0e7ff;border-color:#818cf8}
+#dependency-status .whole-project-gantt:focus-visible{outline:2px solid #4f46e5;outline-offset:2px}
+#dependency-status .whole-project-gantt:disabled{opacity:.5;cursor:default}
+@media(max-width:700px){#dependency-status{left:10px;right:10px;max-width:calc(100vw - 20px);justify-content:center}#dependency-status .status-divider{display:none}#dependency-status .status-legend{justify-content:center}}
 #dependency-status .status-pill{
   display:inline-flex;align-items:center;gap:4px;padding:3px 6px;
   border-radius:5px;background:transparent;border:0;
@@ -3334,12 +3366,19 @@ body.gantt-open{overflow:hidden}
   </div>
 </div>
 
-<div id="dependency-status" class="loading-hidden" aria-label="Dependency status key">
-  <span class="status-pill blocked"><span class="status-arrow">←</span>Blocked by</span>
-  <span class="status-pill blocks"><span class="status-arrow">→</span>Blocks</span>
-  <span id="external-status" class="status-pill external"><span class="status-dot"></span>External blocker</span>
-  <span id="cycle-status" class="status-pill cycle"><span class="status-dot"></span>Circular</span>
-  <span id="locked-status" class="status-pill locked"><span class="status-dot"></span>Selected</span>
+<div id="dependency-status" class="loading-hidden" aria-label="Full board tools and dependency status key">
+  <div class="status-legend" aria-label="Dependency status key">
+    <span class="status-pill blocked"><span class="status-arrow">←</span>Blocked by</span>
+    <span class="status-pill blocks"><span class="status-arrow">→</span>Blocks</span>
+    <span id="external-status" class="status-pill external"><span class="status-dot"></span>External blocker</span>
+    <span id="cycle-status" class="status-pill cycle"><span class="status-dot"></span>Circular</span>
+    <span id="locked-status" class="status-pill locked"><span class="status-dot"></span>Selected</span>
+  </div>
+  <span class="status-divider" aria-hidden="true"></span>
+  <button type="button" id="whole-project-gantt" class="whole-project-gantt" title="See all project tickets and milestones, including unconnected tickets; completed tickets follow the Show completed filter" aria-label="See whole project Gantt">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4v16M3 7h18M3 12h18M3 17h18"/><path d="M7 5v4h5V5M14 10v4h6v-4M8 15v4h8v-4"/></svg>
+    See whole project Gantt
+  </button>
 </div>
 
 
@@ -3513,7 +3552,7 @@ const state = {
   milestoneSearchTerm:'',       // Milestones-only card filter; never filters the Gantt
   showDashboard:false,
   showMyView:false,
-  myViewSavedSorts:{}, myViewSort:{field:'priority',direction:'asc'}, myViewColumns:['key','summary','priority','dueDate','epic','status','blockers','blocked','riskScore','riskReasons'], milestoneSort:'dueDate', ganttReturnToMilestones:false, ganttReturnContext:null,
+  myViewSavedSorts:{}, myViewSort:{field:'priority',direction:'asc'}, myViewColumns:['key','summary','priority','dueDate','epic','status','blockers','blocked','riskScore','riskReasons'], milestoneSort:'dueDate', collapseMilestoneBlockers:false, ganttReturnToMilestones:false, ganttReturnContext:null,
   dashboardSavedSorts:{},dashboardDraftSorts:{},dashboardTab:'needs-attention',dashboardPages:{},dashboardAttentionFilter:'',dashboardWorkloadSort:'tickets-desc',myViewHighlightDue:'',
   startingView:'default',
   showMiniMap:true, customJql:'', useJiraModal:false, ganttScale:12, ganttShowDependencies:true, ganttNarrow:false, currentUserName:'', currentUserAccountId:'', personalUserOverride:false, personalTicketFilter:'',
@@ -3536,7 +3575,7 @@ const state = {
 // /fullboard?key=OPD-123&showBlockers=1
 // /milestones?key=WT-592  (focus the milestone in its OWN view)
 // /project-overview#tab-overdue ; /my-view
-// /gantt/WT-592 ; /gantt/all-milestones
+// /gantt/WT-592 ; /gantt/all-milestones ; /gantt/whole-project
 const ROUTE_TABS=new Set(['needs-attention','upcoming-7','upcoming-31','overdue','missing-due',
   'unassigned','biggest-unblockers','chain-risks','circular','in-development','backlog','workload-priorities']);
 const ROUTE_TICKET=/^[A-Za-z][A-Za-z0-9_]*-\d+$/;
@@ -3558,6 +3597,7 @@ function readSharedViewUrl(){
   else if(path==='/project-overview'||path==='/dashboard')section='dashboard';
   else if(path==='/milestones'||path==='/milestone')section='milestone';
   else if(path==='/gantt/all-milestones'){section='gantt';ganttKey='ALL-MILESTONES';}
+  else if(path==='/gantt/whole-project'){section='gantt';ganttKey='WHOLE-PROJECT';}
   else if(path.startsWith('/gantt/')){
     const raw=decodeURIComponent(window.location.pathname.split('/').filter(Boolean).pop()||'');
     if(ROUTE_TICKET.test(raw)){section='gantt';ganttKey=raw.toUpperCase();}
@@ -3596,7 +3636,7 @@ function syncSharedViewUrl(forceReplace=false){
   const overlay=document.getElementById('gantt-overlay');
   let path,query='',hash='';
   if(overlay&&!overlay.hidden&&ganttCurrent){
-    path='/gantt/'+(ganttCurrent.isOverview?'all-milestones':encodeURIComponent(ganttCurrent.milestone.key));
+    path='/gantt/'+(ganttCurrent.isWholeProject?'whole-project':ganttCurrent.isOverview?'all-milestones':encodeURIComponent(ganttCurrent.milestone.key));
   }else if(state.showDashboard){
     path='/project-overview';
     hash='#tab-'+(ROUTE_TABS.has(state.dashboardTab)?state.dashboardTab:'needs-attention');
@@ -3629,7 +3669,7 @@ function restoreBrowserRoute(){
     }
     render();
     if(route.section==='gantt'){
-      const data=route.ganttKey==='ALL-MILESTONES'?buildAllMilestonesGantt():buildMilestoneGantt(route.ganttKey);
+      const data=route.ganttKey==='WHOLE-PROJECT'?buildWholeProjectGantt():route.ganttKey==='ALL-MILESTONES'?buildAllMilestonesGantt():buildMilestoneGantt(route.ganttKey);
       if(data)openGanttData(data,null);
     }
   }finally{
@@ -3679,6 +3719,7 @@ async function loadPreferences(){
     state.ganttNarrow=saved.ganttNarrow===true;
     state.myViewColumns=normaliseMyViewColumns(saved.myViewColumns);
     state.milestoneSort=['dueDate','priority','assignee'].includes(saved.milestoneSort)?saved.milestoneSort:'dueDate';
+    state.collapseMilestoneBlockers=saved.collapseMilestoneBlockers===true;
     state.startingView=['default','my-view','dashboard','milestone'].includes(saved.startingView) ? saved.startingView : 'default';
     state.myViewSavedSorts=(saved.myViewSorts && typeof saved.myViewSorts==='object' && !Array.isArray(saved.myViewSorts)) ? saved.myViewSorts : {};
     state.dashboardSavedSorts=(saved.dashboardTabSorts && typeof saved.dashboardTabSorts==='object' && !Array.isArray(saved.dashboardTabSorts)) ? saved.dashboardTabSorts : {};
@@ -3711,7 +3752,8 @@ async function savePreferences(updates){
         ganttScale:state.ganttScale, ganttShowDependencies:state.ganttShowDependencies!==false, ganttNarrow:state.ganttNarrow===true,
         personalUserAccountId:state.currentUserAccountId||'', personalUserName:state.currentUserName||'',
         myViewSorts:state.myViewSavedSorts||{}, dashboardTabSorts:state.dashboardSavedSorts||{},
-        myViewColumns:normaliseMyViewColumns(state.myViewColumns),milestoneSort:state.milestoneSort||'dueDate'
+        myViewColumns:normaliseMyViewColumns(state.myViewColumns),milestoneSort:state.milestoneSort||'dueDate',
+        collapseMilestoneBlockers:state.collapseMilestoneBlockers===true
       }),cache:'no-store'
     });
     if(!response.ok) throw new Error('Preferences API returned '+response.status);
@@ -6733,7 +6775,7 @@ function milestoneCardHtml(i){
     '<div class="summary">' + esc(i.summary) + '</div>' +
     '<div class="card-meta">' + lazyAssigneeSelectHtml(i) + dueDateHtml(i) + '</div>' +
     '<div class="milestone-chain-meta">' +
-      '<span class="my-view-count upstream" title="All active upstream blockers">← ' + dashboardGraphTraversal(state.issues||[]).upstreamCount(i.key) + ' blockers</span>' +
+      '<span class="my-view-count upstream" title="All active upstream blockers">← ' + (state.collapseMilestoneBlockers?sortedMilestoneBlockers(i.key).length:dashboardGraphTraversal(state.issues||[]).upstreamCount(i.key)) + ' blockers</span>' +
       '<span class="my-view-count downstream" title="All active downstream blocked tickets">Blocked ' + dashboardGraphTraversal(state.issues||[]).downstreamCount(i.key) + ' →</span>' +
       '<button type="button" class="milestone-gantt-launch" data-gantt-milestone="' + esc(i.key) + '" data-stop-propagation="1" title="Open Gantt timeline for ' + esc(i.key) + '" aria-label="Open Gantt timeline for ' + esc(i.key) + '"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4v16M3 7h18M3 12h18M3 17h18"/><path d="M7 5v4h5V5M14 10v4h6v-4M8 15v4h8v-4"/></svg></button>' +
     '</div>' +
@@ -6747,8 +6789,47 @@ function compareMilestoneSort(a,b){
   const preferred=state.milestoneSort==='priority'?byPriority():state.milestoneSort==='assignee'?byAssignee():byDue();
   return preferred||byDue()||byPriority()||a.key.localeCompare(b.key);
 }
+function visibleMilestoneBlockers(milestoneKey){
+  if(!state.collapseMilestoneBlockers)return milestoneChainItems(milestoneKey);
+  // Treat a preceding milestone as an atomic dependency. Stop traversing
+  // that branch at the milestone, but keep any independent path to the same
+  // ancestor: it is still genuinely required by this milestone.
+  const byKey=new Map(state.displayIssues.map(i=>[i.key,i]));
+  const incoming=state.displayIncoming || new Map();
+  const keep=new Set([milestoneKey]),queue=[milestoneKey];
+  for(let pos=0;pos<queue.length;pos++){
+    for(const key of incoming.get(queue[pos])||[]){
+      if(keep.has(key)||!byKey.has(key))continue;
+      keep.add(key);
+      const item=byKey.get(key);
+      if(!(item.labels||[]).some(label=>String(label).toLowerCase()==='milestone'))queue.push(key);
+    }
+  }
+  keep.delete(milestoneKey);
+  // Rebuild levels for the *visible* subgraph, avoiding misleading gaps left
+  // by items collapsed into an upstream milestone. Cycles remain visible.
+  const items=[...keep].map(key=>byKey.get(key));
+  const indegree=new Map(items.map(item=>[item.key,0]));
+  const level=new Map();
+  for(const edge of state.displayEdges){
+    if(keep.has(edge.from)&&keep.has(edge.to))indegree.set(edge.to,indegree.get(edge.to)+1);
+  }
+  const roots=items.filter(item=>indegree.get(item.key)===0).map(item=>item.key);
+  roots.forEach(key=>level.set(key,0));
+  for(let pos=0;pos<roots.length;pos++){
+    const key=roots[pos];
+    for(const target of state.displayOutgoing?.get(key)||[]){
+      if(!keep.has(target))continue;
+      level.set(target,Math.max(level.get(target)||0,(level.get(key)||0)+1));
+      indegree.set(target,indegree.get(target)-1);
+      if(indegree.get(target)===0)roots.push(target);
+    }
+  }
+  return items.map(item=>({...item,chainLevel:level.get(item.key)??item.level??0,
+    upstreamMilestone:(item.labels||[]).some(label=>String(label).toLowerCase()==='milestone')}));
+}
 function sortedMilestoneBlockers(milestoneKey){
-  return milestoneChainItems(milestoneKey).sort((a,b)=>
+  return visibleMilestoneBlockers(milestoneKey).sort((a,b)=>
     (a.chainLevel-b.chainLevel)||compareMilestoneSort(a,b));
 }
 function milestoneOverviewHtml(milestones){
@@ -6767,9 +6848,10 @@ function milestoneOverviewHtml(milestones){
           return '<div class="milestone-blocked-group">' +
             '<div class="milestone-blocked-level">' + label + '</div>' +
             groups.get(level).map(b =>
-              '<div class="milestone-blocked-item dashboard-ticket' + (isCompletedStatus(b.status) ? ' completed' : '') +
+              '<div class="milestone-blocked-item dashboard-ticket' + (isCompletedStatus(b.status) ? ' completed' : '') + (b.upstreamMilestone?' upstream-milestone':'') +
                 '" data-key="' + esc(b.key) + '" data-milestone-chain="' + esc(b.key) + '" title="' + esc(b.key + ' - ' + (b.summary || '')) + '">' +
                 '<span class="milestone-blocked-content">' +
+                  (b.upstreamMilestone?'<span class="milestone-upstream-dot" aria-label="Previous milestone" title="Earlier milestone; its upstream blockers are collapsed"></span>':'') +
                   '<span class="milestone-blocked-priority">' + priorityIconHtml(b.priority) + '</span>' +
                   '<a class="milestone-blocked-key" href="' + esc(b.url || (CFG.jiraBaseUrl + '/browse/' + b.key)) +
                   '" target="_blank" rel="noopener noreferrer" data-stop-propagation="1" data-issue-key="' +
@@ -6794,7 +6876,7 @@ function milestoneOverviewHtml(milestones){
   return '<div class="milestone-overview">' +
     '<div class="milestone-overview-header">' +
       '<span class="milestone-overview-title">Milestones</span>' +
-      '<div class="milestone-overview-tools"><label class="milestone-sort-label" for="milestone-sort">Sort blocked by <select id="milestone-sort"><option value="dueDate"'+(state.milestoneSort==='dueDate'?' selected':'')+'>Due date</option><option value="priority"'+(state.milestoneSort==='priority'?' selected':'')+'>Priority</option><option value="assignee"'+(state.milestoneSort==='assignee'?' selected':'')+'>Assignee</option></select></label><span class="milestone-overview-count">' + milestones.length + '</span>' +
+      '<div class="milestone-overview-tools"><label class="milestone-collapse-toggle" title="Show preceding milestones instead of repeating all their upstream blockers"><input id="milestone-collapse-blockers" type="checkbox"'+(state.collapseMilestoneBlockers?' checked':'')+'> Collapse previous milestone blockers</label><label class="milestone-sort-label" for="milestone-sort">Sort blocked by <select id="milestone-sort"><option value="dueDate"'+(state.milestoneSort==='dueDate'?' selected':'')+'>Due date</option><option value="priority"'+(state.milestoneSort==='priority'?' selected':'')+'>Priority</option><option value="assignee"'+(state.milestoneSort==='assignee'?' selected':'')+'>Assignee</option></select></label><span class="milestone-overview-count">' + milestones.length + '</span>' +
       '<button type="button" class="milestone-project-gantt" id="milestone-project-gantt"'+(milestones.length?'':' disabled')+' title="See every milestone on one project timeline">▤ All milestones Gantt</button></div>' +
     '</div>' +
     '<div class="milestone-row">' +
@@ -6820,9 +6902,12 @@ function milestoneBlockersClipboardContent(milestoneKey){
   const blockers=sortedMilestoneBlockers(milestoneKey);
   const columns=['Level','Key','Summary','Priority','Assignee','Due date','Status'];
   const sortName={dueDate:'Due date',priority:'Priority',assignee:'Assignee'}[state.milestoneSort]||'Due date';
+  // Mark milestone rows whether or not the collapse-blockers preference is on.
+  // The label goes in the Summary cell so the Jira key remains a clean link.
   const records=blockers.map(b=>[
     b.chainLevel===0?'Unblocked':'Level '+b.chainLevel,
-    b.key,b.summary||'',b.priority||'Unspecified',b.assignee||'Unassigned',
+    b.key,((b.labels||[]).some(label=>String(label).toLowerCase()==='milestone')?'Milestone: ':'')+(b.summary||''),
+    b.priority||'Unspecified',b.assignee||'Unassigned',
     b.dueDate?formatDueDate(b.dueDate):'No due date',b.status||''
   ]);
   const name=String(milestone?.summary||milestoneKey);
@@ -6842,7 +6927,10 @@ function milestoneBlockersClipboardContent(milestoneKey){
   const headerCells=columns.map((c,idx)=>'<th width="'+widths[idx]+'" style="width:'+widths[idx]+'px;'+cellCss+'background:#e2e8f0;color:#172033;font-weight:bold;">'+esc(c)+'</th>').join('');
   const rows=records.map((r,n)=>'<tr>'+r.map((value,idx)=>{
     const url=idx===1?((state.issues.find(i=>i.key===value)?.url)||CFG.jiraBaseUrl+'/browse/'+value):'';
-    const content=url?'<a href="'+esc(url)+'" style="color:#4338ca;text-decoration:underline;">'+esc(value)+'</a>':esc(value);
+    // Preserve bold styling in Outlook, Gmail and Word; plain-text fallback
+    // keeps the same visible 'Milestone:' prefix without HTML markup.
+    const content=url?'<a href="'+esc(url)+'" style="color:#4338ca;text-decoration:underline;">'+esc(value)+'</a>':
+      (idx===2&&String(value).startsWith('Milestone: ')?'<b>Milestone:</b> '+esc(String(value).slice('Milestone: '.length)):esc(value));
     return '<td width="'+widths[idx]+'" style="width:'+widths[idx]+'px;'+cellCss+'background:'+(n%2?'#f8fafc':'#ffffff')+';">'+content+'</td>';
   }).join('')+'</tr>').join('');
   const html='<div style="font:12px Arial,sans-serif;color:#172033;">'+
@@ -6935,6 +7023,11 @@ function renderMilestoneOverview(flashKey){
   board.querySelector('#milestone-sort')?.addEventListener('change',e=>{
     state.milestoneSort=e.target.value;
     savePreferences({milestoneSort:state.milestoneSort});
+    render();
+  });
+  board.querySelector('#milestone-collapse-blockers')?.addEventListener('change',e=>{
+    state.collapseMilestoneBlockers=e.target.checked;
+    savePreferences({collapseMilestoneBlockers:state.collapseMilestoneBlockers});
     render();
   });
   board.querySelector('#milestone-project-gantt')?.addEventListener('click',e=>{
@@ -7226,7 +7319,7 @@ function render(){
     const dashboardBack = !!state.dashboardReturnSection && !!dashboardBackLabels[state.dashboardReturnSection];
     milestoneBackBtn.classList.toggle('visible', !!state.ganttReturnContext || !!backMilestone || dashboardBack || state.ganttReturnToMilestones);
     milestoneBackBtn.innerHTML = state.ganttReturnContext
-      ? '&#8592; Back to '+esc(state.ganttReturnContext.isOverview?'All milestones Gantt':state.ganttReturnContext.milestoneKey+' Gantt')
+      ? '&#8592; Back to '+esc(state.ganttReturnContext.isWholeProject?'Whole project Gantt':state.ganttReturnContext.isOverview?'All milestones Gantt':state.ganttReturnContext.milestoneKey+' Gantt')
       : dashboardBack
       ? '&#8592; Back to ' + esc(dashboardBackLabels[state.dashboardReturnSection])
       : (state.ganttReturnToMilestones ? '&#8592; Back to milestones' : backMilestone ? '&#8592; Back to ' + esc(backMilestone.key + ' - ' + (backMilestone.summary || 'Milestone')) : '');
@@ -8569,6 +8662,7 @@ async function pollCompletedDownload(loadGeneration = state.loadGeneration){
         // when Show completed is enabled.
         hideCompletedDownloadNotice();
         render();
+        refreshOpenGanttAfterJiraLoad();
         if(completedDownloadPollTimer) clearInterval(completedDownloadPollTimer);
         completedDownloadPollTimer=null;
       }else if(d.status === 'error'){
@@ -8627,7 +8721,7 @@ async function load(resetSelection){
     }
     await render(); updateSaveButton();
     if(requestedGantt){
-      const data=requestedGantt==='ALL-MILESTONES'?buildAllMilestonesGantt():buildMilestoneGantt(requestedGantt);
+      const data=requestedGantt==='WHOLE-PROJECT'?buildWholeProjectGantt():requestedGantt==='ALL-MILESTONES'?buildAllMilestonesGantt():buildMilestoneGantt(requestedGantt);
       if(data)openGanttData(data,null);
     }
     if(routeBootstrapping){routeBootstrapping=false;syncSharedViewUrl();}
@@ -9103,6 +9197,28 @@ function buildAllMilestonesGantt(){
     scheduled:rows.filter(r=>!r.reason),unscheduled:rows.filter(r=>r.reason),
     edges:state.displayEdges.filter(e=>keys.has(e.from)&&keys.has(e.to))};
 }
+function buildWholeProjectGantt(){
+  // Include all project tickets, even isolated tickets and With Remarkable,
+  // but follow the Full Board's Show completed setting. Do not apply the
+  // other on-screen board filters to the whole-project Gantt.
+  const issues=state.showCompleted ? (state.issues||[]) :
+    (state.issues||[]).filter(i=>!isCompletedStatus(i.status));
+  const byKey=new Map(issues.map(i=>[i.key,i]));
+  const edges=(state.edges||[]).filter(e=>byKey.has(e.from)&&byKey.has(e.to));
+  const incoming=new Map(issues.map(i=>[i.key,[]]));
+  edges.forEach(e=>incoming.get(e.to).push(e));
+  const rows=issues.map(i=>{
+    const milestone=(i.labels||[]).some(label=>String(label).toLowerCase()==='milestone');
+    const schedule=milestone?ganttProjectMilestoneSchedule(i,incoming,byKey):ganttScheduleForIssue(i,edges,byKey);
+    return {key:i.key,summary:i.summary||'',status:i.status||'',assignee:i.assignee||'Unassigned',
+      assigneeAccountId:i.assigneeAccountId||null,milestone,...schedule,color:ganttIssueColour(i.status),level:i.level||0};
+  });
+  rows.sort((a,b)=>(a.level-b.level)||(a.start||'9999-12-31').localeCompare(b.start||'9999-12-31')||a.key.localeCompare(b.key));
+  return {milestone:{key:'WHOLE-PROJECT',summary:'Whole project',isMilestone:false,isWholeProject:true},
+    isMilestone:false,isWholeProject:true,rows,
+    scheduled:rows.filter(r=>!r.reason&&r.start&&r.end),
+    unscheduled:rows.filter(r=>r.reason||!r.start||!r.end),edges};
+}
 // A compact, centred badge is used by every scheduled Gantt label.
 // "Unassigned" is blue to distinguish tickets that need an owner.
 function ganttAssigneeHtml(r){
@@ -9145,7 +9261,7 @@ function renderGanttChart(){
   if(!chart||!ganttCurrent)return;
   const d=ganttCurrent,rows=d.scheduled;
   const drawDependencies=state.ganttShowDependencies!==false;
-  info.textContent=(d.isOverview?'Milestones: ':'Tasks: ')+rows.length+' scheduled · '+d.unscheduled.length+' unscheduled · '+
+  info.textContent=(d.isOverview?'Milestones: ':d.isWholeProject?'Project tickets: ':'Tasks: ')+rows.length+' scheduled · '+d.unscheduled.length+' unscheduled · '+
     d.edges.length+' direct dependencies'+(drawDependencies?'':' (hidden)')+' · '+
     (state.showCompleted?'including':'excluding')+' completed';
   const maxDate=rows.length?Math.max(...rows.map(r=>ganttDate(r.end))):null;
@@ -9188,18 +9304,18 @@ function renderGanttChart(){
   const rowMarkup=rows.map(r=>{
     const from=(ganttDate(r.start)-origin)/GANTT_DAY_MS*ganttDayWidth;
     const length=((ganttDate(r.end)-ganttDate(r.start))/GANTT_DAY_MS+1)*ganttDayWidth;
-    const bar=r.milestone&&!d.isOverview?'<span class="gantt-diamond" style="left:'+(from+length-ganttDayWidth/2)+'px;background:#b45309" title="'+esc(ganttBarTooltip(r))+'"></span>':
+    const bar=r.milestone&&!d.isOverview&&!d.isWholeProject?'<span class="gantt-diamond" style="left:'+(from+length-ganttDayWidth/2)+'px;background:#b45309" title="'+esc(ganttBarTooltip(r))+'"></span>':
       '<span class="gantt-bar" style="left:'+from+'px;width:'+Math.max(5,length-2)+'px;background:'+r.color+'" title="'+esc(ganttBarTooltip(r))+'"></span>';
     return '<div class="gantt-task-row" data-gantt-key="'+esc(r.key)+'">'+
       '<div class="gantt-task-label"><div class="gantt-task-info"><a href="'+esc(CFG.jiraBaseUrl+'/browse/'+r.key)+'" target="_blank" rel="noopener noreferrer" data-issue-key="'+esc(r.key)+'">'+esc(r.key)+'</a>'+
-      (r.milestone&&!d.isOverview?'<span class="gantt-milestone-tag">'+(d.isMilestone?'MILESTONE':'SELECTED')+'</span>':'')+
+      (r.milestone&&!d.isOverview?'<span class="gantt-milestone-tag">'+(d.isWholeProject||d.isMilestone?'MILESTONE':'SELECTED')+'</span>':'')+
       '<span class="gantt-task-summary" title="'+esc(r.summary)+'">'+esc(r.summary)+'</span>'+
       '<span class="gantt-task-dates">'+esc(ganttDateLabel(ganttDate(r.start)))+' – '+esc(ganttDateLabel(ganttDate(r.end)))+' · '+esc(r.source)+'</span></div>'+ganttAssigneeHtml(r)+'</div>'+
       '<div class="gantt-task-track" style="width:'+timelineWidth+'px">'+bar+'</div></div>';
   }).join('');
   chart.innerHTML='<div class="gantt-canvas'+(state.ganttNarrow===true?' gantt-narrow':'')+(drawDependencies?'':' gantt-dependencies-off')+'" data-origin="'+origin+'" data-days="'+days+'" data-label-width="'+labelWidth+'" data-today-left="'+todayLeft+'" style="width:'+totalWidth+'px;--gantt-left:'+labelWidth+'px">'+
     '<div class="gantt-timeline-heading" style="height:'+headHeight+'px">'+
-      '<div class="gantt-heading-label">'+(d.isOverview?'MILESTONE / PROJECT PLAN':'ISSUE / TASK')+' <small>'+'Start · Due · Calculation'+'</small></div>'+
+      '<div class="gantt-heading-label">'+(d.isOverview?'MILESTONE / PROJECT PLAN':d.isWholeProject?'WHOLE PROJECT / TASK':'ISSUE / TASK')+' <small>'+'Start · Due · Calculation'+'</small></div>'+
       '<div class="gantt-heading-scale" style="width:'+timelineWidth+'px">'+monthHead.join('')+dayHead.join('')+'<div class="gantt-hover-guide" hidden></div><div class="gantt-hover-date" hidden></div></div></div>'+
     '<div class="gantt-task-area" style="width:'+totalWidth+'px">'+
       '<div class="gantt-calendar-overlay" style="left:'+labelWidth+'px;width:'+timelineWidth+'px">'+weeks.join('')+'</div>'+
@@ -9260,7 +9376,7 @@ function renderGanttChart(){
     '<strong>'+esc(r.reason||'No valid schedule')+'</strong></div>').join('');
   missing.innerHTML='<div class="gantt-unscheduled-heading">Unscheduled ('+d.unscheduled.length+')</div>'+
     (missingRows||'<div class="gantt-unscheduled-empty">'+(d.isOverview?'All milestones have valid start and due dates.':'All tickets have a valid start and due date.')+'</div>')+
-    '<p class="gantt-schedule-notes">'+(d.isOverview?'Milestone bars show start through due date. Start: Jira start date → first blocker after the preceding milestone (blockers use Jira start, previous blocker due + 1 day, or creation) → milestone creation date. Blocker tasks are not displayed.':'Start: Jira start date → day after latest direct blocker due date → Jira creation date. Tickets without a due date or with start after due date appear here.')+'</p>';
+    '<p class="gantt-schedule-notes">'+(d.isOverview?'Milestone bars show start through due date. Start: Jira start date → first blocker after the preceding milestone (blockers use Jira start, previous blocker due + 1 day, or creation) → milestone creation date. Blocker tasks are not displayed.':d.isWholeProject?'All loaded project tickets are shown (including unconnected and completed). Milestone bars use project-stage start dates; task bars use Jira start, latest direct blocker due + 1 day, or creation. Missing/invalid schedules are listed separately.':'Start: Jira start date → day after latest direct blocker due date → Jira creation date. Tickets without a due date or with start after due date appear here.')+'</p>';
   attachTicketKeyModalHandlers(missing);
 }
 function ganttChainKeys(key){
@@ -9302,7 +9418,7 @@ function openGanttTicketChain(key){
   // specific milestone (e.g. WT-303) versus the all-milestones chart.
   const source={
     milestoneKey:ganttCurrent.milestone.key,
-    isOverview:!!ganttCurrent.isOverview,
+    isOverview:!!ganttCurrent.isOverview,isWholeProject:!!ganttCurrent.isWholeProject,
     showMilestones:state.showMilestones,showDashboard:state.showDashboard,showMyView:state.showMyView,
     lockedKey:state.lockedKey,showBlocked:state.showBlocked,
     selectionHistory:JSON.parse(JSON.stringify(state.selectionHistory||[])),
@@ -9338,7 +9454,7 @@ function returnToOriginGantt(){
   state.revealSelectedKey=source.lockedKey;
   render();
   // Render has rebuilt displayIssues; always create a fresh timeline from it.
-  const data=source.isOverview?buildAllMilestonesGantt():buildMilestoneGantt(source.milestoneKey);
+  const data=source.isWholeProject?buildWholeProjectGantt():source.isOverview?buildAllMilestonesGantt():buildMilestoneGantt(source.milestoneKey);
   if(data)openGanttData(data,null);
   else statusText.textContent='The original Gantt is no longer available with the current filters.';
 }
@@ -9375,15 +9491,21 @@ function openMilestoneGantt(key,button){
 function openAllMilestonesGantt(button){
   openGanttData(buildAllMilestonesGantt(),button);
 }
+function openWholeProjectGantt(button){
+  openGanttData(buildWholeProjectGantt(),button);
+}
+document.getElementById('whole-project-gantt')?.addEventListener('click',e=>{
+  e.preventDefault();openWholeProjectGantt(e.currentTarget);
+});
 function openGanttData(data,button){
   if(!data)return;
   state.ganttReturnContext=null;
   ganttCurrent=data;ganttHoverKey=null;ganttLockedKey=null;
   ganttReturnFocus=button||document.activeElement;
   const overlay=document.getElementById('gantt-overlay');
-  const kind=data.isOverview?'Project plan · milestones only':data.isMilestone?'Milestone timeline':'Selected chain timeline';
+  const kind=data.isWholeProject?'Project plan · all tickets':data.isOverview?'Project plan · milestones only':data.isMilestone?'Milestone timeline':'Selected chain timeline';
   overlay.querySelector('.gantt-eyebrow').textContent=kind;
-  document.getElementById('gantt-title').textContent=data.isOverview?'All milestones · project plan':data.milestone.key+' · '+data.milestone.summary;
+  document.getElementById('gantt-title').textContent=data.isWholeProject?'Whole project · Gantt':data.isOverview?'All milestones · project plan':data.milestone.key+' · '+data.milestone.summary;
   document.getElementById('gantt-export-status').textContent='';
   overlay.hidden=false;
   document.body.classList.add('gantt-open');
@@ -9396,12 +9518,12 @@ function openGanttData(data,button){
 function refreshOpenGanttAfterJiraLoad(){
   if(!ganttCurrent||document.getElementById('gantt-overlay').hidden)return;
   const previousKey=ganttCurrent.milestone.key;
-  const updated=ganttCurrent.isOverview?buildAllMilestonesGantt():buildMilestoneGantt(previousKey);
+  const updated=ganttCurrent.isWholeProject?buildWholeProjectGantt():ganttCurrent.isOverview?buildAllMilestonesGantt():buildMilestoneGantt(previousKey);
   if(!updated)return;
   const viewport=document.getElementById('gantt-chart');
   const left=viewport.scrollLeft,top=viewport.scrollTop;
   ganttCurrent=updated;
-  document.getElementById('gantt-title').textContent=updated.isOverview?'All milestones · project plan':updated.milestone.key+' · '+updated.milestone.summary;
+  document.getElementById('gantt-title').textContent=updated.isWholeProject?'Whole project · Gantt':updated.isOverview?'All milestones · project plan':updated.milestone.key+' · '+updated.milestone.summary;
   updateGanttControls();
   renderGanttChart();
   viewport.scrollLeft=left;viewport.scrollTop=top;
@@ -9423,7 +9545,7 @@ async function exportMilestoneGanttPdf(){
     const link=document.createElement('a');
     const format=output==='Full screen'?'Full':output==='A4'?'A4':'A3';
     const today=new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'numeric'}).format(new Date());
-    const title=ganttCurrent.isOverview?'All milestones':ganttCurrent.milestone.key;
+    const title=ganttCurrent.isWholeProject?'Whole project':ganttCurrent.isOverview?'All milestones':ganttCurrent.milestone.key;
     link.href=url;link.download=title+' Gantt '+format+' '+today+'.pdf';
     document.body.appendChild(link);link.click();link.remove();
     setTimeout(()=>URL.revokeObjectURL(url),30000);
